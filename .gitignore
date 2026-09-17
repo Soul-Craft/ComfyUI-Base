@@ -1,0 +1,19 @@
+# Runtime state, not source. BASE_STATE is /workspace/comfy-base/state on a pod; running base.sh from the
+# repo puts it here instead, and a `git add .` would otherwise sweep a run's logs into a commit.
+state/
+# the base's own toolchain when installed beside the checkout (uv's python, the venv)
+python/
+# per-run tool output: pod logs, pins, canvas snapshots and review renders, wherever a _build/ sits
+**/_build/podruns/
+**/_build/pins/
+**/_build/snapshots/
+**/_build/review.svg
+**/_build/review-focus.svg
+# python and pytest leavings
+__pycache__/
+*.pyc
+.pytest_cache/
+# the Mac
+.DS_Store
+# the local testbed server's pid, log and port files
+.testbed-server.*

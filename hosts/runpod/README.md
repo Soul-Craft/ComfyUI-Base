@@ -1,0 +1,62 @@
+# hosts/runpod : RunPod, the proven host
+
+A RunPod pod is a container. Its start command is what runs at boot, its persistent storage is a network volume mounted
+at `/workspace`, and it is reached through a public IP with a mapped ssh port and through RunPod's HTTP proxy. This
+folder's `provider.py` is the RunPod half of the driver, moved here verbatim in base 2.2.0.
+
+## What you need on the Mac
+
+- **The API key.** `RUNPOD_API_KEY` in the environment, else `~/.runpod/config.toml` as written by
+  `runpodctl config --apiKey=<key>`. It is sent as a bearer header and is never printed, logged or put in an argument.
+- **An ssh key.** `~/.ssh/id_ed25519` and its `.pub`; `--pubkey` names another.
+- `uv` (the driver is a `uv run` script with no dependencies).
+
+## What the pod needs
+
+- **`PUBLIC_KEY`** in the pod's env, set to the Mac's public key. `podctl ensure` sets it (the pod resets); the base's
+  `boot.sh` writes it to `/root/.ssh/authorized_keys` and starts sshd on 22. No key, no sshd: the base never starts a
+  listener nobody can log in to.
+- **A network volume at `/workspace`** (`volumeMountPath`). The base installs itself to `/workspace/comfy-base` and the
+  packages to `/workspace/packages`, so a stop, start or redeploy keeps everything. `podctl install` records the volume's
+  size in `state/volume.env` because `df` on the pooled volume reports the pool, not the quota.
+- **22/tcp exposed.** `ensure` adds it when missing (the pod resets).
+
+## How the boot is handed over
+
+`podctl ensure <pod>` wraps the image's own start command with the boot guard:
+
+    bash -c "if [ -x /workspace/comfy-base/boot.sh ]; then exec bash /workspace/comfy-base/boot.sh; fi; <sshd bootstrap>; exec <the image's own entry>"
+
+Before the base is installed that boots the image as it was, plus sshd. Afterwards the base's `boot.sh` is PID 1:
+sshd, JupyterLab (only with `JUPYTER_TOKEN` or `JUPYTER_PASSWORD` set), the saved tokens, provisioning, ComfyUI with
+the base's launch line, then `sleep infinity`. The image's entry is read from Docker Hub's registry; pass
+`--entry '<its start command>'` for an image the registry cannot describe. `ensure` is idempotent: a pod that already
+carries the guard is not patched and its image is never fetched. RunPod has no systemd, so this wrap is the whole
+mechanism; `BASE_HOST` is detected on the pod itself from PID 1's `RUNPOD_POD_ID`.
+
+## The addresses
+
+- **ssh: `<public ip>:<mapped port>`**, user `root`. The mapped port changes on every start, which is why `start --wait`,
+  `restart --wait` and `deploy --wait` rewrite the `Host runpod` block in `~/.ssh/config` (HostName and Port only; every
+  other byte of the file stays). `ssh-config <pod>` rewrites it by hand.
+- **HTTP: RunPod's proxy**, `https://<pod id>-8188.proxy.runpod.net` for ComfyUI and `-8888` for JupyterLab. The proxy
+  reaches the container from outside, so ComfyUI and JupyterLab must bind `0.0.0.0` on this host: `BASE_LISTEN=0.0.0.0`,
+  the one host where it is not loopback. JupyterLab on a proxy URL is root on the box; it starts only with a token.
+- **The tunnel**, `podctl tunnel <pod>`: the ONE ssh session that forwards 8188 and 8888 to `localhost` (`--port` adds
+  more). Use it for the canvas tools and the browser when the proxy is not wanted; command sessions carry no forwards,
+  so nothing else fights the tunnel for the ports.
+
+## The commands
+
+    uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
+    uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
+    uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
+    uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run with --latest, poll, logs, pins
+    uv run "_build/pod/podctl.py" stop|start|restart <pod> --wait
+    uv run "_build/pod/podctl.py" deploy --like <pod> --wait    # a NEW pod cloned onto the same volume (a machine whose GPU is not ours)
+    uv run "_build/pod/podctl.py" lease <pod> [--take|--release] [--minutes N] [--purpose ...]   # who holds the GPU; advisory, expires
+    uv run "_build/pod/podctl.py" tunnel <pod>                  # 8188 and 8888 to localhost, until killed
+    uv run "_build/pod/podctl.py" prune <pod> [--yes]           # the old-layout folders under /workspace/packages
+
+`--provider runpod` is the default when the repository's `brand.toml` names no other host. The handbook's section 1
+("Step zero") and section 7 ("State on the pod") carry the details this page leaves out.

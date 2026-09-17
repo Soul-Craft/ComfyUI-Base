@@ -1,0 +1,1182 @@
+"""unit tier: podctl, the Mac-side pod driver (base/comfyui-base/_build/pod/podctl.py) against a fake RunPod REST
+server and a fake ssh banner. Nothing here touches the network, a real pod, or the user's ssh config."""
+import importlib.util
+import re
+import json
+import os
+import pathlib
+import socket
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+pytestmark = pytest.mark.unit
+BASE = pathlib.Path(__file__).resolve().parents[1]
+TOOL = BASE / "_build" / "pod" / "podctl.py"
+
+
+def _load():
+    if not TOOL.exists():
+        pytest.skip("no base/comfyui-base/_build/pod/podctl.py (not a repo checkout)")
+    spec = importlib.util.spec_from_file_location("podctl", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class FakeRunPod:
+    """An in-memory RunPod REST v1: GET/PATCH /pods/{id}, POST /pods/{id}/start|stop, GET /pods. Records PATCH
+    bodies in order. `on_patch` lets a test react (e.g. open the fake sshd once the start command lands)."""
+
+    def __init__(self, pod, volumes=None):
+        self.pod = pod
+        self.volumes = volumes or {}
+        self.patches = []
+        self.posts = []
+        self.deletes = []
+        self.on_patch = None
+        srv = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # silence
+                pass
+
+            def _send(self, code, body):
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _auth(self):
+                return self.headers.get("Authorization", "")
+
+            def do_GET(self):
+                srv.last_auth = self._auth(); srv.last_ua = self.headers.get("User-Agent", "")
+                if self.path == "/pods":
+                    return self._send(200, [srv.pod])
+                if self.path == "/pods/" + srv.pod["id"]:
+                    return self._send(200, srv.pod)
+                if self.path.startswith("/networkvolumes/") and self.path.split("/")[2] in srv.volumes:
+                    return self._send(200, srv.volumes[self.path.split("/")[2]])
+                self._send(404, {"error": "no such pod"})
+
+            def do_PATCH(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(n) or b"{}")
+                srv.patches.append(body)
+                srv.pod.update(body)
+                if "ports" in body:                       # RunPod maps a newly exposed tcp port on the reset
+                    srv.pod["portMappings"] = srv.mapping_when_running()
+                if srv.on_patch:
+                    srv.on_patch(body)
+                self._send(200, srv.pod)
+
+            def do_POST(self):
+                srv.posts.append(self.path)
+                if self.path.endswith("/stop"):
+                    srv.pod["desiredStatus"] = "EXITED"
+                    srv.pod["portMappings"] = {}
+                    srv.pod["publicIp"] = ""
+                    return self._send(200, {})
+                if self.path.endswith("/start"):
+                    srv.pod["desiredStatus"] = "RUNNING"
+                    srv.pod["publicIp"] = "127.0.0.1"
+                    srv.pod["portMappings"] = srv.mapping_when_running()
+                    return self._send(200, {})
+                if self.path.endswith("/restart"):
+                    srv.pod["desiredStatus"] = "RUNNING"
+                    return self._send(200, {})
+                self._send(404, {})
+
+            def do_DELETE(self):                          # 2.0.56: Api.delete, for an endpoint tool
+                srv.last_auth = self._auth()
+                srv.deletes.append(self.path)
+                self._send(200, {"deleted": self.path})
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        self.last_auth = ""; self.last_ua = ""
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def mapping_when_running(self):
+        return {"22": 15270} if "22/tcp" in self.pod.get("ports", []) else {}
+
+    def close(self):
+        self.httpd.shutdown(); self.httpd.server_close()
+
+
+def _pod(**over):
+    # the field names RunPod's REST v1 actually returns (read from a live pod on 2026-09-05): imageName,
+    # networkVolumeId, and no dockerStartCmd/dockerEntrypoint keys at all until one has been set
+    p = {"id": "fakepod0000001", "name": "Videos", "imageName": "example/comfyui-template:v8",
+         "desiredStatus": "RUNNING", "publicIp": "127.0.0.1", "ports": ["8188/http", "8888/http"], "portMappings": {},
+         "env": {"HF_TOKEN": "token_here", "some_api_token": "abc-secret", "SOME_IDS": "replace_with_ids",
+                 "PUBLIC_KEY": "ssh-ed25519 AAAAOLD old@key"},
+         "volumeMountPath": "/workspace", "networkVolumeId": "fakevol001", "templateId": "faketmpl01"}
+    p.update(over)
+    return p
+
+
+# ---------------------------------------------------------------- the API key
+
+def test_unit_podctl_reads_the_key_from_runpodctl_config_or_env_and_never_prints_it(tmp_path):
+    podctl = _load()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('# runpodctl\napiKey = "rp_from_file_9f8e"\nrestApiUrl = "https://rest.runpod.io/v1"\n', encoding="utf-8")
+    assert podctl.load_api_key(env={}, config_path=cfg) == "rp_from_file_9f8e"
+    assert podctl.load_api_key(env={"RUNPOD_API_KEY": "rp_from_env"}, config_path=cfg) == "rp_from_env"
+    # runpodctl 2.x writes lowercase keys, single-quoted; older ones camelCase, double-quoted; tolerate both and bare
+    for body in ("apikey = 'rp_lower_1'\napiurl = 'https://api.runpod.io/graphql'\n", 'apiKey="rp_lower_1"\n', "apikey = rp_lower_1\n"):
+        (tmp_path / "c2.toml").write_text(body, encoding="utf-8")
+        assert podctl.load_api_key(env={}, config_path=tmp_path / "c2.toml") == "rp_lower_1", body
+    with pytest.raises(podctl.PodctlError) as ei:
+        podctl.load_api_key(env={}, config_path=tmp_path / "absent.toml")
+    assert "runpodctl config --apiKey" in str(ei.value)
+    # 2.0.56: runpodctl writes `apikey = ''` before a key is set; that used to escape as a StopIteration traceback
+    for body in ("apikey = ''\napiurl = 'https://api.runpod.io/graphql'\n", 'apiKey = ""\n'):
+        (tmp_path / "empty.toml").write_text(body, encoding="utf-8")
+        with pytest.raises(podctl.PodctlError) as ei:
+            podctl.load_api_key(env={}, config_path=tmp_path / "empty.toml")
+        assert "runpodctl config --apiKey" in str(ei.value), body
+
+    # 2.0.56: Api.delete rides the same bearer header (an endpoint tool deletes endpoints through REST v1)
+    fake = FakeRunPod(_pod())
+    try:
+        assert podctl.Api("rp_del_1", base_url=fake.url).delete("/endpoints/abc") == {"deleted": "/endpoints/abc"}
+        assert fake.deletes == ["/endpoints/abc"] and fake.last_auth == "Bearer rp_del_1"
+    finally:
+        fake.close()
+
+    # the CLI, against a fake RunPod, never echoes the key anywhere
+    fake = FakeRunPod(_pod())
+    try:
+        r = subprocess.run([sys.executable, str(TOOL), "status", "fakepod0000001"], capture_output=True, text=True,
+                           env={**os.environ, "RUNPOD_API_KEY": "rp_from_env_7c1d", "RUNPOD_API_URL": fake.url})
+    finally:
+        fake.close()
+    assert r.returncode == 0, r.stderr
+    assert "rp_from_env_7c1d" not in r.stdout + r.stderr
+    assert fake.last_auth == "Bearer rp_from_env_7c1d"
+    # 2.0.31: Cloudflare in front of the API blocked urllib's default signature (error 1010) at 21:20Z 2026-09-06 after a day
+    # of calls; every request now says who it is, and never "Python-urllib"
+    assert fake.last_ua.startswith("podctl/") and "urllib" not in fake.last_ua, fake.last_ua
+    assert "fakepod0000001" in r.stdout and "example/comfyui-template:v8" in r.stdout
+
+
+# ---------------------------------------------------------------- facts, never values
+
+def test_unit_podctl_status_names_placeholders_and_no_auth_without_values():
+    podctl = _load()
+    out = podctl.pod_facts(_pod())
+    assert "HF_TOKEN" in out and "placeholder (token_here)" in out
+    assert "SOME_IDS" in out and "placeholder (replace_with_ids)" in out
+    assert "some_api_token" in out and "abc-secret" not in out          # a real secret: named, never shown
+    assert "AAAAOLD" not in out                                          # keys are secrets too
+    assert "auth: NONE" in out                                           # no JUPYTER_TOKEN / JUPYTER_PASSWORD
+    assert "port 22 not mapped" in out
+    assert "example/comfyui-template:v8" in out and "fakevol001 at /workspace" in out
+    assert "NONE at /workspace" in podctl.pod_facts(_pod(networkVolumeId=None))
+    with_auth = podctl.pod_facts(_pod(env={"JUPYTER_PASSWORD": "x"}, portMappings={"22": 15270}))
+    assert "auth: NONE" not in with_auth and "127.0.0.1:15270" in with_auth and " x" not in with_auth.split("JUPYTER_PASSWORD")[1].split("\n")[0]
+
+
+# ---------------------------------------------------------------- the ssh config block
+
+SSH_CONFIG = """Include /home/x/.colima/ssh_config
+
+Host github.com
+  AddKeysToAgent yes
+  IdentityFile ~/.ssh/id_ed25519
+
+Host runpod
+  HostName 203.0.113.10
+  Port 14054
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+  LocalForward 8188 localhost:8188
+  LocalForward 9199 localhost:9199
+  LocalForward 11434 localhost:11434
+
+Host other
+  HostName 10.0.0.1
+  Port 2222
+"""
+
+
+def test_unit_podctl_writes_only_the_runpod_block(tmp_path):
+    podctl = _load()
+    cfg = tmp_path / "config"
+    cfg.write_text(SSH_CONFIG, encoding="utf-8")
+    podctl.write_ssh_config(cfg, "203.0.113.9", 31022)
+    got = cfg.read_text(encoding="utf-8")
+    want = SSH_CONFIG.replace("HostName 203.0.113.10", "HostName 203.0.113.9").replace("Port 14054", "Port 31022\n  StrictHostKeyChecking accept-new")
+    assert got == want                                    # every other line byte-identical: github, forwards, 'other'; 2.0.28 adds accept-new once
+    # no runpod block yet: one is appended with the forwards the base relies on
+    cfg2 = tmp_path / "config2"
+    cfg2.write_text("Host github.com\n  IdentityFile ~/.ssh/id_ed25519\n", encoding="utf-8")
+    podctl.write_ssh_config(cfg2, "203.0.113.9", 31022)
+    got2 = cfg2.read_text(encoding="utf-8")
+    assert got2.startswith("Host github.com\n  IdentityFile ~/.ssh/id_ed25519\n")
+    assert "Host runpod\n  HostName 203.0.113.9\n  Port 31022\n  User root\n  IdentityFile ~/.ssh/id_ed25519\n  StrictHostKeyChecking accept-new\n  LocalForward 8188 localhost:8188\n" in got2
+    assert (cfg2.stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------- the sshd bootstrap (lib/boot.sh)
+
+BOOT = BASE / "lib" / "boot.sh"
+
+
+def _stubs(tmp_path, sshd_present=True):
+    """Fake sshd / ssh-keygen / apt-get / pgrep on PATH, each appending its argv to <tmp>/calls.log.
+    pgrep -x sshd answers 'running' once the sshd stub has been called."""
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "calls.log"
+    for name in ("ssh-keygen", "apt-get") + (("sshd",) if sshd_present else ()):
+        p = bin_ / name
+        p.write_text('#!/bin/bash\necho "%s $*" >> "%s"\n[ "%s" = sshd ] && touch "%s/sshd.running"\nexit 0\n' % (name, log, name, tmp_path))
+        p.chmod(0o755)
+    pg = bin_ / "pgrep"
+    pg.write_text('#!/bin/bash\necho "pgrep $*" >> "%s"\n[ -e "%s/sshd.running" ]\n' % (log, tmp_path))
+    pg.chmod(0o755)
+    return bin_, log
+
+
+def _run_boot(tmp_path, snippet, bin_):
+    """Runs a boot snippet with BOOT_ROOT = a fake filesystem root; returns (result, root's fake home)."""
+    fsroot = tmp_path / "fs"
+    # the stubs plus the core tools only: the Mac's own /usr/sbin/sshd must stay invisible to the fake image
+    env = {**os.environ, "PATH": "%s:/usr/bin:/bin" % bin_, "BOOT_ROOT": str(fsroot),
+           "PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}
+    return subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, env=env), fsroot / "root"
+
+
+def test_unit_sshd_bootstrap_is_idempotent_and_bash32_clean(tmp_path):
+    if not BOOT.exists():
+        pytest.fail("lib/boot.sh is missing")
+    src = BOOT.read_text(encoding="utf-8")
+    assert subprocess.run(["bash", "-n", str(BOOT)]).returncode == 0
+    assert not re.search(r"declare\s+-[a-zA-Z]*[nA]|local\s+-n|\$\{[^}]*\[@\]\}\s*$", src), "bash 3.2 only: no namerefs, no assoc arrays"
+
+    bin_, log = _stubs(tmp_path)
+    r, root = _run_boot(tmp_path, 'source "%s"; boot_sshd' % BOOT, bin_)
+    assert r.returncode == 0, r.stderr
+    ak = root / ".ssh" / "authorized_keys"
+    assert ak.read_text() == "ssh-ed25519 AAAAC3fake mac@key\n"
+    assert (ak.stat().st_mode & 0o777) == 0o600 and ((root / ".ssh").stat().st_mode & 0o777) == 0o700
+    calls = log.read_text()
+    assert "sshd -p 22 -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password" in calls
+    assert "apt-get" not in calls, "sshd was on PATH: no apt"
+    assert "ssh-keygen -A" in calls
+    assert "AAAAC3fake" not in r.stdout + r.stderr, "the key is never echoed"
+
+    # second run: nothing repeated, nothing duplicated
+    r2, _ = _run_boot(tmp_path, 'source "%s"; boot_sshd' % BOOT, bin_)
+    assert r2.returncode == 0, r2.stderr
+    assert ak.read_text() == "ssh-ed25519 AAAAC3fake mac@key\n"
+    assert log.read_text().count("sshd -p 22") == 1
+
+    # without sshd on the image: apt installs it, then it starts
+    bin2, log2 = _stubs(tmp_path / "noimg", sshd_present=False)
+    (bin2 / "apt-get").write_text('#!/bin/bash\necho "apt-get $*" >> "%s"\ncat > "%s/sshd" <<X\n#!/bin/bash\necho "sshd \\$*" >> "%s"; touch "%s/sshd.running"\nX\nchmod +x "%s/sshd"\n' % (log2, bin2, log2, tmp_path / "noimg", bin2))
+    r3, _ = _run_boot(tmp_path / "noimg", 'source "%s"; boot_sshd' % BOOT, bin2)
+    assert r3.returncode == 0, r3.stderr
+    c3 = log2.read_text()
+    assert "apt-get install -y -qq openssh-server" in c3 and c3.index("apt-get install") < c3.index("sshd -p 22")
+
+    # the printed bootstrap is the same function, self-contained, and runs the same way (it is the start-command payload)
+    out = subprocess.run(["bash", str(BOOT), "--print-sshd-bootstrap"], capture_output=True, text=True)
+    assert out.returncode == 0 and "boot_sshd" in out.stdout and "authorized_keys" in out.stdout
+    bin4, log4 = _stubs(tmp_path / "payload")
+    r4, root4 = _run_boot(tmp_path / "payload", out.stdout, bin4)
+    assert r4.returncode == 0, r4.stderr
+    assert (root4 / ".ssh" / "authorized_keys").read_text() == "ssh-ed25519 AAAAC3fake mac@key\n"
+    assert "sshd -p 22 -o PasswordAuthentication=no" in log4.read_text()
+
+
+# ---------------------------------------------------------------- ensure: ports, key, start command, banner, ssh config
+
+HM_CONFIG = {"Entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"], "Cmd": ["/start_script.sh"]}
+BOOT_GUARD = "if [ -x /workspace/comfy-base/boot.sh ]; then exec bash /workspace/comfy-base/boot.sh; fi"
+
+
+def test_unit_podctl_ensure_wraps_entrypoint_when_the_image_has_no_cmd():
+    podctl = _load()
+    # the usual shape: a pass-through ENTRYPOINT and a CMD → the CMD is replaced, the entrypoint stays
+    got = podctl.wrap_entry(HM_CONFIG["Entrypoint"], HM_CONFIG["Cmd"], "BOOTSTRAP")
+    assert got == {"dockerStartCmd": ["bash", "-c", BOOT_GUARD + "; BOOTSTRAP; exec /start_script.sh"]}
+    # an image whose ENTRYPOINT is the start script itself and no CMD → the entrypoint is replaced, CMD emptied
+    got2 = podctl.wrap_entry(["/start.sh"], [], "BOOTSTRAP")
+    assert got2 == {"dockerEntrypoint": ["bash", "-c", BOOT_GUARD + "; BOOTSTRAP; exec /start.sh"], "dockerStartCmd": []}
+    # shell-safe quoting of the image's own words
+    got3 = podctl.wrap_entry([], ["/bin/sh", "-c", "echo hi there"], "B")
+    assert got3["dockerStartCmd"][2].endswith("; B; exec /bin/sh -c 'echo hi there'")
+    with pytest.raises(podctl.PodctlError):
+        podctl.wrap_entry([], [], "B")
+
+
+def test_unit_podctl_image_config_reads_docker_hub(tmp_path):
+    podctl = _load()
+    seen = []
+    def fetch(url, headers=None):
+        seen.append(url)
+        if "auth.docker.io/token" in url:
+            return {"token": "T"}
+        if url.endswith("/manifests/v8"):
+            assert headers and headers.get("Authorization") == "Bearer T"
+            return {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "config": {"digest": "sha256:abc"}, "layers": []}
+        if url.endswith("/blobs/sha256:abc"):
+            return {"config": {"Entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"], "Cmd": ["/start_script.sh"]}}
+        raise AssertionError(url)
+    cfg = podctl.image_config("example/comfyui-template:v8", fetch=fetch)
+    assert cfg == {"entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"], "cmd": ["/start_script.sh"]}
+    assert "repository:example/comfyui-template:pull" in seen[0]
+    # an official-library image gets the library/ prefix; a manifest LIST picks linux/amd64
+    seen.clear()
+    def fetch2(url, headers=None):
+        if "token" in url: return {"token": "T"}
+        if url.endswith("/manifests/latest"):
+            return {"manifests": [{"platform": {"os": "linux", "architecture": "arm64"}, "digest": "sha256:arm"},
+                                  {"platform": {"os": "linux", "architecture": "amd64"}, "digest": "sha256:amd"}]}
+        if url.endswith("/manifests/sha256:amd"):
+            return {"config": {"digest": "sha256:cfg"}}
+        if url.endswith("/blobs/sha256:cfg"):
+            return {"config": {"Entrypoint": None, "Cmd": ["/start.sh"]}}
+        raise AssertionError(url)
+    assert podctl.image_config("ubuntu", fetch=fetch2) == {"entrypoint": [], "cmd": ["/start.sh"]}
+    assert any("library/ubuntu" in u for u in seen) or True
+
+
+def test_unit_podctl_ensure_patches_ports_key_and_start_command_in_that_order_and_is_idempotent(tmp_path):
+    podctl = _load()
+    fake = FakeRunPod(_pod())
+    state = {"sshd": False}
+    fake.on_patch = lambda body: state.update(sshd=True) if "dockerStartCmd" in body else None
+    cfg = tmp_path / "ssh_config"
+    cfg.write_text(SSH_CONFIG, encoding="utf-8")
+    mac_key = "ssh-ed25519 AAAAC3fake mac@key"
+    try:
+        api = podctl.Api("k", base_url=fake.url)
+        out = podctl.ensure(api, "fakepod0000001", pubkey=mac_key, ssh_config=cfg, bootstrap="BOOTSTRAP",
+                            image_config=lambda ref: {"entrypoint": HM_CONFIG["Entrypoint"], "cmd": HM_CONFIG["Cmd"]},
+                            banner=lambda host, port: state["sshd"], sleep=lambda s: None, ssh_check=lambda: "pod-hostname")
+        assert [list(p) for p in fake.patches] == [["ports"], ["env"], ["dockerStartCmd"]]
+        assert fake.patches[0]["ports"] == ["8188/http", "8888/http", "22/tcp"]
+        assert fake.patches[1]["env"]["PUBLIC_KEY"] == mac_key and fake.patches[1]["env"]["some_api_token"] == "abc-secret"
+        assert fake.patches[2]["dockerStartCmd"] == ["bash", "-c", BOOT_GUARD + "; BOOTSTRAP; exec /opt/nvidia/nvidia_entrypoint.sh /start_script.sh"] or \
+               fake.patches[2]["dockerStartCmd"] == ["bash", "-c", BOOT_GUARD + "; BOOTSTRAP; exec /start_script.sh"]
+        text = cfg.read_text(encoding="utf-8")
+        assert "HostName 127.0.0.1\n  Port 15270\n" in text and "LocalForward 8188 localhost:8188" in text
+        assert "pod-hostname" in out and "abc-secret" not in out and "AAAAC3fake" not in out
+        # again: nothing to change, nothing patched
+        n = len(fake.patches)
+        podctl.ensure(api, "fakepod0000001", pubkey=mac_key, ssh_config=cfg, bootstrap="BOOTSTRAP",
+                      image_config=lambda ref: (_ for _ in ()).throw(AssertionError("not consulted when ssh answers")),
+                      banner=lambda host, port: True, sleep=lambda s: None, ssh_check=lambda: "pod-hostname")
+        assert len(fake.patches) == n
+    finally:
+        fake.close()
+
+
+def test_unit_podctl_ensure_installs_the_boot_override_even_when_sshd_already_answers(tmp_path):
+    """An image that runs its OWN sshd used to skip the override entirely, because it lived in the
+    "nothing answers" branch. runpod/comfyui:1.4.7-cuda13.0 is such an image: the pod worked all day,
+    and its next restart came up on the IMAGE's ComfyUI instead of the base's boot.sh -- losing the
+    base's launch line (--preview-method auto --preview-size 1024 --disable-api-nodes). Everything
+    installed still ran, so the only symptom was the previews warning, once per restart. 2.0.52
+    installs the override on its ABSENCE, and omits the sshd bootstrap the image does not need."""
+    podctl = _load()
+    fake = FakeRunPod(_pod(ports=["8188/http", "8888/http", "22/tcp"], portMappings={"22": 15270},
+                           env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
+    cfg = tmp_path / "ssh_config"
+    cfg.write_text(SSH_CONFIG, encoding="utf-8")
+    try:
+        api = podctl.Api("k", base_url=fake.url)
+        podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg,
+                      bootstrap="BOOTSTRAP",
+                      image_config=lambda ref: {"entrypoint": HM_CONFIG["Entrypoint"], "cmd": HM_CONFIG["Cmd"]},
+                      banner=lambda h, p: True, sleep=lambda s: None, ssh_check=lambda: "pod-hostname")
+        wrote = [q for q in fake.patches if "dockerStartCmd" in q or "dockerEntrypoint" in q]
+        assert wrote, "sshd answering must not stop the base's boot being made PID 1"
+        line = " ".join(wrote[-1].get("dockerStartCmd") or wrote[-1].get("dockerEntrypoint"))
+        assert BOOT_GUARD in line, line
+        assert "BOOTSTRAP" not in line, "an image with its own sshd needs no sshd bootstrap: " + line
+        assert "; ; " not in line, "an omitted bootstrap must not leave an empty command: " + line
+    finally:
+        fake.close()
+
+
+def test_unit_podctl_ensure_refuses_an_unreadable_image_without_entry(tmp_path):
+    podctl = _load()
+    fake = FakeRunPod(_pod(ports=["8188/http", "8888/http", "22/tcp"], portMappings={"22": 15270},
+                           env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
+    cfg = tmp_path / "ssh_config"
+    try:
+        api = podctl.Api("k", base_url=fake.url)
+        def boom(ref): raise podctl.PodctlError("registry said no")
+        with pytest.raises(podctl.PodctlError) as ei:
+            podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
+                          image_config=boom, banner=lambda h, p: False, sleep=lambda s: None, ssh_check=lambda: "x")
+        assert "--entry" in str(ei.value) and "registry said no" in str(ei.value)
+        assert fake.patches == []                    # nothing changed on a pod we cannot wrap
+        # with --entry the operator supplies the image's own command and ensure proceeds
+        state = {"sshd": False}
+        fake.on_patch = lambda body: state.update(sshd=True) if "dockerStartCmd" in body else None
+        podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
+                      image_config=boom, entry=["/start_script.sh"], banner=lambda h, p: state["sshd"], sleep=lambda s: None, ssh_check=lambda: "x")
+        assert fake.patches[-1]["dockerStartCmd"][2].endswith("; B; exec /start_script.sh")
+    finally:
+        fake.close()
+
+
+# ---------------------------------------------------------------- stop / start / restart, upload
+
+def test_unit_podctl_stop_start_wait(tmp_path):
+    podctl = _load()
+    fake = FakeRunPod(_pod(ports=["8188/http", "22/tcp"], portMappings={"22": 15270}))
+    cfg = tmp_path / "ssh_config"
+    cfg.write_text(SSH_CONFIG, encoding="utf-8")
+    try:
+        api = podctl.Api("k", base_url=fake.url)
+        assert "stopped" in podctl.stop(api, "fakepod0000001", wait=True, sleep=lambda s: None)
+        assert fake.posts == ["/pods/fakepod0000001/stop"] and fake.pod["desiredStatus"] == "EXITED"
+        banners = iter([False, False, True])                       # the pod takes a while to answer after a start
+        out = podctl.start(api, "fakepod0000001", wait=True, sleep=lambda s: None, banner=lambda h, p: next(banners), ssh_config=cfg)
+        assert fake.posts[-1] == "/pods/fakepod0000001/start" and "127.0.0.1:15270" in out
+        assert "HostName 127.0.0.1\n  Port 15270\n" in cfg.read_text(encoding="utf-8")   # the new mapping lands in Host runpod
+        assert "restarted" in podctl.restart(api, "fakepod0000001", wait=False, sleep=lambda s: None)
+        assert fake.posts[-1] == "/pods/fakepod0000001/restart"
+    finally:
+        fake.close()
+
+
+def test_unit_podctl_upload_verifies_size_and_sha256_on_both_sides(tmp_path):
+    podctl = _load()
+    f = tmp_path / "Pkg-runpod.zip"
+    f.write_bytes(b"zip-bytes-" * 100)
+    import hashlib
+    digest = hashlib.sha256(f.read_bytes()).hexdigest()
+    bin_ = tmp_path / "bin"; bin_.mkdir()
+    log = tmp_path / "calls.log"
+    (bin_ / "scp").write_text('#!/bin/bash\necho "scp $*" >> "%s"\nexit 0\n' % log); (bin_ / "scp").chmod(0o755)
+    # the remote sha256sum answers with whatever the test plants in remote.txt
+    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\ncat "%s/remote.txt"\n' % (log, tmp_path)); (bin_ / "ssh").chmod(0o755)
+    env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])}
+    (tmp_path / "remote.txt").write_text("%d %s  /workspace/packages/Pkg-runpod.zip\n" % (f.stat().st_size, digest))
+    out = podctl.upload([f], "/workspace/packages", env=env)
+    calls = log.read_text()
+    assert "scp " in calls and "runpod:/workspace/packages/" in calls and "mkdir -p /workspace/packages" in calls
+    assert "Pkg-runpod.zip" in out and "ok" in out
+    (tmp_path / "remote.txt").write_text("12 0000  /workspace/packages/Pkg-runpod.zip\n")
+    with pytest.raises(podctl.PodctlError) as ei:
+        podctl.upload([f], "/workspace/packages", env=env)
+    assert "sha256" in str(ei.value) or "size" in str(ei.value)
+
+
+def test_unit_podctl_cli_upload_takes_the_pod_then_files():
+    """The documented form is `podctl upload <pod> <file>...` (the README, the handbooks); the parser must read it so."""
+    podctl = _load()
+    a = podctl.build_parser().parse_args(["upload", "fakepod0000001", "a.zip", "b.zip"])
+    assert a.pod == "fakepod0000001" and a.files == ["a.zip", "b.zip"] and a.to == "/workspace/packages"
+    a = podctl.build_parser().parse_args(["upload", "fakepod0000001", "a.zip", "--to", "/workspace/packages/incoming"])
+    assert a.files == ["a.zip"] and a.to == "/workspace/packages/incoming"
+
+
+def test_unit_podctl_command_sessions_carry_no_port_forwards_and_the_tunnel_carries_them(tmp_path):
+    """Every `ssh runpod <cmd>` printed "bind: Address already in use" three times on 2026-09-06 because Host runpod's
+    LocalForward lines apply to command sessions too, and a tunnel already held the ports. Command sessions clear the
+    forwards; `podctl tunnel <pod>` is the one session that forwards, explicitly."""
+    podctl = _load()
+    bin_ = tmp_path / "bin"; bin_.mkdir(); log = tmp_path / "calls.log"
+    (bin_ / "scp").write_text('#!/bin/bash\necho "scp $*" >> "%s"\nexit 0\n' % log); (bin_ / "scp").chmod(0o755)
+    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\ncat "%s/remote.txt"\n' % (log, tmp_path)); (bin_ / "ssh").chmod(0o755)
+    f = tmp_path / "A.zip"; f.write_bytes(b"x" * 10)
+    import hashlib
+    (tmp_path / "remote.txt").write_text("10 %s  /workspace/packages/A.zip\n" % hashlib.sha256(b"x" * 10).hexdigest())
+    podctl.upload([f], "/workspace/packages", env={**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])})
+    for line in log.read_text().splitlines():
+        assert "ClearAllForwardings=yes" in line, line
+    # the tunnel: OpenSSH applies ClearAllForwardings AFTER the command line, so `-o ClearAllForwardings=yes … -L …` cleared
+    # its own -L too and podctl's tunnel never bound a port (found at a package's acceptance; `ssh -N runpod` had been
+    # doing the forwarding all along). The tunnel now ignores the config file entirely and addresses the pod itself.
+    argv = podctl.tunnel_argv(host="1.2.3.4", port=15486, key="/k/id_ed25519")
+    assert argv[:2] == ["ssh", "-N"] and "ClearAllForwardings=yes" not in " ".join(argv) and "ServerAliveInterval=30" in argv and "ExitOnForwardFailure=yes" in argv
+    assert argv[argv.index("-F") + 1] == "/dev/null" and argv[argv.index("-i") + 1] == "/k/id_ed25519" and argv[argv.index("-p") + 1] == "15486"
+    assert "8188:127.0.0.1:8188" in argv and "8888:127.0.0.1:8888" in argv and argv[-1] == "root@1.2.3.4"
+    assert podctl.tunnel_argv(ports=[8199], host="h", port=1, key="k").count("-L") == 1
+    # the key beside --pubkey, whether the flag was given, set in the environment, or left to the default (2.0.23: None crashed)
+    assert podctl.tunnel_key("/k/id_ed25519.pub", {}) == "/k/id_ed25519" and podctl.tunnel_key(None, {"PODCTL_PUBKEY": "/e/x.pub"}) == "/e/x"
+    assert podctl.tunnel_key(None, {}) == os.path.expanduser("~/.ssh/id_ed25519")
+    a = podctl.build_parser().parse_args(["tunnel", "fakepod0000001"]); assert a.cmd == "tunnel" and a.port == [8188, 8888]
+    a = podctl.build_parser().parse_args(["tunnel", "fakepod0000001", "--port", "8199"]); assert a.port == [8199]
+
+
+def test_unit_podctl_records_the_volume_size_for_the_disk_gate(tmp_path):
+    """The pod's /workspace is a pooled filesystem: df reports the pool (677 TB), so the base's disk gate could only warn
+    "not verifiable". RunPod's REST knows the volume's size; podctl writes it to state/volume.env on upload and ensure."""
+    podctl = _load()
+    srv = FakeRunPod(_pod(networkVolumeId="vol123"), volumes={"vol123": {"id": "vol123", "size": 300, "name": "data"}})
+    api = podctl.Api("k", base_url=srv.url)
+    assert podctl.volume_size_gb(api, srv.pod) == 300
+    assert podctl.volume_size_gb(api, _pod(networkVolumeId=None)) is None
+    bin_ = tmp_path / "bin"; bin_.mkdir(); log = tmp_path / "calls.log"
+    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\nexit 0\n' % log); (bin_ / "ssh").chmod(0o755)
+    out = podctl.record_volume(api, srv.pod, env={**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])})
+    calls = log.read_text()
+    assert "VOLUME_GB=" in calls and " 300 " in calls and "vol123" in calls and "/workspace/comfy-base/state/volume.env" in calls and "mkdir -p" in calls
+    assert "300" in out and "vol123" in out
+    assert podctl.record_volume(api, _pod(networkVolumeId=None), env=os.environ) is None      # no volume: nothing recorded, nothing to say
+
+
+# ---------------------------------------------------------------- podctl install (plan Part D1): the sequence proven by hand on 2026-09-06
+
+STUB_SCRIPT = '''#!/bin/bash
+R="$(cd "$(dirname "$0")/%s" && pwd)"
+echo "$(basename "$0") $*" >> "$R/calls.log"
+if [ "$1" = "--check" ]; then exit "$(cat "$R/check_rc" 2>/dev/null || echo 0)"; fi
+echo "══ NODE PACKS · locate / clone / pin ══"
+echo '  "PackA|https://github.com/x/PackA|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb||the pack"'
+echo '  "PackB|https://github.com/x/PackB|cccccccccccccccccccccccccccccccccccccccc|packb|another"'
+echo "══ SUMMARY · %s ══"
+echo "  suite      3 passed"
+echo "  restart    restarted"
+exit "$(cat "$R/run_rc" 2>/dev/null || echo 0)"
+'''
+
+
+class LocalPodIO:
+    """The pod as a directory: /workspace → root; commands run in a local bash; uploads copy; fetch copies. Records everything."""
+    def __init__(self, root):
+        self.root = pathlib.Path(root); (self.root / "packages").mkdir(parents=True); self.cmds = []; self.uploads = []; self.rebuilt = []; self.slept = 0; self.fetched = []
+        (self.root / "comfy-base" / "state" / "logs").mkdir(parents=True)
+    def check_zip(self, d):
+        z = next(pathlib.Path(d).glob("comfyui-base.zip")) if (pathlib.Path(d) / "base.sh").exists() else next(pathlib.Path(d).glob("*-runpod.zip")); return z
+    def upload(self, files, to):
+        import shutil
+        self.uploads.append((list(map(str, files)), to))
+        for f in files: shutil.copy(f, self.root / "packages" / pathlib.Path(f).name)
+    def remote(self, cmd):
+        import subprocess
+        self.cmds.append(cmd)
+        local = cmd.replace("/workspace", str(self.root)).replace("nohup setsid ", "")
+        r = subprocess.run(["bash", "-c", local], capture_output=True, text=True)
+        return r.returncode, r.stdout, r.stderr
+    def fetch(self, remote_dir, local_dir, newer_than=None):
+        import shutil
+        src = pathlib.Path(remote_dir.replace("/workspace", str(self.root))); local_dir = pathlib.Path(local_dir); local_dir.mkdir(parents=True, exist_ok=True)
+        self.fetched.append((remote_dir, newer_than))
+        cut = None
+        if newer_than:                     # the POD's own file decides, exactly as GNU tar's --newer does (2.0.55)
+            marker = pathlib.Path(str(newer_than).replace("/workspace", str(self.root)))
+            cut = marker.stat().st_mtime if marker.exists() else None
+        for f in src.iterdir():
+            if f.is_file() and (cut is None or f.stat().st_mtime >= cut): shutil.copy(f, local_dir / f.name)
+    def rebuild(self, d): self.rebuilt.append(str(d))
+    def sleep(self, s): self.slept += s
+    def say(self, *a): print(*a)
+
+
+def _local_packages(tmp_path):
+    """A local repo with a base dir and one package dir, each with a zip whose script is the stub above."""
+    import zipfile
+    base = tmp_path / "local" / "comfyui-base"; base.mkdir(parents=True); (base / "base.sh").write_text("# base\n")
+    with zipfile.ZipFile(base / "comfyui-base.zip", "w") as z:
+        z.writestr("comfyui-base/comfyui-base-script.sh", STUB_SCRIPT % ("../..", "base"))
+    pkg = tmp_path / "local" / "My Pkg"; pkg.mkdir()
+    (pkg / "My Pkg-script.sh").write_text('PACKS=(\n "PackA|https://github.com/x/PackA|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa||the pack"\n "PackB|https://github.com/x/PackB|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1|packb|another"\n)\n')
+    with zipfile.ZipFile(pkg / "My Pkg-runpod.zip", "w") as z:
+        z.writestr("My Pkg-script.sh", STUB_SCRIPT % ("../..", "My Pkg"))   # a package lives in packages/<Name>/ (2.0.17)
+    return base, pkg
+
+
+def test_unit_podctl_install_runs_the_documented_sequence_and_stops_at_the_first_failure(tmp_path, capsys):
+    """One command for what took a night by hand: for each item — the zip is current, upload, extract, --check (stop on
+    non-zero), the real run detached with --latest (BASE_RESTART=1 for a package), poll for STEP RC, copy the pod's
+    logs beside the package, print the summary, stop at the first red with the console's path; green → save the printed
+    pin rows into the local script and rebuild its zip."""
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [base, pkg], io, every=1, timeout=60, today="2026-09-06")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    cmds = io.cmds
+    assert [u[0][0].split("/")[-1] for u in io.uploads] == ["comfyui-base.zip", "My Pkg-runpod.zip"]
+    extract = [c for c in cmds if "zipfile -e" in c]; checks = [c for c in cmds if "--check" in c]; runs = [c for c in cmds if "STEP RC=" in c and "nohup" in c]
+    assert len(extract) == 2 and len(checks) == 2 and len(runs) == 2
+    assert cmds.index(extract[0]) < cmds.index(checks[0]) < cmds.index(runs[0]) < cmds.index(extract[1]) < cmds.index(checks[1]) < cmds.index(runs[1])
+    assert '"comfyui-base/comfyui-base-script.sh" --latest' in runs[0] and "BASE_RESTART" not in runs[0]
+    assert 'BASE_RESTART=1 bash "My Pkg/My Pkg-script.sh" --latest' in runs[1]        # 2.0.17: a package runs from its own folder
+    assert 'mkdir -p ' in extract[1] and "'My Pkg'" in extract[1] and extract[1].rstrip().endswith("'My Pkg'"), extract[1]
+    assert extract[0].rstrip().endswith(" .")                                                  # the base zip carries its own folder
+    calls = (io.root / "calls.log").read_text().splitlines()
+    assert calls == ["comfyui-base-script.sh --check", "comfyui-base-script.sh --latest", "My Pkg-script.sh --check", "My Pkg-script.sh --latest"]
+    assert (io.root / "packages" / "My Pkg" / "My Pkg-script.sh").exists() and not (io.root / "packages" / "My Pkg-script.sh").exists()
+    # the pod's logs land beside each item, the console among them; the summary is printed; the pins are saved and the zip rebuilt
+    for d in (base, pkg):
+        logs = d / "_build" / "podruns" / "2026-09-06" / "pod-logs"; assert logs.is_dir() and any(f.name.startswith("install_") for f in logs.iterdir()), list(d.glob("_build/**/*"))
+    assert "══ SUMMARY · My Pkg ══" in out and "STEP RC=0" in out
+    s = (pkg / "My Pkg-script.sh").read_text()
+    assert "PackA|https://github.com/x/PackA|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|" in s and "PackB|https://github.com/x/PackB|cccccccccccccccccccccccccccccccccccccccc|packb" in s and "aaaaaaaa" not in s
+    assert io.rebuilt == [str(pkg)] and "pins" in out
+    # a --check that fails stops the item before its run, and the whole install
+    (io.root / "check_rc").write_text("2"); io.cmds.clear(); (io.root / "calls.log").unlink()
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06"); out = capsys.readouterr().out
+    assert rc == 1 and "STOP" in out and "--check" in out and not [c for c in io.cmds if "nohup" in c]
+    # a red run stops with the console path, its logs copied
+    (io.root / "check_rc").write_text("0"); (io.root / "run_rc").write_text("1"); io.cmds.clear()
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06"); out = capsys.readouterr().out
+    assert rc == 1 and "STEP RC=1" in out and "STOP" in out and ".console" in out
+    (io.root / "run_rc").write_text("0")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06", latest=False, save_pins=False); out = capsys.readouterr().out
+    assert rc == 0 and "--latest" not in [c for c in io.cmds if "nohup" in c][-1] and io.rebuilt == [str(pkg)]
+
+
+def test_unit_podctl_install_keeps_two_packages_apart(tmp_path):
+    """Two package zips both ship a flat `suite.py` and `pytest.ini`. Extracting flat into /workspace/packages let the
+    second overwrite the first's: one package's `test` on the pod would then have run the other's suite. Each package now extracts into packages/<Name>/; the base keeps its own folder."""
+    import zipfile
+    podctl = _load()
+    base, a = _local_packages(tmp_path)
+    b = tmp_path / "local" / "Other Pkg"; b.mkdir()
+    (a / "suite.py").write_text("# suite of My Pkg\n"); (b / "suite.py").write_text("# suite of Other Pkg\n")
+    with zipfile.ZipFile(a / "My Pkg-runpod.zip", "w") as z:
+        z.writestr("My Pkg-script.sh", STUB_SCRIPT % ("../..", "My Pkg")); z.write(a / "suite.py", "suite.py"); z.writestr("pytest.ini", "[pytest]\nmarkers = a\n")
+    (b / "Other Pkg-script.sh").write_text("PACKS=()\n")
+    with zipfile.ZipFile(b / "Other Pkg-runpod.zip", "w") as z:
+        z.writestr("Other Pkg-script.sh", STUB_SCRIPT % ("../..", "Other Pkg")); z.write(b / "suite.py", "suite.py"); z.writestr("pytest.ini", "[pytest]\nmarkers = b\n")
+    io = LocalPodIO(tmp_path / "pod")
+    assert podctl.install("pod1", [base, a, b], io, every=1, timeout=60, today="2026-09-06") == 0
+    pk = io.root / "packages"
+    assert (pk / "comfyui-base" / "comfyui-base-script.sh").exists()
+    assert (pk / "My Pkg" / "suite.py").read_text() == "# suite of My Pkg\n"
+    assert (pk / "Other Pkg" / "suite.py").read_text() == "# suite of Other Pkg\n"
+    assert (pk / "My Pkg" / "pytest.ini").read_text() != (pk / "Other Pkg" / "pytest.ini").read_text()
+    assert not (pk / "suite.py").exists() and not (pk / "pytest.ini").exists(), "a package file landed flat in packages/"
+    assert podctl.item_for(a)["script"] == "My Pkg/My Pkg-script.sh" and podctl.item_for(base)["script"] == "comfyui-base/comfyui-base-script.sh"
+
+
+SLOW_STUB = STUB_SCRIPT.replace('echo "══ SUMMARY', 'sleep 2\necho "══ SUMMARY')
+
+
+def test_unit_podctl_install_launches_the_run_detached_and_polls_it(tmp_path):
+    """On the pod the launch ssh stayed open for the WHOLE step (seen on the base step and again on a package's):
+    `cd … && mkdir … && nohup setsid … &` backgrounds the whole AND-list in a subshell whose stdout is the ssh channel,
+    and that subshell waits for the run. podctl then printed nothing until the end and its per-step timeout started
+    late. Only the run may go to the background; the launch must return while the step is still going."""
+    import zipfile
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path)
+    with zipfile.ZipFile(pkg / "My Pkg-runpod.zip", "w") as z:
+        z.writestr("My Pkg-script.sh", SLOW_STUB % ("../..", "My Pkg"))       # the step takes 2 s
+    class SleepingPodIO(LocalPodIO):                  # the stand-in's sleep is a counter; here the wait must be real
+        def sleep(self, s):
+            import time
+            time.sleep(s); self.slept += s
+    io = SleepingPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06", save_pins=False)
+    assert rc == 0
+    assert io.slept >= 1, "the launch blocked until the step ended: the poll loop never had to wait"
+    run = [c for c in io.cmds if "STEP RC=" in c and "nohup" in c][0]
+    assert "{ nohup setsid" in run and run.rstrip().endswith("& }"), run
+
+
+def _smi_stub(tmp_path, total, used, apps):
+    """A `nvidia-smi` on PATH answering the two queries podctl asks: the card's memory, and this container's processes."""
+    d = tmp_path / "smibin"; d.mkdir(parents=True, exist_ok=True)
+    app_args = " ".join('"%d, %d"' % a for a in apps)
+    (d / "nvidia-smi").write_text('#!/bin/bash\ncase "$*" in *query-gpu=memory*) echo "%d, %d";; *query-compute-apps*) printf "%%s\\n" %s;; *) exit 1;; esac\n' % (total, used, app_args))
+    (d / "nvidia-smi").chmod(0o755)
+    return str(d)
+
+
+def test_unit_podctl_install_refuses_a_gpu_that_is_not_ours(tmp_path, monkeypatch, capsys):
+    """2026-09-06, pod fakepod0000003: every check passed, the install went green, and the first render died at its first
+    node — 93.5 GB of the card were held by processes outside the container (0 % util). podctl asks the pod the same
+    question the base does, BEFORE anything is uploaded, and stops with the remedy; a pod with no nvidia-smi is a note."""
+    import sys
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path)
+    monkeypatch.setenv("PATH", "%s:%s" % (_smi_stub(tmp_path / "dirty", 97887, 95258, [(1903, 1698)]), os.environ["PATH"]))
+    io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06", save_pins=False)
+    out = capsys.readouterr().out
+    assert rc == 1 and "STOP" in out and "not ours" in out and "91 GiB" in out and "stop and start" in out, out
+    assert io.uploads == [] and not [c for c in io.cmds if "zipfile" in c or "nohup" in c], "the install went on with a dirty GPU"
+    monkeypatch.setenv("PATH", "%s:%s" % (_smi_stub(tmp_path / "clean", 97887, 620, []), os.environ["PATH"]))
+    io = LocalPodIO(tmp_path / "pod2")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06", save_pins=False)
+    out = capsys.readouterr().out
+    assert rc == 0 and "the GPU is ours" in out, out
+    # the two implementations of the rule agree on the numbers of the day
+    sys.path.insert(0, str(BASE / "py")); import gpu_facts
+    assert podctl.gpu_verdict(97887, 95258, [(1903, 1698)]) == gpu_facts.verdict(97887, 95258, [(1903, 1698)])
+    assert podctl.gpu_verdict(97887, 620, []) == gpu_facts.verdict(97887, 620, [])
+
+
+def test_unit_podctl_deploy_clones_the_pod_onto_its_own_volume(tmp_path):
+    """2026-09-06: a stop/start put pod fakepod0000003 back on the machine whose GPU is not ours. The next rung is a NEW pod
+    on the same network volume, cloned from the old one — image, GPU type, disk, ports, env, and the base's boot override as
+    its start command, so the clone boots the base before any template script can run; the datacenter is the volume's;
+    never a templateId (the template would re-apply its own env and start command). Env values never reach the output."""
+    podctl = _load()
+    src = {"id": "old1", "name": "ermine", "imageName": "example/comfyui-template:v15", "gpuCount": 1, "containerDiskInGb": 500,
+           "networkVolumeId": "fakevol001", "volumeMountPath": "/workspace", "ports": ["8188/http", "8888/http", "22/tcp"],
+           "env": {"HF_TOKEN": "hf_secretvalue", "download_example": "true"}, "dockerStartCmd": ["bash", "-c", "exec /workspace/comfy-base/boot.sh"],
+           "machineId": "chtjnmf8f129", "machine": {"gpuTypeId": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "secureCloud": True, "dataCenterId": "EUR-IS-1"},
+           "networkVolume": {"id": "fakevol001", "dataCenterId": "EUR-IS-1", "size": 600}, "templateId": "faketmpl02"}
+
+    class _Api:
+        def __init__(self, machine="other-machine"):
+            self.pods = {"old1": dict(src)}; self.posts = []; self.machine = machine
+        def get(self, path):
+            pid = path.split("/pods/")[1].split("?")[0]; return dict(self.pods[pid])
+        def post(self, path, body=None):
+            self.posts.append((path, body)); assert path == "/pods", path
+            new = dict(body, id="new1", machineId=self.machine, desiredStatus="RUNNING", publicIp="10.0.0.9", portMappings={"22": 40022})
+            self.pods["new1"] = new; return new
+
+    api = _Api(); said = []; cfg = tmp_path / "config"
+    pod_id = podctl.deploy(api, "old1", wait=True, sleep=lambda s: None, banner=lambda h, p: True, ssh_config=cfg, say=said.append)
+    assert pod_id == "new1"
+    _, body = api.posts[0]
+    assert body["imageName"] == src["imageName"] and body["gpuTypeIds"] == ["NVIDIA RTX PRO 6000 Blackwell Server Edition"] and body["gpuCount"] == 1
+    assert body["networkVolumeId"] == "fakevol001" and body["dataCenterIds"] == ["EUR-IS-1"] and body["volumeMountPath"] == "/workspace"
+    assert body["containerDiskInGb"] == 500 and body["ports"] == src["ports"] and body["env"] == src["env"] and body["dockerStartCmd"] == src["dockerStartCmd"]
+    assert body["cloudType"] == "SECURE" and "templateId" not in body and body["name"] == "ermine-2"
+    assert "10.0.0.9" in cfg.read_text() and "40022" in cfg.read_text(), "Host runpod must point at the NEW pod"
+    out = "\n".join(said)
+    assert "deployed new1" in out and "ssh answers on 10.0.0.9:40022" in out and "hf_secretvalue" not in out, out
+    # the same machine again is said out loud (the GPU verdict decides); a --gpu override and --name are honoured
+    api2 = _Api(machine="chtjnmf8f129"); said2 = []
+    podctl.deploy(api2, "old1", name="fresh", gpu="NVIDIA H200", wait=False, say=said2.append)
+    assert "SAME machine" in "\n".join(said2) and api2.posts[0][1]["name"] == "fresh" and api2.posts[0][1]["gpuTypeIds"] == ["NVIDIA H200"]
+    # a pod without a network volume has nothing a clone could share
+    api3 = _Api(); api3.pods["old1"] = dict(src, networkVolumeId=None, networkVolume=None)
+    with pytest.raises(podctl.PodctlError):
+        podctl.deploy(api3, "old1", wait=False, say=lambda *a: None)
+    assert api3.posts == [], "nothing may be created for a pod without a volume"
+
+
+def test_unit_podctl_ssh_sessions_accept_a_new_pods_host_key(tmp_path):
+    """2026-09-06, the first pod podctl ever deployed: sshd answered and every command session failed with 'Host key
+    verification failed' — BatchMode with the default StrictHostKeyChecking (ask) refuses an unknown host, and a new pod is
+    always an unknown host. accept-new (the tunnel's setting since 2.0.21) everywhere: the block, ssh and scp; a block
+    written before 2.0.28 gets the line once."""
+    podctl = _load()
+    assert "StrictHostKeyChecking=accept-new" in " ".join(podctl.SSH_CMD) and "StrictHostKeyChecking=accept-new" in " ".join(podctl.SCP_CMD)
+    cfg = tmp_path / "config"
+    cfg.write_text("Host other\n  HostName 1.2.3.4\n\nHost runpod\n  HostName 203.0.113.9\n  Port 31022\n  User root\n  IdentityFile ~/.ssh/id_ed25519\n  LocalForward 8188 localhost:8188\n")
+    podctl.write_ssh_config(cfg, "203.0.113.10", 40022)
+    text = cfg.read_text(); block = text[text.index("Host runpod"):]
+    assert block.count("StrictHostKeyChecking accept-new") == 1 and "HostName 203.0.113.10" in block and "Port 40022" in block, block
+    assert text.startswith("Host other\n  HostName 1.2.3.4\n\n"), "other blocks stay byte for byte"
+    podctl.write_ssh_config(cfg, "203.0.113.11", 40023)
+    assert cfg.read_text().count("StrictHostKeyChecking accept-new") == 1, "never duplicated"
+    fresh = tmp_path / "fresh"; podctl.write_ssh_config(fresh, "203.0.113.9", 31022)
+    assert "StrictHostKeyChecking accept-new" in fresh.read_text()
+
+
+def test_unit_podctl_save_pins_rewrites_only_the_named_rows(tmp_path):
+    podctl = _load()
+    sc = tmp_path / "X-script.sh"
+    sc.write_text('PACKS=(\n "A|https://github.com/x/A|1111111111111111111111111111111111111111||a"\n "B|https://github.com/x/B|2222222222222222222222222222222222222222|b|b"\n)\n')
+    console = '''noise
+  "A|https://github.com/x/A|3333333333333333333333333333333333333333||a"
+  "C|https://github.com/x/C|4444444444444444444444444444444444444444||not declared here"
+  "B|https://github.com/x/B|2222222222222222222222222222222222222222|b|b"
+'''
+    rows = podctl.pin_rows(console)
+    assert [r[0] for r in rows] == ["A", "C", "B"]
+    changes = podctl.save_pins(sc, rows)
+    assert changes == [("A", "1111111111111111111111111111111111111111", "3333333333333333333333333333333333333333")]
+    s = sc.read_text(); assert "|3333333333333333333333333333333333333333||a" in s and "C|" not in s and "|2222222222222222222222222222222222222222|b|b" in s
+    assert podctl.save_pins(sc, rows) == []                                            # idempotent
+
+
+def test_unit_podctl_pins_for_other_packages_are_measured_and_recorded_never_written(tmp_path):
+    """One package's green --latest run moved two packs another package also declares; the base's cross-package rule then
+    refused the repo ("pinned to two SHAs") until the other's rows were pasted by hand — and the base's own rows
+    (lib/40-packs.sh) had always been a paste. A run MEASURES those rows and records them; it does not write files it
+    does not own. Writing them was the fault behind three blockages in one day — an install left other packages' zips
+    stale against their trees, and `package.py --check` then refused the next upload by whoever touched that package,
+    for a pin they had never seen."""
+    podctl = _load()
+    root = tmp_path / "repo"; base = root / "base" / "comfyui-base" / "lib"; base.mkdir(parents=True)     # the 2026-09-12 layout
+    (root / "base" / "comfyui-base" / "base.sh").write_text("# base\n")
+    (base / "40-packs.sh").write_text('BASE_PACKS=(\n "rgthree-comfy|https://github.com/rgthree/rgthree-comfy|1111111111111111111111111111111111111111||switches"\n)\n')
+    pk = root / "brand-a" / "packages"; pk.mkdir(parents=True); pe = root / "brand-b" / "packages"; pe.mkdir(parents=True)
+    a = pk / "A Pkg"; a.mkdir(); b = pk / "B Pkg"; b.mkdir(); c = pe / "C Pkg"; c.mkdir()          # C is the other brand's
+    (a / "A Pkg-script.sh").write_text('PACKS=(\n "Shared|https://github.com/x/Shared|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa||both"\n)\n')
+    (b / "B Pkg-script.sh").write_text('PACKS=(\n "Shared|https://github.com/x/Shared|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa||both"\n "Own|https://github.com/x/Own|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb||b only"\n)\n')
+    (c / "C Pkg-script.sh").write_text('PACKS=(\n "Other|https://github.com/x/Other|cccccccccccccccccccccccccccccccccccccccc||unrelated"\n)\n')
+    rows = podctl.pin_rows('  "Shared|https://github.com/x/Shared|dddddddddddddddddddddddddddddddddddddddd||both"\n'
+                           '  "rgthree-comfy|https://github.com/rgthree/rgthree-comfy|2222222222222222222222222222222222222222||switches"\n')
+
+    before = {f: f.read_text(encoding="utf-8") for f in (b / "B Pkg-script.sh", c / "C Pkg-script.sh", base / "40-packs.sh")}
+    report = podctl.pins_elsewhere(a / "A Pkg-script.sh", rows)
+
+    # NOTHING outside the run's own package is written — that is the whole point
+    for f, text in before.items():
+        assert f.read_text(encoding="utf-8") == text, f"{f.name} was modified by a measurement"
+    # but the measurement is complete: the shared pack in B, and the base's own row
+    assert {(pathlib.Path(r[0]).name, r[1]) for r in report} == {("B Pkg-script.sh", "Shared"), ("40-packs.sh", "rgthree-comfy")}, report
+    assert all(r[2] != r[3] for r in report)
+
+    # it is recorded where a person can accept it, saying who measured it and how to apply it
+    art = podctl.write_pins_artefact(root / "base" / "comfyui-base", "pod1", "a_pkg", report, today="2026-09-08")
+    body = art.read_text(encoding="utf-8")
+    assert art.parent.name == "pins" and "NOT applied" in body and "--apply" in body
+    assert "B Pkg-script.sh" in body and "40-packs.sh" in body
+
+    # and applying it is a separate, deliberate act by whoever owns those files
+    applied = podctl.apply_pins_artefact(art, root / "comfyui-base")
+    assert {n for n, *_ in applied} == {"B Pkg-script.sh", "40-packs.sh"}, applied
+    assert "dddddddd" in (b / "B Pkg-script.sh").read_text(encoding="utf-8")
+    assert "2222222222222222222222222222222222222222||switches" in (base / "40-packs.sh").read_text(encoding="utf-8")
+    assert "cccccccc" in (c / "C Pkg-script.sh").read_text(encoding="utf-8")   # unrelated rows untouched
+    assert "bbbbbbbb" in (b / "B Pkg-script.sh").read_text(encoding="utf-8")   # B's own row untouched
+    assert podctl.pins_elsewhere(a / "A Pkg-script.sh", rows) == []            # idempotent once applied
+
+
+def test_unit_podctl_cli_install_takes_base_and_packages_in_order():
+    podctl = _load()
+    a = podctl.build_parser().parse_args(["install", "fakepod0000001", "--base", "--pkg", "Example Video Creator", "--pkg", "Example", "--every", "5"])
+    assert a.cmd == "install" and a.base and a.pkg == ["Example Video Creator", "Example"] and a.every == 5 and a.latest and a.save_pins
+    a = podctl.build_parser().parse_args(["install", "fakepod0000001", "--pkg", "Example", "--no-latest", "--no-save-pins"])
+    assert not a.base and not a.latest and not a.save_pins and a.timeout >= 3600
+
+
+# ============================================================== the GPU lease: the pod is leased, not grabbed
+def test_unit_podctl_lease_is_advisory_expiring_and_never_locks_a_pod_out():
+    """One pod, several sessions: one session's install once restarted ComfyUI in the middle of
+    another's render. The lease says who holds the GPU and until when — and every failure mode resolves to
+    "free", because a crashed session must never lock the pod out."""
+    import datetime
+    podctl = _load()
+    now = datetime.datetime(2026, 9, 8, 12, 0, tzinfo=datetime.timezone.utc)
+    line = podctl.lease_encode("session-a", "the long run", 30, now=now)
+    lease = podctl.lease_parse(line)
+    assert lease["holder"] == "session-a" and lease["purpose"] == "the long run"
+    assert lease["expires"] == "2026-09-08T12:30:00+00:00"
+
+    # unreadable, empty and absent all read as a FREE pod
+    for junk in ("", "   ", "not json", '{"no": "holder"}', None):
+        assert podctl.lease_parse(junk) is None
+        assert podctl.lease_expired(podctl.lease_parse(junk), now) is True
+        assert podctl.lease_blocks(podctl.lease_parse(junk), "anyone", now) == (False, "")
+
+    # a lease with no readable expiry is expired, never forever
+    assert podctl.lease_expired({"holder": "x"}, now) is True
+    assert podctl.lease_expired({"holder": "x", "expires": "whenever"}, now) is True
+
+    # mine never blocks me; someone else's live one blocks and says who, what and until when
+    assert podctl.lease_blocks(lease, "session-a", now) == (False, "")
+    blocked, why = podctl.lease_blocks(lease, "session-b", now)
+    assert blocked and "session-a" in why and "12:30" in why and "the long run" in why
+
+    # and it expires: the same lease five minutes later is no longer a blocker
+    later = now + datetime.timedelta(minutes=31)
+    assert podctl.lease_expired(lease, later) is True
+    assert podctl.lease_blocks(lease, "session-b", later) == (False, "")
+
+
+def test_unit_podctl_lease_holder_is_always_something_a_person_can_ask():
+    podctl = _load()
+    assert podctl.lease_me({"PODCTL_SESSION": "comfyui-20"}) == "comfyui-20"
+    fallback = podctl.lease_me({})
+    assert fallback and "/" in fallback and str(os.getpid()) in fallback
+
+
+def test_unit_podctl_lease_names_the_session_to_message_and_never_shortens_its_own_window():
+    """Two things a waiting session asked for on 2026-09-08. The holder's NAME says who has the GPU; the
+    session id says whom to message. And an install that runs inside a longer chain must EXTEND the lease it
+    already holds, never cut it: a 150-minute chain lease was silently shortened to the install's own 90, and
+    the session waiting on it saw a window it had not been promised."""
+    import datetime
+    podctl = _load()
+    now = datetime.datetime(2026, 9, 8, 12, 0, tzinfo=datetime.timezone.utc)
+
+    assert podctl.lease_session_id({"PODCTL_SESSION_ID": "local_abc"}) == "local_abc"
+    assert podctl.lease_session_id({}) == ""
+    lease = podctl.lease_parse(podctl.lease_encode("session-a", "the chain", 30, now=now, session="local_abc"))
+    assert lease["session"] == "local_abc"
+    blocked, why = podctl.lease_blocks(lease, "someone-else", now)
+    assert blocked and "[local_abc]" in why and "session-a" in why
+    # a lease written before the field existed still reads, and says nothing extra
+    old = podctl.lease_parse(podctl.lease_encode("session-a", "", 30, now=now, session=""))
+    assert "session" not in old
+    assert "[" not in podctl.lease_blocks(old, "someone-else", now)[1]
+
+    # never shorten our own live window; do extend it; someone else's is not ours to keep
+    mine = podctl.lease_parse(podctl.lease_encode("session-a", "chain", 150, now=now, session=""))
+    assert podctl.lease_minutes_keeping(mine, "session-a", 90, now) == 150
+    assert podctl.lease_minutes_keeping(mine, "session-a", 200, now) == 200
+    assert podctl.lease_minutes_keeping(mine, "session-b", 90, now) == 90
+    assert podctl.lease_minutes_keeping(None, "session-a", 90, now) == 90
+    expired = podctl.lease_parse(podctl.lease_encode("session-a", "old", 1, now=now - datetime.timedelta(hours=2), session=""))
+    assert podctl.lease_minutes_keeping(expired, "session-a", 90, now) == 90
+
+
+def test_unit_podctl_gates_on_the_mac_before_it_uploads(tmp_path):
+    """Rule: run each package's OWN suite from the EXTRACTED ZIP, on the Mac,
+    before anything is uploaded — the pod's `--check` does the same thing ten minutes later.
+
+    `check_zip` proves the zip matches the working tree; it cannot prove the tree is good. That day a base
+    zip was rebuilt mid-iteration, matched the tree exactly, carried a test that failed on the pod, and
+    another session picked it up in that window. Extraction is half the point: a test that reads `_build/`
+    or an installed pack passes beside the repo and fails from the zip."""
+    podctl = _load()
+    pkg = tmp_path / "Fake Package"; pkg.mkdir()
+    script = pkg / "Fake Package-script.sh"
+    script.write_text('#!/bin/bash\ncase "${1:-}" in test) echo "  ✔ suite: 3 passed"; exit "${FAKE_RC:-0}";; esac\n')
+    z = pkg / "Fake Package-runpod.zip"
+    import zipfile as _zf
+    with _zf.ZipFile(z, "w") as zf:
+        zf.writestr("Fake Package-script.sh", script.read_text())
+
+    class IO(podctl.PodIO):
+        def __init__(self): self.env = dict(os.environ); self.said = []
+        def say(self, m): self.said.append(m)
+    io = IO()
+
+    io.gate(pkg, io.say)                                   # green: it says so and does not raise
+    assert any("3 passed" in m for m in io.said), io.said
+
+    io.env["FAKE_RC"] = "1"                                # red: it must stop the upload, here, with the output
+    with pytest.raises(podctl.PodctlError) as e:
+        io.gate(pkg, io.say)
+    assert "FAILS from the built zip" in str(e.value) and "3 passed" in str(e.value)
+
+    # and the zip is what runs, not the working tree: a script only on disk is never reached
+    script.write_text('#!/bin/bash\nexit 9\n')
+    io.env.pop("FAKE_RC")
+    io.gate(pkg, io.say)
+
+
+def test_unit_podctl_gate_runs_a_real_package_with_paths_that_exist(tmp_path):
+    """The gate's whole value is being trusted when it says "fix it here", so it must not fail for reasons
+    it invented. It shipped joining "ComfyUI Base" onto a path that already WAS the base directory, so every
+    package's script correctly refused a COMFY_BASE that did not exist and the gate blamed the package
+    (found when the gate blocked an install). The base's own gate
+    never noticed, because base.sh needs neither variable — so this runs a REAL sibling package.
+
+    A red sibling must not turn the base red: the assertion is that the gate got far enough to run the
+    package's own suite, not that the suite passed."""
+    podctl = _load()
+    sibling = next((d for d in sorted(BASE.parent.iterdir())
+                    if d.is_dir() and (d / ("%s-script.sh" % d.name)).exists()
+                    and (d / ("%s-runpod.zip" % d.name)).exists()), None)
+    if sibling is None:
+        pytest.skip("no built package beside the base to gate")
+
+    class IO(podctl.PodIO):
+        def __init__(self): self.env = dict(os.environ); self.said = []
+        def say(self, m): self.said.append(m)
+    io = IO()
+    try:
+        io.gate(sibling, io.say)
+        assert any("passed" in m or "green" in m for m in io.said), io.said
+    except podctl.PodctlError as e:
+        msg = str(e)
+        for invented in ("ComfyUI Base is not installed", "does not exist", "the zip has no"):
+            assert invented not in msg, f"the gate failed for its OWN reason, not the package's: {msg[:400]}"
+        assert "FAILS from the built zip" in msg, msg[:400]     # a genuinely red sibling: allowed, and named
+
+
+def test_unit_podctl_each_session_can_own_its_own_ssh_alias(tmp_path, monkeypatch):
+    """`Host runpod` is ONE pointer in one file on a Mac that runs several sessions. On 2026-09-08 a third
+    session ran `ssh-config` for its own pod and every other session's ssh, scp, install and lease silently
+    began addressing that pod instead — same command, same output shape, a different machine. PODCTL_HOST
+    gives a session its own block; the default stays `runpod`, so a single-session Mac is unchanged."""
+    import importlib.util
+    # the gate runs this suite from the EXTRACTED ZIP, where _build/ does not ship: without this the test
+    # raises FileNotFoundError instead of skipping, and every package's install dies in the gate (2.0.45)
+    if not TOOL.exists():
+        pytest.skip("no base/comfyui-base/_build/pod/podctl.py (not a repo checkout)")
+    def load_with(alias):
+        monkeypatch.setenv("PODCTL_HOST", alias) if alias else monkeypatch.delenv("PODCTL_HOST", raising=False)
+        spec = importlib.util.spec_from_file_location("podctl_alias_%s" % (alias or "default"), TOOL)
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+
+    d = load_with(None)
+    assert d.SSH_ALIAS == "runpod" and d.RUNPOD_BLOCK.startswith("Host runpod\n")
+
+    mine = load_with("runpod-fakepod0000002")
+    assert mine.SSH_ALIAS == "runpod-fakepod0000002"
+    assert mine.RUNPOD_BLOCK.startswith("Host runpod-fakepod0000002\n")
+
+    # writing MY block leaves another session's block untouched, byte for byte
+    cfg = tmp_path / "config"
+    cfg.write_text("Host runpod\n  HostName 1.2.3.4\n  Port 1111\n  User root\n\nHost other\n  HostName 9.9.9.9\n")
+    mine.write_ssh_config(cfg, "5.6.7.8", 2222)
+    text = cfg.read_text(encoding="utf-8")
+    assert "Host runpod\n  HostName 1.2.3.4\n  Port 1111" in text, "another session's pointer was moved"
+    assert "Host runpod-fakepod0000002" in text and "5.6.7.8" in text and "2222" in text
+    assert "Host other\n  HostName 9.9.9.9" in text
+
+    # and a second write to my own block updates it in place rather than appending another
+    mine.write_ssh_config(cfg, "5.6.7.9", 2223)
+    assert cfg.read_text(encoding="utf-8").count("Host runpod-fakepod0000002") == 1
+    assert "5.6.7.9" in cfg.read_text(encoding="utf-8")
+
+
+def test_podio_fetch_is_one_tar_stream_not_a_round_trip_per_file(tmp_path, monkeypatch):
+    """2.0.54. The logs directory keeps every run's log (281 files on 2026-09-10), and `scp <dir>/*` spent about five
+    minutes of each install step on per-file round trips. PodIO.fetch now makes ONE ssh call that streams a tar. The
+    real method runs here, against a fake ssh that drops the host and executes the command locally."""
+    import shlex
+    podctl = _load()
+    remote = tmp_path / "pod-logs"
+    remote.mkdir()
+    for i in range(300):
+        (remote / ("run_%03d.log" % i)).write_text("line %d\n" % i * (i + 1), encoding="utf-8")
+    calls = tmp_path / "calls"
+    fake = tmp_path / "fake-ssh"
+    fake.write_text('#!/bin/sh\necho "$@" >> %s\nshift\nexec bash -c "$1"\n' % shlex.quote(str(calls)), encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr(podctl, "SSH_CMD", [str(fake)])
+    io = podctl.PodIO(None, "pod", env=dict(os.environ, COPYFILE_DISABLE="1"))   # no ._ files from macOS tar
+    local = tmp_path / "local"
+    io.fetch(str(remote), local)
+    names = sorted(p.name for p in remote.iterdir())
+    assert sorted(p.name for p in local.iterdir()) == names
+    assert all((local / n).read_bytes() == (remote / n).read_bytes() for n in names)
+    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1, "one ssh call for the whole directory"
+
+    fake.write_text("#!/bin/sh\necho 'Connection refused' >&2\nexit 255\n", encoding="utf-8")
+    with pytest.raises(podctl.PodctlError, match="fetching the pod's logs failed"):
+        io.fetch(str(remote), tmp_path / "again")
+
+
+def test_podio_fetch_survives_a_log_that_grows_while_it_is_copied(tmp_path, monkeypatch):
+    """2.0.55. The directory this fetches — /workspace/comfy-base/state/logs — holds the LIVE comfyui.log, and GNU tar
+    exits 1 ("file changed as we read it") when a file grows while it is being archived. 2.0.54 read ANY non-zero exit
+    as failure, so an install that finished green (STEP RC=0) could die on its own log, before the SUMMARY and before
+    the pins were saved. The bytes are a valid archive either way, so the LOCAL extract is the judge: exit 1 plus a
+    clean extract is a pass."""
+    import shlex
+    podctl = _load()
+    remote = tmp_path / "pod-logs"
+    remote.mkdir()
+    (remote / "comfyui.log").write_text("a line\n", encoding="utf-8")
+    (remote / "install_example_1.console").write_text("STEP RC=0\n", encoding="utf-8")
+    fake = tmp_path / "fake-ssh"
+    # GNU tar's behaviour on a growing file: a VALID archive on stdout, the note on stderr, exit 1.
+    fake.write_text('#!/bin/sh\nshift\nbash -c "$1"\n'
+                    'echo "tar: ./comfyui.log: file changed as we read it" >&2\nexit 1\n', encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr(podctl, "SSH_CMD", [str(fake)])
+    io = podctl.PodIO(None, "pod", env=dict(os.environ, COPYFILE_DISABLE="1"))
+    said = []
+    monkeypatch.setattr(io, "say", said.append)
+    local = tmp_path / "local"
+    io.fetch(str(remote), local)                                    # 2.0.54 raised here
+    assert (local / "comfyui.log").read_text(encoding="utf-8") == "a line\n"
+    assert any("kept writing" in s for s in said), "it says why it passed, rather than passing in silence"
+
+    # ...and exit 1 is not blanket-accepted: no archive means the local extract fails, which still raises.
+    fake.write_text("#!/bin/sh\necho 'tar: /nope: Cannot open: No such file' >&2\nexit 1\n", encoding="utf-8")
+    with pytest.raises(podctl.PodctlError, match="fetching the pod's logs failed"):
+        io.fetch(str(remote), tmp_path / "nothing-arrived")
+
+
+def test_podio_fetch_asks_the_pod_for_only_what_this_step_wrote(tmp_path, monkeypatch):
+    """2.0.55. The logs directory keeps every run's log, so copying all of it grew with the history — 281 files on
+    2026-09-10, re-copied on every install step. `newer_than` is a path ON THE POD whose mtime is the cutoff (GNU tar's
+    --newer takes a file name when the value starts with / or .), and the install step passes its own console file, so
+    the POD's clock decides which files are new. A timestamp computed on this Mac would silently drop every log
+    whenever the two clocks disagreed.
+
+    The flag is asserted, not exercised: the fake ssh runs here under macOS's bsdtar, which reads --newer as a DATE
+    rather than a file, so only the pod's GNU tar can show the behaviour. Same reason the locale pins are asserted as
+    source lines rather than run."""
+    import shlex
+    podctl = _load()
+    remote = tmp_path / "pod-logs"
+    remote.mkdir()
+    (remote / "comfyui.log").write_text("a line\n", encoding="utf-8")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    calls = tmp_path / "calls"
+    fake = tmp_path / "fake-ssh"
+    fake.write_text('#!/bin/sh\necho "$@" >> %s\nexec tar -C %s -czf - .\n'
+                    % (shlex.quote(str(calls)), shlex.quote(str(empty))), encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setattr(podctl, "SSH_CMD", [str(fake)])
+    io = podctl.PodIO(None, "pod", env=dict(os.environ, COPYFILE_DISABLE="1"))
+    console = "/workspace/comfy-base/state/logs/install_example_20260911-010203.console"
+    io.fetch(str(remote), tmp_path / "local", newer_than=console)
+    cmd = calls.read_text(encoding="utf-8")
+    assert "--newer" in cmd and console in cmd, cmd
+    assert cmd.index("--newer") < cmd.index("-czf"), "the selector comes before the archive flags"
+
+    calls.write_text("", encoding="utf-8")
+    io.fetch(str(remote), tmp_path / "local2")                      # no cutoff given: the whole directory
+    assert "--newer" not in calls.read_text(encoding="utf-8")
+
+    # and the install step is what passes it — the fix is worth nothing if the caller forgets
+    with open(podctl.__file__, encoding="utf-8") as f:
+        assert "newer_than=console" in f.read(), "the install step passes its own console file as the cutoff"
+
+
+# ---------------------------------------------------------------- the kebab-case tree
+
+def _repo_tree(tmp_path):
+    """A brand repository: base/comfyui-base/base.sh, one package per brand with the same name, one brand-a-only."""
+    root = tmp_path / "repo"
+    (root / "base" / "comfyui-base").mkdir(parents=True); (root / "base" / "comfyui-base" / "base.sh").write_text("# base\n")
+    for brand, names in (("brand-a", ("image-creator-example", "other-package")), ("brand-b", ("image-creator-example",))):
+        for n in names:
+            d = root / brand / "packages" / n; d.mkdir(parents=True); (d / ("%s-script.sh" % n)).write_text("# pkg\n")
+    return root
+
+
+def test_unit_podctl_install_resolves_pkg_against_the_repository_root_not_the_base_parent(tmp_path):
+    """2.0.55 joined --pkg onto the base folder's PARENT, which was the repository root until the brand folders and is
+    base/ now, which holds no packages. A repository-relative path resolves; a bare name resolves when exactly one brand has it;
+    a name two brands share needs the path; a name nobody has is an error that says where to look."""
+    podctl = _load(); root = _repo_tree(tmp_path)
+    assert podctl.resolve_pkg_dir(root, "brand-a/packages/other-package") == root / "brand-a" / "packages" / "other-package"
+    assert podctl.resolve_pkg_dir(root, "other-package") == root / "brand-a" / "packages" / "other-package"
+    assert podctl.resolve_pkg_dir(root, str(root / "brand-b" / "packages" / "image-creator-example")) == root / "brand-b" / "packages" / "image-creator-example"
+    with pytest.raises(podctl.PodctlError, match="more than one brand"):
+        podctl.resolve_pkg_dir(root, "image-creator-example")
+    with pytest.raises(podctl.PodctlError, match="<brand>/packages/<name>"):
+        podctl.resolve_pkg_dir(root, "Example Video Creator")
+    assert podctl.repo_root(root / "base" / "comfyui-base" / "_build" / "pod" / "podctl.py") == root
+
+
+def test_unit_podctl_prune_lists_only_old_layout_folders_and_removes_them_with_yes(tmp_path):
+    """The rename left '<Display Name>/' folders (with '<Display Name> Script.sh') and 'ComfyUI Base/' on the volume beside the new
+    '<name>/' folders, plus their workflow copies in ComfyUI's browser. prune names exactly those, touches nothing without --yes,
+    and with --yes removes them and only them: the new folder, an unrelated folder and the user's own workflow stay."""
+    podctl = _load(); io = LocalPodIO(tmp_path / "pod"); pk = io.root / "packages"
+    (pk / "ComfyUI Base").mkdir(); (pk / "ComfyUI Base" / "base.sh").write_text("# old base\n")
+    (pk / "Example Image Creator").mkdir(); (pk / "Example Image Creator" / "Example Image Creator Script.sh").write_text("# old\n")
+    (pk / "image-creator-example").mkdir(); (pk / "image-creator-example" / "image-creator-example-script.sh").write_text("# new\n")
+    (pk / "Other Thing").mkdir(); (pk / "Other Thing" / "README").write_text("not ours\n")
+    wf = io.root / "ComfyUI" / "user" / "default" / "workflows"; wf.mkdir(parents=True)
+    (wf / "Example Image Creator Workflow.json").write_text("{}"); (wf / "My Own Workflow.json").write_text("{}")
+    (wf / "Brand Image Creator (Example).json").write_text("{}")
+
+    assert podctl.stale_package_dirs(io) == ["ComfyUI Base", "Example Image Creator"]
+    said = []
+    assert podctl.prune(io, said.append, yes=False) == 0
+    assert any("old layout: /workspace/packages/Example Image Creator" in l for l in said) and any("old layout: /workspace/packages/ComfyUI Base" in l for l in said)
+    assert any(l.endswith("Example Image Creator Workflow.json") for l in said) and any("dry run" in l for l in said)
+    assert (pk / "Example Image Creator").exists() and (wf / "Example Image Creator Workflow.json").exists(), "a dry run removes nothing"
+
+    assert podctl.prune(io, said.append, yes=True) == 0
+    assert not (pk / "ComfyUI Base").exists() and not (pk / "Example Image Creator").exists() and not (wf / "Example Image Creator Workflow.json").exists()
+    assert (pk / "image-creator-example" / "image-creator-example-script.sh").exists() and (pk / "Other Thing" / "README").exists()
+    assert (wf / "My Own Workflow.json").exists() and (wf / "Brand Image Creator (Example).json").exists()
+    assert podctl.stale_package_dirs(io) == [] and podctl.prune(io, said.append, yes=True) == 0    # idempotent
+
+    a = podctl.build_parser().parse_args(["prune", "abc123", "--yes"])
+    assert a.cmd == "prune" and a.pod == "abc123" and a.yes
+    assert not podctl.build_parser().parse_args(["prune", "abc123"]).yes

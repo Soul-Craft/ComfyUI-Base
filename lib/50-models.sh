@@ -1,0 +1,540 @@
+# 50-models.sh — the model library: rows, canonical dests, one index over every filesystem, move-or-download,
+# exact sizes, the disk gate, one deletion prompt scoped by the ledger, and gen-models for the row's bytes.
+#
+# Row format (every package's MODELS): category|Family|Purpose|file|url|bytes|note|alts
+#   dest      = category/Family[/Purpose]/file   (Family empty only for the freeform categories LLM, custom_nodes/<Pack>,
+#               embeddings, sams, depthanything, SEEDVR2, RMBG and grounding-dino, which write category/[Purpose/]file;
+#               vae_approx is flat: ComfyUI's preview loader wants the file right there)
+#   url       = https://huggingface.co/<repo>/resolve/...  |  https://github.com/...  (Hugging Face and GitHub only)
+#             | LOCAL   (must already exist somewhere on the pod; relocated into place, else the run FAILS — a file, or
+#             |          with a trailing / on file, a snapshot FOLDER of that name holding a config.json)
+#             | hf://owner/repo  with file ending in "/"  (a repo snapshot into that directory)
+#   bytes     = exact size; 0 only with LOCAL (any size, must exist). `base.sh gen-models <dir>` fills it in.
+#   alts      = space-separated legacy basenames the index may adopt for this file
+
+BASE_MODEL_EXTS='*.safetensors *.pth *.pt *.pkl *.gguf *.ckpt *.bin *.onnx *.partial'
+# one prune set for every filesystem-wide walk: kernel/virtual trees, package caches, and the places that hold
+# *.pth files which are path configs rather than weights
+# lost+found is pruned from BOTH walks: every ext4 volume has one, it is mode 700 owned by nobody, and a
+# root-squashed pod-local volume denies it even to uid 0 — find then exits 1 and the index is declared
+# incomplete, whose remedy is re-downloading models that are already on disk (found on a 300 GB pod-local
+# /workspace; the MooseFS network volume has no lost+found, which is why this never showed up before).
+# 2.0.53: /tmp and /var/tmp, the Linux temp roots — the Mac's (/var/folders) was already here. The base's own
+# install test writes zero-filled files of each row's declared size under pytest's /tmp tree; a pod whose library
+# lacked a LoRA then MOVED 862 MB of those zeros in as the model, and the render died on its header. An exact
+# -path, never a prefix: a test's own walk starts INSIDE its fake root (under /tmp on Linux), so only a real run's
+# walk from / ever passes through /tmp itself.
+BASE_PRUNE=( '(' -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /var/lib/docker -o -path /snap
+             -o -path /System -o -path /Volumes -o -path /Library -o -path /nix -o -path /var/folders -o -path /tmp -o -path /var/tmp
+             -o -name lost+found -o -name .git -o -name '.venv*' -o -name node_modules -o -name __pycache__
+             -o -name site-packages -o -name dist-packages -o -name .comfy-base-staging -o -name comfy-base ${BASE_FAKE_IMAGE_ROOT:+-o} ${BASE_FAKE_IMAGE_ROOT:+-path} ${BASE_FAKE_IMAGE_ROOT:+"$BASE_FAKE_IMAGE_ROOT"} ')' )
+# the directory walk keeps .venv* visible (it is a search target, not noise)
+BASE_PRUNE_DIRS=( '(' -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /var/lib/docker -o -path /snap
+                  -o -path /System -o -path /Volumes -o -path /Library -o -path /nix -o -path /var/folders -o -path /tmp -o -path /var/tmp
+                  -o -name lost+found -o -name .git -o -name node_modules -o -name __pycache__
+                  -o -name site-packages -o -name dist-packages -o -name .comfy-base-staging ${BASE_FAKE_IMAGE_ROOT:+-o} ${BASE_FAKE_IMAGE_ROOT:+-path} ${BASE_FAKE_IMAGE_ROOT:+"$BASE_FAKE_IMAGE_ROOT"} ')' )
+BASE_DIRSCAN=""; IDX=""; IDX_ROOTS=""
+BASE_DL_BYTES=0; BASE_DL_TIME=0; BASE_DL_SECS=0
+
+# ---------------------------------------------------------------- rows and dests
+_base_model_rows(){ # prints validated MODELS rows; exit 1 on any violation (message on stderr)
+  local row cat fam purp file url bytes note alts bad=0 seen=" "
+  for row in ${MODELS[@]+"${MODELS[@]}"}; do
+    IFS='|' read -r cat fam purp file url bytes note alts <<< "$row"
+    if [ -z "$cat" ] || [ -z "$file" ] || [ -z "$url" ]; then echo "  !! bad MODELS row (want category|Family|Purpose|file|url|bytes|note|alts): $row" >&2; bad=1; continue; fi
+    case "$cat" in
+      LLM|custom_nodes/*|vae_approx|embeddings|sams|depthanything|SEEDVR2|RMBG|grounding-dino|latent_upscale_models|insightface) if [ -n "$fam" ]; then echo "  !! $cat is a freeform category: leave Family empty ($file)" >&2; bad=1; continue; fi;;   # flat by the consumer's design: embedding:<name> is resolved in the folder root; SAM3 SmartInpainter, DepthAnythingV2 and SeedVR2 os.listdir their folders; ComfyUI-RMBG reads models/RMBG/<name>/ and LayerStyle models/grounding-dino/ (2.0.17); the latent-upscaler packs glob *.safetensors at the root of latent_upscale_models/ and return basenames, so a Family folder hides the file from them (2.0.37); insightface's FaceAnalysis(root=X) reads X/models/<pack>/ by its own convention, so the category root is the root every package shares (2.0.39)
+      *) if [ -z "$fam" ]; then echo "  !! $file needs a Family (the folder under $cat/; one spelling per family across the brand's packages, see <brand>/families.txt)" >&2; bad=1; continue; fi
+         if ! [[ "$fam" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then echo "  !! Family '$fam' for $file must be a plain folder name (letters, digits, . _ -)" >&2; bad=1; continue; fi;;
+    esac
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then echo "  !! bytes must be an integer ($file: '$bytes')" >&2; bad=1; continue; fi
+    case "$url" in
+      LOCAL) ;;
+      hf://*/*) if [[ "$file" != */ ]]; then echo "  !! an hf:// url is a repo snapshot: end the file with '/' ($file)" >&2; bad=1; continue; fi;;
+      https://huggingface.co/*|https://github.com/*) ;;
+      *) echo "  !! url host not on the privacy list (huggingface.co, github.com) or not LOCAL/hf://: $url" >&2; bad=1; continue;;
+    esac
+    if [ "$bytes" = "0" ] && [ "$url" != "LOCAL" ]; then echo "  !! bytes=0 is only allowed with url=LOCAL ($file) — run: base.sh gen-models" >&2; bad=1; continue; fi
+    case "$seen" in *" $(_base_lower "$file") "*) echo "  !! $file is declared twice" >&2; bad=1; continue;; esac
+    seen="$seen$(_base_lower "$file") "; echo "$row"
+  done
+  return $bad
+}
+_base_dest_rel(){ # <row> → category/Family[/Purpose]/file
+  local cat fam purp file rest
+  IFS='|' read -r cat fam purp file rest <<< "$1"
+  local p="$cat"; [ -n "$fam" ] && p="$p/$fam"; [ -n "$purp" ] && p="$p/$purp"
+  echo "$p/$file"
+}
+_base_dest_path(){ # <dest rel> → absolute path (custom_nodes/<Pack>/… is relative to the located pack dir)
+  local rel="$1"
+  case "$rel" in
+    custom_nodes/*)
+      local rest="${rel#custom_nodes/}" pname sub e
+      pname="${rest%%/*}"; sub="${rest#*/}"
+      for e in ${PACK_DIRS[@]+"${PACK_DIRS[@]}"}; do if [ "${e%%|*}" = "$pname" ]; then echo "${e#*|}/$sub"; return 0; fi; done
+      echo "$CN/$rest";;
+    *) echo "$M/$rel";;
+  esac
+}
+
+# ---------------------------------------------------------------- one walk for directories, one index for files
+_base_scan_roots(){ # where models and stray trees are looked for: the WHOLE POD, the fake root in tests, every
+  # filesystem off-pod. BASE_SEARCH_ROOTS overrides.
+  #
+  # 2.0.50: this used to return the volume alone on a pod, reasoning that the container disk is restored from the
+  # image at every start, so a file adopted there is gone at the next stop. That is an argument about ADOPTING, not
+  # about SEARCHING — and it made a model the image already ships invisible, so a 24 GiB row was downloaded when a
+  # move would have taken seconds. Searching everywhere is safe because _base_move_into_place MOVES a complete file
+  # onto the volume (mv on one device, else copy-verify-delete, never a symlink), which is exactly what the old
+  # reasoning wanted to guarantee. Measured on a bare pod: the full walk with BASE_PRUNE costs 0.32 s.
+  if [ -n "${BASE_SEARCH_ROOTS:-}" ]; then echo "$BASE_SEARCH_ROOTS"
+  elif [ -n "$BASE_FAKE_ROOT" ]; then echo "$BASE_FAKE_ROOT"
+  else echo /; fi
+}
+_base_dirscan(){ # ONE filesystem walk for every directory question the run asks
+  if [ -n "$BASE_DIRSCAN" ] && [ -f "$BASE_DIRSCAN" ]; then return 0; fi
+  BASE_DIRSCAN="$(_base_mktemp_d)/dirs.txt"
+  local roots=() pats=() expr=() p nm rows
+  read -r -a roots <<<"$(_base_scan_roots)"
+  rows="$(_base_pack_rows 2>/dev/null || true)"
+  while IFS='|' read -r nm _; do [ -n "$nm" ] && pats+=("$nm") || true; done <<< "$rows"
+  pats+=('ComfyUI' 'ComfyUI-*' 'comfyui' '.venv' '.venv-*' '*.pre-*')
+  local _c _f _p fl _r                                             # snapshot rows (file ends in /): their folder names are searched too
+  while IFS='|' read -r _c _f _p fl _r; do case "$fl" in */) pats+=("${fl%/}");; esac; done <<< "$(_base_model_rows 2>/dev/null || true)"
+  for nm in "${pats[@]}"; do
+    if [ "${#expr[@]}" -eq 0 ]; then expr=( -name "$nm" ); else expr+=( -o -name "$nm" ); fi
+  done
+  # bounded: a hung network mount must not stall the run. `cd && pwd -P` collapses symlinks and bind mounts.
+  if _base_timeout "${BASE_SCAN_SECS:-240}" \
+    find "${roots[@]}" ${BASE_PRUNE_DIRS[@]+"${BASE_PRUNE_DIRS[@]}"} -prune -o -type d \( "${expr[@]}" \) -print 2>/dev/null \
+    | while IFS= read -r p; do if [ -d "$p" ]; then (cd "$p" 2>/dev/null && pwd -P) || true; fi; done \
+    | sort -u > "$BASE_DIRSCAN"; then :
+  else
+    printf '  !! the directory scan did not finish within %ss -- stray packs and venvs may go unreported\n' "${BASE_SCAN_SECS:-240}" >&2
+    BASE_WARN+=("directory scan incomplete: raise BASE_SCAN_SECS if this tree is large or on a slow mount")
+  fi
+  return 0
+}
+_base_find_dirs(){ # <dir-name-glob>… → matches out of the single scan above
+  _base_dirscan
+  local d b p
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    b="$(basename "$d")"
+    for p in "$@"; do case "$b" in $p) echo "$d"; break;; esac; done
+  done < "$BASE_DIRSCAN"
+  return 0
+}
+_base_build_index(){ # every model-shaped file on every mounted filesystem → IDX as "size<TAB>path"
+  IDX="$(_base_mktemp_d)/index.tsv"; : > "$IDX"
+  local roots=() kept=() r k skip
+  read -r -a roots <<<"$(_base_scan_roots)"                 # the volume on a pod; every filesystem off-pod
+  while IFS= read -r r; do
+    if [ -z "$r" ] || [ ! -d "$r" ]; then continue; fi
+    skip=0; for k in ${kept[@]+"${kept[@]}"}; do case "$r/" in "$k"/*) skip=1;; esac; done
+    if [ "$skip" = "0" ]; then kept+=("$r"); fi
+  done < <(printf '%s\n' "${roots[@]}" | sed -E 's#(.)/+$#\1#' | awk 'NF' | sort -u)   # keep "/" itself
+  IDX_ROOTS="${kept[*]}"
+  local fmt=(-c $'%s\t%n'); [ "$BASE_STAT" = bsd ] && fmt=(-f $'%z\t%N')
+  local names=() e first=1
+  for e in $BASE_MODEL_EXTS; do if [ "$first" = 1 ]; then names=( -name "$e" ); first=0; else names+=( -o -name "$e" ); fi; done
+  # No -xdev: models routinely sit on a different mount from where the walk starts. custom_nodes is NOT pruned
+  # (rife426.pth lives inside a pack); site-packages IS (thousands of *.pth path files that are not weights).
+  [ -n "$BASE_FAKE_ROOT" ] || note "indexing ${kept[*]} — a minute or two on a network volume"
+  if find "${kept[@]}" ${BASE_PRUNE[@]+"${BASE_PRUNE[@]}"} -prune -o -type f \( "${names[@]}" \) -print0 2>/dev/null \
+    | _base_xargs0 stat "${fmt[@]}" 2>/dev/null >> "$IDX"; then :
+  else
+    # a short index is indistinguishable from "no models on disk", and the answer to that is a re-download
+    printf '  !! the model index walk did not complete -- files already on disk may be fetched again\n' >&2
+    BASE_WARN+=("model index incomplete: the filesystem walk failed, so downloads may repeat work already done")
+  fi
+  sort -u -t$'\t' -k2 "$IDX" -o "$IDX"
+}
+_base_idx_find(){ # <basename>... → "size<TAB>path" lines with an exact (case-insensitive) basename match
+  local names="" n
+  for n in "$@"; do if [ -n "$n" ]; then names="${names}${names:+|}$(_base_lower "$n")"; fi; done
+  [ -n "$names" ] || return 0
+  awk -F'\t' -v names="$names" 'BEGIN{n=split(names,a,"|"); for(i=1;i<=n;i++) want[a[i]]=1}
+       { p=$2; sub(/.*\//,"",p); if (tolower(p) in want) print }' "$IDX"
+}
+
+# ---------------------------------------------------------------- sizes
+_base_expected(){ # <url> → exact:<bytes> from the Hub (x-linked-size beats content-length; a non-2xx final hop counts for nothing) | approx:0
+  local url="$1" auth=() out xl cl st
+  [[ "$url" == https://huggingface.co/* ]] && [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+  out="$(curl -sIL --max-time 40 --retry 2 ${auth[@]+"${auth[@]}"} "$url" 2>/dev/null | tr -d '\r' || true)"
+  xl="$(printf '%s\n' "$out" | awk 'tolower($1)=="x-linked-size:"{v=$2} END{print v}')"
+  cl="$(printf '%s\n' "$out" | awk '/^HTTP\//{c=""} tolower($1)=="content-length:"{c=$2} END{print c}')"
+  st="$(printf '%s\n' "$out" | awk '/^HTTP\//{s=$2} END{print s}')"
+  if [[ "$xl" =~ ^[0-9]+$ ]] && [ "$xl" -gt 0 ]; then echo "exact:$xl"
+  elif [[ "$st" =~ ^2[0-9][0-9]$ ]] && [[ "$cl" =~ ^[0-9]+$ ]] && [ "$cl" -gt 0 ]; then echo "exact:$cl"
+  else echo "approx:0"; fi
+}
+_base_size_ok(){ [[ "$1" =~ ^[0-9]+$ ]] || return 1; [ "$2" = "0" ] || [ "$1" = "$2" ]; }   # <actual> <bytes>; 0 = any size (LOCAL)
+_base_dir_size(){ # bytes under a snapshot dir, minus the .cache/ metadata `hf download --local-dir` writes beside the files
+  # and minus __pycache__: a pack that imports code from its snapshot (RMBG's birefnet.py) leaves one after the first render (2.0.25)
+  "$SYS_PY" - "$1" <<'PYDS' 2>/dev/null || echo 0
+import os, sys
+total = 0
+for dp, ds, fs in os.walk(sys.argv[1]):
+    ds[:] = [d for d in ds if d not in (".cache", "__pycache__")]
+    total += sum(os.path.getsize(os.path.join(dp, f)) for f in fs)
+print(total)
+PYDS
+}
+_base_sparse(){ "$SYS_PY" -c 'import sys; f=open(sys.argv[1],"wb"); f.truncate(int(sys.argv[2])); f.close()' "$1" "$2"; }
+
+_base_move_into_place(){ # <src> <dest> — same device: mv; else copy + size check + delete. Never a symlink.
+  local src="$1" dest="$2" want; want="$(_base_fsize "$src")"
+  mkdir -p "$(dirname "$dest")"
+  if [ "$(_base_fdev "$src")" = "$(_base_fdev "$(dirname "$dest")")" ]; then mv "$src" "$dest"; return 0; fi
+  cp "$src" "$dest.basecopy" || { rm -f "$dest.basecopy"; return 1; }
+  if [ "$(_base_fsize "$dest.basecopy")" = "$want" ]; then mv "$dest.basecopy" "$dest" && rm -f "$src"; else rm -f "$dest.basecopy"; return 1; fi
+}
+_base_rate(){ local b="$1" secs="$2"; if [ "${secs:-0}" -gt 0 ]; then awk -v b="$b" -v s="$secs" 'BEGIN{ printf "%.0f MB/s in %ds", b/1048576/s, s }'; else echo "<1s"; fi; }
+_base_xet_check(){ # a silent fallback to plain HTTPS is several times slower and says nothing anywhere
+  if [ -x "$PY" ] && "$PY" -c "import hf_xet" 2>/dev/null; then ok "hf_xet active (high performance, ${HF_XET_NUM_CONCURRENT_RANGE_GETS:-32} concurrent range gets)"
+  else warn "hf_xet is NOT importable — downloads fall back to plain HTTPS, several times slower"; fi
+}
+_base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, resumable; silent on success, its last lines on failure
+  local staged="$1" url="$2" out; shift 2; out="$(mktemp)"
+  if curl -fL --retry 3 -C - --max-time 3600 "$@" -o "$staged" "$url" > "$out" 2>&1; then rm -f "$out"; return 0; fi
+  tail -3 "$out"; rm -f "$out"; return 1
+}
+_base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets BASE_DL_SECS
+  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS
+  base="$(basename "$dest")"; stage="$STAGING/$base.d"; mkdir -p "$stage"
+  if [ "$BASE_NO_NET" = "1" ] && [ "${BASE_FAKE_DL:-}" != "real" ]; then   # BASE_FAKE_DL=real: the real branches with stubbed tools on PATH
+    if [ "${BASE_FAKE_DL:-}" = "fail" ]; then err "fake download failed (BASE_FAKE_DL=fail)"; rm -rf "$stage"; return 1; fi
+    staged="$stage/$base"; _base_sparse "$staged" "$bytes"      # fake: a sparse file at the declared size
+  elif [[ "$url" == https://huggingface.co/*/resolve/* ]]; then
+    local repo rfile hfbin _dlout
+    repo="${url#https://huggingface.co/}"; repo="${repo%%/resolve/*}"; rfile="${url#*/resolve/}"; rfile="${rfile#*/}"
+    hfbin="$VENV/bin/hf"; [ -x "$hfbin" ] || hfbin="$(command -v hf || true)"
+    if [ -z "$hfbin" ]; then err "hf CLI missing — the venv step installs huggingface_hub[hf-xet]"; return 1; fi
+    for attempt in 1 2 3; do
+      # silent on success (the caller reports file, size, verification and rate); the output is the diagnosis on failure
+      # the token reaches hf through HF_TOKEN in its environment (exported by base_tokens), never as an argument
+      if _dlout="$("$hfbin" download "$repo" "$rfile" --local-dir "$stage" --quiet 2>&1)"; then
+        staged="$stage/$rfile"; [ -f "$staged" ] && break
+      else printf '%s\n' "$_dlout" | tail -5; fi
+      note "attempt $attempt failed — retrying (hf download resumes)"; sleep 5
+    done
+    staged="$stage/$rfile"
+  else
+    staged="$stage/$base"      # github releases and the like: curl, resumable
+    for attempt in 1 2 3; do
+      _base_curl_dl "$staged" "$url" && break
+      note "attempt $attempt failed — retrying (the transfer resumes)"; sleep 5
+    done
+  fi
+  if [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes"; then
+    mkdir -p "$(dirname "$dest")"; mv "$staged" "$dest" && rm -rf "$stage" && rc=0
+    BASE_DL_SECS=$(( SECONDS - t0 ))
+  else
+    [ -f "$staged" ] && err "staged file has $(_base_fsize "$staged") bytes, expected $bytes — kept in $stage for resume"
+  fi
+  return $rc
+}
+_base_snapshot(){ # <hf://owner/repo> <dest dir> <bytes> → a repo snapshot in place, verified by total size
+  local repo="${1#hf://}" dest="$2" bytes="$3" hfbin attempt
+  mkdir -p "$dest"
+  if [ "$BASE_NO_NET" = "1" ]; then _base_sparse "$dest/.fake-snapshot" "$bytes"; return 0; fi
+  hfbin="$VENV/bin/hf"; [ -x "$hfbin" ] || hfbin="$(command -v hf || true)"
+  if [ -z "$hfbin" ]; then err "hf CLI missing"; return 1; fi
+  local _dlout
+  for attempt in 1 2 3; do                          # the token rides HF_TOKEN in hf's environment, never argv (2.0.9); its output is the diagnosis on failure
+    if _dlout="$("$hfbin" download "$repo" --local-dir "$dest" --quiet 2>&1)"; then break; else printf '%s\n' "$_dlout" | tail -5; fi
+    note "attempt $attempt failed — retrying"; sleep 5
+  done
+  [ "$(_base_dir_size "$dest")" = "$bytes" ]
+}
+_base_add_gb(){ awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f", a+b}'; }
+_base_move_dir_into_place(){ # <src dir> <dest dir> → mv on one device, else copy, verify the byte total, remove the source
+  local src="$1" dest="$2" want
+  mkdir -p "$(dirname "$dest")"
+  if [ "$(_base_fdev "$src")" = "$(_base_fdev "$(dirname "$dest")")" ]; then mv "$src" "$dest"; return $?; fi
+  want="$(_base_dir_size "$src")"
+  rm -rf "$dest.partial"; cp -a "$src" "$dest.partial" || { rm -rf "$dest.partial"; return 1; }
+  if [ "$(_base_dir_size "$dest.partial")" = "$want" ]; then mv "$dest.partial" "$dest" && rm -rf "$src"; else rm -rf "$dest.partial"; return 1; fi
+}
+
+# ---------------------------------------------------------------- the disk gate: before anything is downloaded
+_base_volume_quota_gb(){ # the volume size podctl recorded (state/volume.env), or nothing
+  local f="$BASE_STATE/volume.env"
+  [ -f "$f" ] && sed -n "s/^VOLUME_GB='\{0,1\}\([0-9]*\)'\{0,1\}$/\1/p" "$f" | head -1
+  return 0
+}
+_base_volume_used_kb(){ # what the volume holds, in kB (the suite sets BASE_FAKE_USED_KB)
+  if [ -n "${BASE_FAKE_USED_KB:-}" ]; then echo "$BASE_FAKE_USED_KB"; return 0; fi
+  du -skx "${VOL:-$BASE_VOLUME}" 2>/dev/null | cut -f1 | grep -E '^[0-9]+$' || echo 0
+}
+_base_disk_gate(){ # <needed bytes> → 0 proceed, 1 stop. Honest about a pooled filesystem it cannot measure.
+  local need="$1" free_b need_b
+  if [ -n "${BASE_FAKE_FREE_GB:-}" ]; then free_b="$(_base_gb_to_bytes "$BASE_FAKE_FREE_GB")"; else free_b=$(( $(_base_free_kb "$M") * 1000 )); fi
+  need_b=$((need + 10000000000))
+  if [ -z "${BASE_FAKE_FREE_GB:-}" ] && _base_fs_is_pool "$M"; then
+    local quota used_kb
+    quota="$(_base_volume_quota_gb)"
+    if [ -n "$quota" ]; then                                   # podctl recorded the volume's size: measure what it holds, judge the real headroom
+      used_kb="$(_base_volume_used_kb)"
+      free_b=$(( $(_base_gb_to_bytes "$quota") - used_kb * 1000 )); [ "$free_b" -lt 0 ] && free_b=0
+      echo "  volume $quota GB (recorded by podctl) · $(_base_bytes_to_gb $((used_kb * 1000))) GB in use · $(_base_bytes_to_gb "$free_b") GB free"
+    else
+      warn "the volume reports $(_base_bytes_to_gb "$free_b") GB free — that is the backing pool, not your quota, so free space is not verifiable here (podctl upload/ensure records the volume size in state/volume.env)"
+      echo "  need $(_base_bytes_to_gb "$need_b") GB (+10 GB headroom included) — proceeding"
+      return 0
+    fi
+  fi
+  echo "  need $(_base_bytes_to_gb "$need_b") GB (+10 GB headroom) · $(_base_bytes_to_gb "$free_b") GB free on the volume"
+  if [ "$need_b" -gt "$free_b" ]; then
+    if [ "$BASE_DRY" = "1" ]; then       # a dry run reports the verdict; it does not fail on it
+      warn "the real run would stop here: not enough space on the volume ($(_base_bytes_to_gb "$need_b") GB needed, $(_base_bytes_to_gb "$free_b") GB free)"
+      return 0
+    fi
+    err "not enough space on the volume — nothing downloaded (raise the volume size or reclaim below)"
+    BASE_FAILED+=("models: disk gate — $(_base_bytes_to_gb "$need_b") GB needed, $(_base_bytes_to_gb "$free_b") GB free")
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- the stage
+base_models(){
+  hdr "MODEL LIBRARY · $M"
+  local rows; rows="$(_base_model_rows)" || { err "the MODELS table is invalid (see above)"; BASE_FAILED+=("models: invalid rows"); return 1; }
+  _base_build_index
+  echo "  indexed $(wc -l < "$IDX" | tr -d ' ') model-shaped files under: $IDX_ROOTS"
+  local row cat fam purp file url bytes mnote alts rel dest base sz size path cand cand_dev mdev was_partial
+  local -a TODO=() DL_DESTS=()
+  local NEED=0
+  KNOWN=()
+  mdev="$(_base_fdev "$M" 2>/dev/null || echo 0)"
+  while IFS='|' read -r cat fam purp file url bytes mnote alts; do
+    [ -n "$cat" ] || continue
+    row="$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts"
+    rel="$(_base_dest_rel "$row")"; dest="$(_base_dest_path "$rel")"; base="$(basename "${file%/}")"
+    # shellcheck disable=SC2206
+    KNOWN+=("$base" $alts)            # alternates are space-separated basenames: word-splitting is the intent
+    # ---- snapshot rows
+    if [[ "$file" == */ ]]; then
+      local snap_ok=0 sdir="" sdir_c
+      if [ -d "$dest" ]; then
+        if [ "$url" = "LOCAL" ]; then [ -f "$dest/config.json" ] && snap_ok=1
+        elif [ "$(_base_dir_size "$dest")" = "$bytes" ]; then snap_ok=1; fi
+      fi
+      if [ "$snap_ok" = "1" ]; then
+        sz="$(_base_dir_size "$dest")"; ok "$rel  (snapshot, $(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"
+      elif [ "$url" = "LOCAL" ]; then
+        # a LOCAL snapshot never downloads: a folder of that name holding a config.json, anywhere on the pod, is moved into place
+        while IFS= read -r sdir_c; do
+          if [ -n "$sdir_c" ] && [ "$sdir_c" != "$dest" ] && [ -f "$sdir_c/config.json" ]; then case "$sdir_c" in "$STAGING"/*) ;; *) sdir="$sdir_c"; break;; esac; fi
+        done < <(_base_find_dirs "$base")
+        if [ -n "$sdir" ]; then
+          if [ "$BASE_DRY" = "1" ]; then would "move the snapshot folder $sdir → $rel"; MODEL_MOVED+=("$rel (would move from $sdir)")
+          elif _base_move_dir_into_place "$sdir" "$dest"; then ok "$rel ← moved from $sdir"; MODEL_MOVED+=("$rel ← $sdir"); MODEL_MOVED_GB="$(_base_add_gb "$MODEL_MOVED_GB" "$(_base_bytes_to_gb "$(_base_dir_size "$dest")")")"
+          else err "move failed: $sdir → $dest"; MODEL_FAIL+=("$rel (move failed)"); BASE_FAILED+=("snapshot move failed: $rel"); fi
+        else
+          err "$rel is declared LOCAL and no folder '$base' holding a config.json exists anywhere on this pod — place it on the volume and re-run"
+          MODEL_LOCAL_MISSING+=("$rel"); MODEL_FAIL+=("$rel (LOCAL, not found)"); BASE_FAILED+=("LOCAL snapshot not found on this pod: $base → $rel")
+        fi
+      elif [ "$BASE_DRY" = "1" ]; then would "download snapshot $url → $rel ($(_base_bytes_to_gb "$bytes") GB)"; TODO+=("SNAP|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes))
+      else TODO+=("SNAP|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes)); todo "$rel  snapshot (~$(_base_bytes_to_gb "$bytes") GB) — queued"; fi
+      continue
+    fi
+    was_partial=0
+    if [ -f "$dest" ]; then
+      sz="$(_base_fsize "$dest")"
+      if _base_size_ok "$sz" "$bytes"; then ok "$rel  ($(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"; continue; fi
+      miss "$rel is $(_base_bytes_to_gb "$sz") GB, expected $(_base_bytes_to_gb "$bytes") GB — partial"
+      if [ "$BASE_DRY" = "1" ]; then would "rename to $base.partial and re-fetch"
+      else mv "$dest" "$dest.partial"; DEL_FILES+=("$dest.partial"); DEL_BYTES=$((DEL_BYTES + sz)); fi
+      MODEL_PARTIAL+=("$rel"); was_partial=1
+    fi
+    # ---- an indexed file with the exact basename (or a listed alternate) AND the expected size → moved into the library
+    cand=""; cand_dev=""
+    # shellcheck disable=SC2086
+    while IFS=$'\t' read -r size path; do
+      if [ -z "$path" ] || [ ! -f "$path" ] || [ "$path" = "$dest" ]; then continue; fi
+      case "$path" in "$STAGING"/*|*.partial) continue;; esac
+      if _base_size_ok "$size" "$bytes"; then
+        if [ -z "$cand" ] || { [ "$cand_dev" != "$mdev" ] && [ "$(_base_fdev "$path")" = "$mdev" ]; }; then cand="$path"; cand_dev="$(_base_fdev "$path")"; fi
+      else note "$base: same name, different size, left alone: $path ($(_base_bytes_to_gb "$size") GB)"; fi
+    done < <(_base_idx_find "$base" $alts)
+    if [ -n "$cand" ]; then
+      if [ "$BASE_DRY" = "1" ]; then would "move $cand → $rel"; MODEL_MOVED+=("$rel (would move from $cand)")
+      elif _base_move_into_place "$cand" "$dest"; then ok "$rel ← moved from $cand"; MODEL_MOVED+=("$rel ← $cand"); MODEL_MOVED_GB="$(_base_add_gb "$MODEL_MOVED_GB" "$(_base_bytes_to_gb "$(_base_fsize "$dest")")")"
+      else err "move failed: $cand → $dest"; TODO+=("FILE|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes)); fi
+      continue
+    fi
+    # ---- LOCAL rows never download: not found is a failure, by name
+    if [ "$url" = "LOCAL" ]; then
+      err "$rel is declared LOCAL and was not found anywhere on this pod — place $base on the volume and re-run"
+      MODEL_LOCAL_MISSING+=("$rel"); MODEL_FAIL+=("$rel (LOCAL, not found)")
+      BASE_FAILED+=("LOCAL model not found on this pod: $base → $rel")
+      continue
+    fi
+    if [ "$was_partial" = "1" ]; then echo "      re-queued for download"
+    else todo "$rel  (~$(_base_bytes_to_gb "$bytes") GB) — not on disk anywhere, queued for download"; [ -n "$mnote" ] && echo "      $mnote" || true; fi
+    TODO+=("FILE|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes))
+  done <<< "$rows"
+
+  # ---- downloads, behind the gate
+  if [ "${#TODO[@]}" -gt 0 ]; then
+    hdr "DOWNLOADS · ${#TODO[@]} item(s), $(_base_bytes_to_gb "$NEED") GB needed"
+    local kind spec
+    if [ "$BASE_DRY" = "1" ]; then
+      _base_disk_gate "$NEED" || true
+      for spec in "${TODO[@]}"; do IFS='|' read -r kind rel url bytes dest <<<"$spec"; would "download $(_base_bytes_to_gb "$bytes") GB → $rel"; done
+    elif ! _base_disk_gate "$NEED"; then
+      for spec in "${TODO[@]}"; do IFS='|' read -r kind rel url bytes dest <<<"$spec"; MODEL_FAIL+=("$rel (no disk)"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; done
+    else
+      mkdir -p "$STAGING"
+      [ "$BASE_NO_NET" = "1" ] || _base_xet_check
+      for spec in "${TODO[@]}"; do
+        IFS='|' read -r kind rel url bytes dest <<<"$spec"
+        echo -e "\n${CYA}→ $rel${NC}"
+        BASE_DL_SECS=0; local t0=$SECONDS got=1
+        if [ "$kind" = "SNAP" ]; then _base_snapshot "$url" "$dest" "$bytes" && got=0; BASE_DL_SECS=$(( SECONDS - t0 ))
+        else _base_download "$url" "$dest" "$bytes" && got=0; fi
+        if [ "$got" = "0" ]; then
+          local _sz; if [ "$kind" = "SNAP" ]; then _sz="$bytes"; else _sz="$(_base_fsize "$dest")"; fi
+          BASE_DL_BYTES=$(( BASE_DL_BYTES + _sz )); BASE_DL_TIME=$(( BASE_DL_TIME + BASE_DL_SECS ))
+          ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$BASE_DL_SECS")"
+          MODEL_DL+=("$rel"); DL_DESTS+=("$dest"); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$(_base_bytes_to_gb "$bytes")")"
+        else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
+      done
+      rmdir "$STAGING" 2>/dev/null || true
+      # a *.partial this run renamed is dropped once its complete copy is verified in place
+      local keep=() kept_bytes=0 f
+      for f in ${DEL_FILES[@]+"${DEL_FILES[@]}"}; do
+        if [[ "$f" == *.partial ]] && [ -f "${f%.partial}" ] && _base_in_list "${f%.partial}" ${DL_DESTS[@]+"${DL_DESTS[@]}"}; then rm -f "$f"; note "removed $(basename "$f") (re-fetched and verified)"
+        else keep+=("$f"); kept_bytes=$((kept_bytes + $(_base_fsize "$f" 2>/dev/null || echo 0))); fi
+      done
+      DEL_FILES=(${keep[@]+"${keep[@]}"}); DEL_BYTES=$kept_bytes
+    fi
+  fi
+  echo "  downloaded ${#MODEL_DL[@]} · moved ${#MODEL_MOVED[@]} · in place ${#MODEL_OK[@]} · missing ${#MODEL_FAIL[@]}"
+  if [ "${#MODEL_FAIL[@]}" -gt 0 ]; then err "${#MODEL_FAIL[@]} required file(s) missing — the run will exit non-zero at the summary"; fi
+  return 0
+}
+
+# ---------------------------------------------------------------- one deletion prompt, scoped by the ledger
+_base_family_dirs(){ # → the library dirs this package's rows write into (category/Family, or category/Purpose for freeform), plus LEGACY_DIRS
+  local rows cat fam purp rest d seen=" "
+  rows="$(_base_model_rows 2>/dev/null || true)"
+  while IFS='|' read -r cat fam purp rest; do
+    [ -n "$cat" ] || continue
+    d="$cat"; if [ -n "$fam" ]; then d="$d/$fam"; elif [ -n "$purp" ]; then d="$d/$purp"; fi
+    case "$seen" in *" $d "*) ;; *) seen="$seen$d "; echo "$d";; esac
+  done <<< "$rows"
+  for d in ${LEGACY_DIRS[@]+"${LEGACY_DIRS[@]}"}; do case "$seen" in *" $d "*) ;; *) seen="$seen$d "; echo "$d";; esac; done
+}
+base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (default No); a file another package claims is never offered
+  hdr "OLD LAYOUT · DUPLICATES · SUPERSEDED"
+  [ -n "$IDX" ] && [ -f "$IDX" ] || _base_build_index
+  local rows cat fam purp file url bytes mnote alts rel dest base real dsz size path legacy f pat hit lbase d
+  rows="$(_base_model_rows 2>/dev/null || true)"
+  # ---- legacy folders: known files were handled by base_models; the rest is unknown and stays
+  for legacy in ${LEGACY_DIRS[@]+"${LEGACY_DIRS[@]}"}; do
+    [ -d "$M/$legacy" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue; base="$(basename "$f")"
+      if _base_in_list "$base" ${KNOWN[@]+"${KNOWN[@]}"}; then continue; fi
+      hit=0; for pat in ${SUPERSEDED[@]+"${SUPERSEDED[@]}"}; do lbase="$(_base_lower "$base")"; if [[ "$lbase" == $(_base_lower "$pat") ]]; then hit=1; break; fi; done
+      if [ "$hit" = "1" ]; then continue; fi
+      if _base_in_list "${f#"$M"/}" ${UNKNOWN_FILES[@]+"${UNKNOWN_FILES[@]}"}; then continue; fi
+      UNKNOWN_FILES+=("${f#"$M"/}"); note "unknown, left alone: ${f#"$M"/}"
+    done < <(find "$M/$legacy" -maxdepth 2 -type f 2>/dev/null)
+  done
+  # ---- unclaimed: model files in the library's flat category folders that no row declares (an image's own downloads,
+  #      the user's files). Reported, never moved or deleted; a later package that declares one claims it.
+  local catdir e first=1 nexpr=()
+  for e in $BASE_MODEL_EXTS; do case "$e" in '*.partial') continue;; esac; if [ "$first" = 1 ]; then nexpr=( -name "$e" ); first=0; else nexpr+=( -o -name "$e" ); fi; done
+  for catdir in "$M"/*/; do
+    [ -d "$catdir" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue; base="$(basename "$f")"
+      if _base_in_list "$base" ${KNOWN[@]+"${KNOWN[@]}"}; then continue; fi
+      hit=0; for pat in ${SUPERSEDED[@]+"${SUPERSEDED[@]}"}; do lbase="$(_base_lower "$base")"; if [[ "$lbase" == $(_base_lower "$pat") ]]; then hit=1; break; fi; done
+      if [ "$hit" = "1" ]; then continue; fi
+      if _base_in_list "${f#"$M"/}" ${UNKNOWN_FILES[@]+"${UNKNOWN_FILES[@]}"} ${UNCLAIMED_FILES[@]+"${UNCLAIMED_FILES[@]}"}; then continue; fi
+      UNCLAIMED_FILES+=("${f#"$M"/}")
+    done < <(find "$catdir" -maxdepth 1 -type f \( "${nexpr[@]}" \) 2>/dev/null)
+  done
+  if [ "${#UNCLAIMED_FILES[@]}" -gt 0 ]; then note "unclaimed ${#UNCLAIMED_FILES[@]} model file(s) no package declares — left where they are: ${UNCLAIMED_FILES[*]}"; fi
+  # ---- duplicates: same basename (or alternate) + same size as the copy in the library, not claimed by another package
+  while IFS='|' read -r cat fam purp file url bytes mnote alts; do
+    [ -n "$cat" ] || continue
+    [[ "$file" == */ ]] && continue
+    rel="$(_base_dest_rel "$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts")"; dest="$(_base_dest_path "$rel")"; [ -f "$dest" ] || continue
+    real="$(cd "$(dirname "$dest")" && pwd -P)/$(basename "$dest")"; dsz="$(_base_fsize "$dest")"
+    # shellcheck disable=SC2086
+    while IFS=$'\t' read -r size path; do
+      if [ -z "$path" ] || [ ! -f "$path" ] || [ -L "$path" ]; then continue; fi
+      case "$path" in *.partial) continue;; esac
+      if [ "$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")" = "$real" ]; then continue; fi
+      if [ "$size" != "$dsz" ]; then note "same name, different size (kept): $path ($(_base_bytes_to_gb "$size") GB vs $(_base_bytes_to_gb "$dsz") GB in the library)"; continue; fi
+      case "$path" in "$M"/*) if _base_ledger_claims "${path#"$M"/}"; then note "duplicate of $rel at $path is claimed by another installed package — kept"; continue; fi;; esac
+      echo -e "${YEL}  ≡ duplicate of $rel: $path ($(_base_bytes_to_gb "$size") GB)${NC}"; DEL_FILES+=("$path"); DEL_BYTES=$((DEL_BYTES + size))
+    done < <(_base_idx_find "$(basename "$file")" $alts)
+  done <<< "$rows"
+  # ---- superseded: only inside this package's own family folders (and its declared legacy dirs), only by basename
+  local fdirs; fdirs="$(_base_family_dirs)"
+  while IFS=$'\t' read -r size path; do
+    if [ -z "$path" ] || [ ! -f "$path" ] || [ -L "$path" ]; then continue; fi
+    base="$(basename "$path")"; lbase="$(_base_lower "$base")"; hit=0
+    case "$path" in "$M"/*.partial|"$M"/*/*.partial|"$M"/*/*/*.partial|"$M"/*/*/*/*.partial) hit=1;; esac
+    if [ "$hit" = "0" ]; then
+      local inside=0
+      while IFS= read -r d; do [ -n "$d" ] || continue; case "$path/" in "$M/$d"/*) inside=1;; esac; done <<< "$fdirs"
+      [ "$inside" = "1" ] || continue
+      for pat in ${SUPERSEDED[@]+"${SUPERSEDED[@]}"}; do
+        case "$pat" in */*|.*|"") continue;; esac                       # basenames only, ever
+        if [[ "$lbase" == $(_base_lower "$pat") ]]; then hit=1; break; fi
+      done
+    fi
+    [ "$hit" = "1" ] || continue
+    if _base_in_list "$path" ${DEL_FILES[@]+"${DEL_FILES[@]}"}; then continue; fi
+    if _base_ledger_claims "${path#"$M"/}"; then note "superseded here but claimed by another installed package — kept: $path"; continue; fi
+    echo -e "${YEL}  ✂ superseded: $path ($(_base_bytes_to_gb "$size") GB)${NC}"; DEL_FILES+=("$path"); DEL_BYTES=$((DEL_BYTES + size))
+  done < "$IDX"
+  # ---- the single deletion prompt — default No
+  if [ "${#DEL_FILES[@]}" -eq 0 ] && [ "${#DEL_DIRS[@]}" -eq 0 ]; then ok "no duplicates, partials or superseded files"
+  elif [ "$BASE_DRY" = "1" ]; then note "${#DEL_FILES[@]} file(s) + ${#DEL_DIRS[@]} dir(s), $(_base_bytes_to_gb "$DEL_BYTES") GB reclaimable — the real run offers them for deletion (y/N)"
+  else
+    echo
+    if _base_confirm "Delete these ${#DEL_FILES[@]} files and ${#DEL_DIRS[@]} directories ($(_base_bytes_to_gb "$DEL_BYTES") GB reclaimable)? [y/N] "; then
+      for f in ${DEL_FILES[@]+"${DEL_FILES[@]}"}; do if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f "$f" && echo "  ✂ deleted $f"; fi; done
+      for f in ${DEL_DIRS[@]+"${DEL_DIRS[@]}"}; do if [ -d "$f" ]; then rm -rf "$f" && echo "  ✂ deleted $f/"; fi; done
+      ok "$(_base_bytes_to_gb "$DEL_BYTES") GB reclaimed"; DEL_FILES=(); DEL_DIRS=()
+    else note "kept — nothing deleted"; fi
+  fi
+  if [ "$BASE_DRY" != "1" ]; then
+    for legacy in ${LEGACY_DIRS[@]+"${LEGACY_DIRS[@]}"}; do
+      if [ -d "$M/$legacy" ] && [ -z "$(ls -A "$M/$legacy" 2>/dev/null)" ]; then rmdir "$M/$legacy" 2>/dev/null && note "removed empty legacy folder $legacy"; fi
+    done
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- gen-models: fill/verify bytes from the Hub
+base_gen_models(){ # <pkg dir> → the package's MODELS rows with bytes filled from HEAD; exit 1 on drift or an unreadable size
+  local d="${1%/}" s rows rc=0 cat fam purp file url bytes note alts exp
+  s="$(ls "$d"/*"-script.sh" 2>/dev/null | head -1 || true)"
+  if [ -z "$s" ]; then echo "  !! no '*-script.sh' in $d" >&2; return 1; fi
+  rows="$(BASE_DECLARE_ONLY=1 bash "$s" | grep '^MODELROW ' | cut -c10- || true)"
+  while IFS='|' read -r cat fam purp file url bytes note alts; do
+    [ -n "$cat" ] || continue
+    case "$url" in
+      LOCAL|hf://*) echo "$cat|$fam|$purp|$file|$url|$bytes|$note|$alts";;
+      *) exp="$(_base_expected "$url")"
+         if [ "${exp%%:*}" = "exact" ]; then
+           if [ "$bytes" != "${exp#*:}" ]; then echo "  !! $file: declared $bytes bytes, the Hub says ${exp#*:}" >&2; rc=1; fi
+           echo "$cat|$fam|$purp|$file|$url|${exp#*:}|$note|$alts"
+         else echo "  !! $file: the Hub returned no size for $url" >&2; rc=1; echo "$cat|$fam|$purp|$file|$url|$bytes|$note|$alts"; fi;;
+    esac
+  done <<< "$rows"
+  return $rc
+}

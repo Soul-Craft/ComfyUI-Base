@@ -1,0 +1,521 @@
+"""hosts/runpod/provider.py: RunPod, the first host. REST v1, a container whose start command runs the base's boot, and
+/workspace mounted from a network volume. This is the code that was podctl's RunPod half until base 2.2.0, moved here
+verbatim; the driver reaches it through RunPodProvider, and the driver's own shared helpers (ssh, scp, the Host block) are
+reached back through _c(), the driver module registered as comfyui_podctl.
+
+The API key is read from RUNPOD_API_KEY, else from runpodctl's ~/.runpod/config.toml (`apiKey = "..."`). It is sent as a
+bearer header and never printed, logged or placed in an argument.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.request
+
+from comfyui_hosts import Address, PodctlError, Provider
+
+VOLUME_ROOT = "/workspace"          # RunPod mounts the network volume here (volumeMountPath); the base's BASE_VOLUME on this host
+
+
+def _c():
+    """The driver module (podctl.py), for the shared helpers: write_ssh_config, ssh_banner, ssh_run, _sq, SSH_ALIAS."""
+    return sys.modules["comfyui_podctl"]
+
+
+def write_ssh_config(path, host, port):
+    return _c().write_ssh_config(path, host, port)
+
+
+def ssh_banner(host, port, timeout=10):
+    return _c().ssh_banner(host, port, timeout)
+
+
+def _ssh_hostname():
+    return _c()._ssh_hostname()
+
+
+def ssh_run(remote_cmd, env=None, timeout=None):
+    return _c().ssh_run(remote_cmd, env=env, timeout=timeout)
+
+
+def _sq(s):
+    return _c()._sq(s)
+
+
+DEFAULT_API_URL = "https://rest.runpod.io/v1"
+
+
+PLACEHOLDERS = {"token_here", "replace_with_ids", "changeme", ""}
+
+
+SECRET_NAMES = re.compile(r"token|key|secret|password", re.I)
+
+
+def load_api_key(env=None, config_path=None):
+    """RUNPOD_API_KEY, else runpodctl's config file. Never echoed by anything in this module."""
+    env = os.environ if env is None else env
+    key = (env.get("RUNPOD_API_KEY") or "").strip()
+    if key:
+        return key
+    path = pathlib.Path(config_path) if config_path else pathlib.Path.home() / ".runpod" / "config.toml"
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            # runpodctl 2.x: apikey = 'x'; older: apiKey = "x"; hand-written: apikey = x
+            m = re.match(r"""\s*api_?key\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))\s*$""", line, re.I)
+            if m:
+                key = next((g for g in m.groups() if g), "")
+                if key:
+                    return key
+                # 2.0.56: `apikey = ''` (what runpodctl writes before a key is set) matched with every group empty,
+                # and next() over an empty generator raised StopIteration -- a traceback where the line below belongs.
+    raise PodctlError("no RunPod API key: run `runpodctl config --apiKey=<your key>` once, or export RUNPOD_API_KEY")
+
+
+def _base_version():
+    try:
+        return (pathlib.Path(__file__).resolve().parents[2] / "VERSION").read_text().strip() or "0"
+    except OSError:
+        return "0"
+
+
+BASE_VERSION_FOR_UA = _base_version()
+
+
+class Api:
+    """The few REST v1 calls podctl needs. JSON in, JSON out; errors carry the status and the body, never the key."""
+
+    def __init__(self, key, base_url=None):
+        self.key = key
+        self.base = (base_url or os.environ.get("RUNPOD_API_URL") or DEFAULT_API_URL).rstrip("/")
+
+    USER_AGENT = "podctl/%s (ComfyUI Base; RunPod REST v1 client)" % BASE_VERSION_FOR_UA
+
+    def _call(self, method, path, body=None, _retry=True):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + self.key)
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", self.USER_AGENT)   # 2.0.31: Cloudflare blocks urllib's default signature (error 1010)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            text = e.read().decode(errors="replace")
+            if e.code == 403 and "error-1010" in text and _retry:
+                import time
+                time.sleep(5)                               # one retry: the edge rule is per request signature, not per key
+                return self._call(method, path, body, _retry=False)
+            raise PodctlError("%s %s -> HTTP %s: %s" % (method, path, e.code, text[:300]))
+        except urllib.error.URLError as e:
+            raise PodctlError("%s %s -> %s" % (method, path, e.reason))
+        return json.loads(raw) if raw else {}
+
+    def get(self, path):
+        return self._call("GET", path)
+
+    def patch(self, path, body):
+        return self._call("PATCH", path, body)
+
+    def post(self, path, body=None):
+        return self._call("POST", path, body)
+
+    def delete(self, path):
+        return self._call("DELETE", path)
+
+
+def pod_image(pod):
+    """RunPod's REST v1 returns `imageName` (its openapi says `image`); accept both."""
+    return pod.get("imageName") or pod.get("image") or ""
+
+
+def pod_volume_id(pod):
+    return pod.get("networkVolumeId") or (pod.get("networkVolume") or {}).get("id") or ""
+
+
+def env_verdicts(env):
+    """{name: 'placeholder (<value>)' | 'set' | 'unset'}: the value of anything secret-looking is never shown."""
+    out = {}
+    for name, value in sorted((env or {}).items()):
+        v = (value or "").strip()
+        if v in PLACEHOLDERS:
+            out[name] = "placeholder (%s)" % (v or "empty")
+        elif SECRET_NAMES.search(name):
+            out[name] = "set"
+        else:
+            out[name] = "set (%s)" % v
+    return out
+
+
+def pod_facts(pod):
+    env = pod.get("env") or {}
+    mapping = pod.get("portMappings") or {}
+    lines = [
+        "pod        %s (%s)" % (pod.get("id"), pod.get("name")),
+        "image      %s" % (pod_image(pod) or "(unknown)"),
+        "status     %s" % pod.get("desiredStatus"),
+        "public ip  %s" % (pod.get("publicIp") or "(none yet)"),
+        "ports      %s" % " ".join(pod.get("ports") or []) ,
+        "ssh        %s" % ("%s:%s" % (pod.get("publicIp"), mapping["22"]) if mapping.get("22") else "port 22 not mapped"),
+        "volume     %s at %s" % (pod_volume_id(pod) or "NONE", pod.get("volumeMountPath") or "?"),
+        "start cmd  %s" % (" ".join(pod.get("dockerStartCmd") or []) or "(image default)"),
+    ]
+    for name, verdict in env_verdicts(env).items():
+        lines.append("env        %-22s %s" % (name, verdict))
+    if not (env.get("JUPYTER_TOKEN") or env.get("JUPYTER_PASSWORD")):
+        lines.append("jupyter    auth: NONE: anyone with the URL gets a terminal; set JUPYTER_TOKEN (or JUPYTER_PASSWORD)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- the ssh config block
+
+# ONE alias, one Mac, several sessions: and the block is a single pointer. On 2026-09-08 a third session
+# ran `ssh-config` for its own pod and every other session's ssh, scp, install and lease silently began
+# addressing that pod instead: same command, same output shape, different machine. `PODCTL_HOST` gives a
+# session its own block (export PODCTL_HOST=runpod-<podid>) so nothing it does moves anyone else's pointer.
+# The default stays `runpod`, so a single-session Mac and every existing habit are unchanged.
+
+
+BOOT_GUARD = "if [ -x /workspace/comfy-base/boot.sh ]; then exec bash /workspace/comfy-base/boot.sh; fi"
+
+
+def _fetch_json(url, headers=None):
+    req = urllib.request.Request(url)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def image_config(ref, fetch=None):
+    """{'entrypoint': [...], 'cmd': [...]} of a public Docker Hub image, from the registry's config blob."""
+    fetch = fetch or _fetch_json
+    name, _, tag = ref.partition(":")
+    tag = tag or "latest"
+    if "/" not in name:
+        name = "library/" + name
+    if name.count("/") > 1 or name.split("/")[0].count(".") or name.startswith("ghcr.io"):
+        raise PodctlError("only public Docker Hub images can be read (%s); pass --entry '<the image's start command>'" % ref)
+    try:
+        token = fetch("https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull" % name)["token"]
+        h = {"Authorization": "Bearer " + token,
+             "Accept": ", ".join(["application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json",
+                                  "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.oci.image.index.v1+json"])}
+        base = "https://registry-1.docker.io/v2/%s" % name
+        man = fetch(base + "/manifests/" + tag, headers=h)
+        if "manifests" in man:                                        # a list: pick linux/amd64
+            pick = next((m for m in man["manifests"] if (m.get("platform") or {}).get("architecture") == "amd64"
+                         and (m.get("platform") or {}).get("os", "linux") == "linux"), man["manifests"][0])
+            man = fetch(base + "/manifests/" + pick["digest"], headers=h)
+        cfg = fetch(base + "/blobs/" + man["config"]["digest"], headers=h).get("config") or {}
+    except PodctlError:
+        raise
+    except Exception as e:                                            # network, JSON, key errors: one line, no traceback
+        raise PodctlError("could not read the image config of %s (%s); pass --entry '<the image's start command>'" % (ref, e))
+    return {"entrypoint": list(cfg.get("Entrypoint") or []), "cmd": list(cfg.get("Cmd") or [])}
+
+
+def wrap_entry(entrypoint, cmd, bootstrap):
+    """The pod fields that make the base's boot.sh PID 1 when it exists, else run the sshd bootstrap and the image's
+    own entry. A CMD is replaced (the entrypoint, usually a pass-through, stays); an entrypoint-only image gets its
+    entrypoint replaced and CMD emptied."""
+    import shlex
+    # bootstrap is None when the image already runs its own sshd: the boot guard is still installed (that is what
+    # makes the base PID 1), but nothing needs to start sshd. An empty part would leave "guard; ; exec ...": a
+    # bash syntax error: so the parts are joined, not interpolated.
+    prefix = "; ".join([BOOT_GUARD] + ([bootstrap] if bootstrap else []))
+    if cmd:
+        return {"dockerStartCmd": ["bash", "-c", "%s; exec %s" % (prefix, " ".join(shlex.quote(w) for w in cmd))]}
+    if entrypoint:
+        return {"dockerEntrypoint": ["bash", "-c", "%s; exec %s" % (prefix, " ".join(shlex.quote(w) for w in entrypoint))],
+                "dockerStartCmd": []}
+    raise PodctlError("the image declares neither an entrypoint nor a command; pass --entry '<the image's start command>'")
+
+
+def sshd_bootstrap_text():
+    """The self-contained sshd snippet, from lib/boot.sh (one source for the start command and the boot)."""
+    import subprocess
+    boot = pathlib.Path(__file__).resolve().parents[2] / "lib" / "boot.sh"
+    r = subprocess.run(["bash", str(boot), "--print-sshd-bootstrap"], capture_output=True, text=True)
+    if r.returncode != 0 or "boot_sshd" not in r.stdout:
+        raise PodctlError("could not read the sshd bootstrap from %s" % boot)
+    return r.stdout.strip()
+
+
+def wait_for(api, pod_id, ok, what, sleep, tries=90, every=5):
+    for _ in range(tries):
+        pod = api.get("/pods/" + pod_id)
+        if ok(pod):
+            return pod
+        sleep(every)
+    raise PodctlError("gave up waiting for %s (%ds)" % (what, tries * every))
+
+
+def ensure(api, pod_id, pubkey, ssh_config, bootstrap, image_config=image_config, entry=None, banner=ssh_banner,
+           sleep=None, ssh_check=None, log=None):
+    """Make the pod reachable and hand its boot to the base. Idempotent: every step checks before it changes.
+    Order: ports (22/tcp) → env.PUBLIC_KEY → wait RUNNING + mapping → ssh banner → (refused) start command → wait →
+    banner → the `Host runpod` block → `ssh runpod hostname`."""
+    import time
+    sleep = sleep or time.sleep
+    log = log or (lambda s: print(s))
+    pod = api.get("/pods/" + pod_id)
+    ports = list(pod.get("ports") or [])
+    if "22/tcp" not in ports:
+        log("ensure: exposing 22/tcp (the pod resets)")
+        api.patch("/pods/" + pod_id, {"ports": ports + ["22/tcp"]})
+    env = dict(pod.get("env") or {})
+    if (env.get("PUBLIC_KEY") or "").strip() != pubkey.strip():
+        log("ensure: setting PUBLIC_KEY to the Mac key (the pod resets)")
+        env["PUBLIC_KEY"] = pubkey.strip()
+        api.patch("/pods/" + pod_id, {"env": env})
+
+    def up(p):
+        return p.get("desiredStatus") == "RUNNING" and bool(p.get("publicIp")) and bool((p.get("portMappings") or {}).get("22"))
+    pod = wait_for(api, pod_id, up, "RUNNING with port 22 mapped", sleep)
+    host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+    # 2.0.52: the override is installed when it is ABSENT, not when sshd happens to be silent. It used to live
+    # inside the "nothing answers" branch, so an image that runs its own sshd (runpod/comfyui:1.4.7-cuda13.0) never
+    # got it: and that pod's next restart came up on the IMAGE's ComfyUI instead of the base's boot.sh, losing the
+    # base's launch line (--preview-method auto --preview-size 1024 --disable-api-nodes). Everything installed still
+    # worked, so the only symptom was the previews warning, once per restart. Found on the cold-install pod after a
+    # restart, 2026-09-08. Reading the pod's own fields keeps this idempotent: a pod that already carries the guard
+    # is not patched and its image is never fetched, so `ensure` still resets nothing on a second run.
+    answers = banner(host, port)
+    installed = BOOT_GUARD in " ".join((pod.get("dockerEntrypoint") or []) + (pod.get("dockerStartCmd") or []))
+    if not installed:
+        if answers:
+            log("ensure: sshd answers, but the base's boot is not PID 1: installing it (the pod resets)")
+        else:
+            log("ensure: nothing answers on %s:%d: this image runs no sshd; wrapping its start command" % (host, port))
+        if entry:
+            fields = wrap_entry([], list(entry), bootstrap if not answers else None)
+        else:
+            try:
+                cfg = image_config(pod_image(pod))
+            except PodctlError as e:
+                raise PodctlError("%s: or pass --entry '<the image's start command>'" % e)
+            fields = wrap_entry(cfg["entrypoint"], cfg["cmd"], bootstrap if not answers else None)
+        api.patch("/pods/" + pod_id, fields)
+        pod = wait_for(api, pod_id, up, "RUNNING with port 22 mapped after the reset", sleep)
+        host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+        for _ in range(60):
+            if banner(host, port):
+                break
+            sleep(5)
+        else:
+            raise PodctlError("sshd never answered on %s:%d after the start command was set: read the pod's log" % (host, port))
+    write_ssh_config(ssh_config, host, port)
+    log("ensure: Host %s -> %s:%d" % (_c().SSH_ALIAS, host, port))
+    hostname = (ssh_check or _ssh_hostname)()
+    return "reachable: %s:%d (pod hostname %s)" % (host, port, hostname)
+
+
+def stop(api, pod_id, wait=True, sleep=None):
+    import time
+    sleep = sleep or time.sleep
+    api.post("/pods/%s/stop" % pod_id)
+    if wait:
+        wait_for(api, pod_id, lambda p: p.get("desiredStatus") in ("EXITED", "STOPPED"), "the pod to stop", sleep, tries=60)
+    return "stopped %s" % pod_id
+
+
+def start(api, pod_id, wait=True, sleep=None, banner=ssh_banner, ssh_config=None):
+    """Start (resume) the pod; with wait, block until port 22 is mapped AND answers with an ssh banner, then refresh
+    the `Host runpod` block (the public port changes on every start)."""
+    import time
+    sleep = sleep or time.sleep
+    api.post("/pods/%s/start" % pod_id)
+    if not wait:
+        return "started %s" % pod_id
+    pod = wait_for(api, pod_id, lambda p: p.get("desiredStatus") == "RUNNING" and p.get("publicIp") and (p.get("portMappings") or {}).get("22"),
+                   "RUNNING with port 22 mapped", sleep, tries=120)
+    host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+    for _ in range(120):
+        if banner(host, port):
+            break
+        sleep(5)
+    else:
+        raise PodctlError("started, but sshd never answered on %s:%d: read the pod's boot log" % (host, port))
+    write_ssh_config(ssh_config or pathlib.Path.home() / ".ssh" / "config", host, port)
+    return "started %s: ssh answers on %s:%d (Host %s updated)" % (pod_id, host, port, _c().SSH_ALIAS)
+
+
+def restart(api, pod_id, wait=True, sleep=None, banner=ssh_banner, ssh_config=None):
+    api.post("/pods/%s/restart" % pod_id)
+    out = "restarted %s" % pod_id
+    if wait:
+        import time
+        sleep = sleep or time.sleep
+        pod = wait_for(api, pod_id, lambda p: p.get("desiredStatus") == "RUNNING" and p.get("publicIp") and (p.get("portMappings") or {}).get("22"),
+                       "RUNNING with port 22 mapped", sleep, tries=120)
+        host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+        for _ in range(120):
+            if banner(host, port):
+                break
+            sleep(5)
+        else:
+            raise PodctlError("restarted, but sshd never answered on %s:%d" % (host, port))
+        write_ssh_config(ssh_config or pathlib.Path.home() / ".ssh" / "config", host, port)
+        out += ": ssh answers on %s:%d" % (host, port)
+    return out
+
+
+def deploy_body(src, name=None, gpu=None):
+    """The create body that clones a pod onto ITS OWN network volume: same image, GPU type, disk, ports, env and start command
+    (the base's boot override: the clone boots the base from its first start and the template's own downloader never runs);
+    the volume's datacenter; secure cloud when the source is. Never a templateId: the template would re-apply its own env and
+    start command over the clone's. The one reason to exist: a machine whose GPU is not ours (2.0.26's verdict): a stop/start
+    lands on the same machine; a new pod lands wherever the datacenter has the GPU free."""
+    vol = src.get("networkVolume") or {}
+    if not src.get("networkVolumeId") or not vol.get("dataCenterId"):
+        raise PodctlError("%s has no network volume: nothing for a clone to share (a redeploy is for a pod on a volume)" % src.get("id"))
+    machine = src.get("machine") or {}
+    gpu = gpu or machine.get("gpuTypeId")
+    if not gpu:
+        raise PodctlError("%s: the API did not name the GPU type (machine facts missing): pass --gpu" % src.get("id"))
+    body = {"name": name or "%s-2" % (src.get("name") or "pod"), "imageName": src["imageName"], "gpuTypeIds": [gpu],
+            "gpuCount": int(src.get("gpuCount") or 1), "containerDiskInGb": int(src.get("containerDiskInGb") or 50),
+            "networkVolumeId": src["networkVolumeId"], "volumeMountPath": src.get("volumeMountPath") or "/workspace",
+            "ports": list(src.get("ports") or []), "env": dict(src.get("env") or {}),
+            "cloudType": "SECURE" if machine.get("secureCloud", True) else "COMMUNITY", "dataCenterIds": [vol["dataCenterId"]],
+            "supportPublicIp": True, "computeType": "GPU", "interruptible": bool(src.get("interruptible"))}
+    for k in ("dockerStartCmd", "dockerEntrypoint"):
+        if src.get(k):
+            body[k] = list(src[k])
+    return body
+
+
+def deploy(api, like, name=None, gpu=None, wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print):
+    """A NEW pod cloned from `like` onto the same volume. With wait: until sshd answers, then `Host runpod` → the new pod.
+    Returns the new pod id. Prints counts and names, never an env value."""
+    import time
+    sleep = sleep or time.sleep
+    src = api.get("/pods/%s?includeMachine=true&includeNetworkVolume=true" % like)
+    body = deploy_body(src, name=name, gpu=gpu)
+    new = api.post("/pods", body)
+    pod_id = new["id"]
+    say("deployed %s (%s): %s · %s × %d · %d GB container disk · volume %s at %s (%s) · %d ports · %d env vars · start command %s"
+        % (pod_id, body["name"], body["imageName"], body["gpuTypeIds"][0], body["gpuCount"], body["containerDiskInGb"], body["networkVolumeId"],
+           body["volumeMountPath"], body["dataCenterIds"][0], len(body["ports"]), len(body["env"]), "cloned (the base's boot)" if body.get("dockerStartCmd") else "(image default)"))
+    if new.get("machineId") and new.get("machineId") == src.get("machineId"):
+        say("  note: the SAME machine as %s (%s): the GPU verdict decides" % (like, new["machineId"]))
+    if not wait:
+        return pod_id
+    pod = wait_for(api, pod_id, lambda p: p.get("desiredStatus") == "RUNNING" and p.get("publicIp") and (p.get("portMappings") or {}).get("22"),
+                   "RUNNING with port 22 mapped", sleep, tries=120)
+    host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+    for _ in range(120):
+        if banner(host, port):
+            break
+        sleep(5)
+    else:
+        raise PodctlError("deployed %s, but sshd never answered on %s:%d: read the pod's boot log in the console" % (pod_id, host, port))
+    write_ssh_config(ssh_config or pathlib.Path.home() / ".ssh" / "config", host, port)
+    say("  ssh answers on %s:%d (Host %s → %s); machine %s" % (host, port, _c().SSH_ALIAS, pod_id, pod.get("machineId") or "?"))
+    if pod.get("machineId") and pod.get("machineId") == src.get("machineId"):
+        say("  note: the SAME machine as %s: the GPU verdict decides" % like)
+    return pod_id
+
+
+# Command sessions carry NO port forwards: Host runpod's LocalForward lines are for the tunnel, and a command session that
+# tries them while a tunnel holds the ports prints "bind: Address already in use" three times per call (2026-09-06).
+
+
+def volume_size_gb(api, pod):
+    """The network volume's size in GB from RunPod's REST, or None for a pod without one."""
+    vid = pod_volume_id(pod)
+    if not vid:
+        return None
+    v = api.get("/networkvolumes/%s" % vid)
+    size = v.get("size") if isinstance(v, dict) else None
+    return int(size) if size is not None else None
+
+
+def record_volume(api, pod, env=None):
+    """Write /workspace/comfy-base/state/volume.env (VOLUME_GB, VOLUME_ID, RECORDED) on the pod: the base's disk gate
+    reads it, because df on the pooled volume reports the pool, not the quota. Returns the line printed, or None."""
+    import datetime
+    size = volume_size_gb(api, pod)
+    if size is None:
+        return None
+    vid = pod_volume_id(pod)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cmd = "mkdir -p /workspace/comfy-base/state && printf 'VOLUME_GB=%%s\\nVOLUME_ID=%%s\\nRECORDED=%%s\\n' %s %s %s > /workspace/comfy-base/state/volume.env" % (
+        _sq(str(size)), _sq(vid), _sq(ts))
+    r = ssh_run(cmd, env=env)
+    if r.returncode != 0:
+        raise PodctlError("could not record the volume size on the pod: %s" % r.stderr.strip()[-300:])
+    return "volume  %d GB (%s) recorded in state/volume.env" % (size, vid)
+
+
+# ---------------------------------------------------------------- the provider the driver loads
+
+class RunPodProvider(Provider):
+    """RunPod behind the host interface. Everything above is reached through it by the driver; the functions stay
+    importable on their own for the suite, which drives them against a fake REST server."""
+    name = "runpod"
+    volume_root = VOLUME_ROOT
+    ssh_user = "root"
+    ssh_alias = "runpod"
+    key_path = pathlib.Path.home() / ".ssh" / "id_ed25519"
+    experimental = False
+
+    def __init__(self, api=None):
+        self.api = api or Api(load_api_key())
+
+    def pods(self):
+        return self.api.get("/pods") or []
+
+    def pod(self, ident):
+        return self.api.get("/pods/" + ident)
+
+    def facts(self, pod):
+        mapping = pod.get("portMappings") or {}
+        status = {"RUNNING": "running", "EXITED": "stopped", "STOPPED": "stopped"}.get(pod.get("desiredStatus"), "transitional")
+        return {"id": pod.get("id"), "name": pod.get("name"), "status": status, "host": pod.get("publicIp") or "",
+                "port": int(mapping["22"]) if mapping.get("22") else 0, "user": self.ssh_user, "image": pod_image(pod),
+                "gpu": (pod.get("machine") or {}).get("gpuTypeId", ""), "volumes": [pod_volume_id(pod)] if pod_volume_id(pod) else []}
+
+    def address(self, pod):
+        f = self.facts(pod)
+        return Address(f["host"], f["port"], self.ssh_user) if f["host"] and f["port"] else None
+
+    def status_text(self, pod):
+        return pod_facts(pod)
+
+    def pods_lines(self):
+        out = []
+        for p in self.pods():
+            m = (p.get("portMappings") or {}).get("22")
+            out.append("%-16s %-14s %-44s %-8s %-16s %s" % (p.get("id"), (p.get("name") or "")[:14], pod_image(p)[:44],
+                                                             p.get("desiredStatus"), p.get("publicIp") or "-", ("22->%s" % m) if m else "22 unmapped"))
+        return out
+
+    def image_text(self, pod):
+        cfg = image_config(pod_image(pod))
+        return "image      %s\nentrypoint %s\ncmd        %s\nwrap       %s" % (
+            pod_image(pod), cfg["entrypoint"], cfg["cmd"], json.dumps(wrap_entry(cfg["entrypoint"], cfg["cmd"], "<sshd bootstrap>")))
+
+    def ensure(self, pod_id, pubkey, ssh_config, log=print, entry=None, **kw):
+        return ensure(self.api, pod_id, pubkey=pubkey, ssh_config=ssh_config, bootstrap=sshd_bootstrap_text(), entry=entry, log=log)
+
+    def start(self, pod_id, wait=True, ssh_config=None):
+        return start(self.api, pod_id, wait=wait, ssh_config=ssh_config)
+
+    def stop(self, pod_id, wait=True):
+        return stop(self.api, pod_id, wait=wait)
+
+    def restart(self, pod_id, wait=True, ssh_config=None):
+        return restart(self.api, pod_id, wait=wait, ssh_config=ssh_config)
+
+    def deploy_like(self, like, name=None, gpu=None, wait=True, ssh_config=None, say=print):
+        return deploy(self.api, like, name=name, gpu=gpu, wait=wait, ssh_config=ssh_config, say=say)
+
+    def record_volume(self, pod, env=None):
+        return record_volume(self.api, pod, env=env)

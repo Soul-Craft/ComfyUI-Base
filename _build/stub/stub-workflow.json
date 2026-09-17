@@ -1,0 +1,79 @@
+{
+  "id": "00000000-0000-0000-0000-00000000stub",
+  "revision": 0,
+  "last_node_id": 3,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VAELoader",
+      "mode": 0,
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        200,
+        60
+      ],
+      "flags": {},
+      "order": 1,
+      "widgets_values": [
+        "stub_vae.safetensors"
+      ],
+      "inputs": [],
+      "outputs": [],
+      "properties": {}
+    },
+    {
+      "id": 2,
+      "type": "UnetLoaderGGUF",
+      "mode": 4,
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        200,
+        60
+      ],
+      "flags": {},
+      "order": 2,
+      "widgets_values": [
+        "stub_bypassed.gguf"
+      ],
+      "inputs": [],
+      "outputs": [],
+      "properties": {}
+    },
+    {
+      "id": 3,
+      "type": "LoraLoaderModelOnly",
+      "mode": 0,
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        200,
+        60
+      ],
+      "flags": {},
+      "order": 3,
+      "widgets_values": [
+        "stub_local.safetensors",
+        1.0
+      ],
+      "inputs": [],
+      "outputs": [],
+      "properties": {}
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "package_version": "1.0.0"
+  },
+  "version": 0.4
+}
