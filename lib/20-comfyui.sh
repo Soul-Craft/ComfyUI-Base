@@ -21,8 +21,23 @@ _base_token_aliases(){ # the names other templates use for the same secret; the 
   esac
 }
 _base_auth_file(){ # <NAME> → a 0600 file holding "Authorization: Bearer <value>", for curl -H @file (never argv)
-  local name="$1" f="$BASE_TMPD/.auth-$name"
-  ( umask 077; printf 'Authorization: Bearer %s\n' "${!name}" > "$f" ); echo "$f"
+  # SEPARATE statements, not one `local a=.. b=..`: bash expands every word of a `local` line BEFORE it binds any
+  # of them, so `$name` in a second assignment reads the CALLER's scope, never `$1`. It worked only because every
+  # in-tree caller happened to hold `name` set to the same token name, which is an accident and not a contract. A
+  # caller with `name` unset aborted under `set -u`; a caller with `name=""` wrote `.auth-` with the wrong value
+  # and no error, so a bearer token for the wrong name went out and read as a plain auth failure (2.5.1).
+  local name="$1"
+  local f="$BASE_TMPD/.auth-$name"
+  ( umask 077; printf 'Authorization: Bearer %s\n' "${!name}" > "$f" )
+  # the write is in a subshell whose failure was discarded, and the path was echoed either way, so a path bug
+  # reached the caller as `curl: option -H: error encountered when reading a file` and an HTTP 000: it points at
+  # curl, at the URL, at the vendor, at anything but this helper. It cost a session two paid installs. This guard
+  # makes every future variant name itself, including a name the caller passes with a slash in it, which the
+  # split declaration above cannot prevent (2.5.1).
+  # to STDERR, not through err(): this function's STDOUT IS its answer, so a message written there is captured by
+  # the caller's $( ) and lost, exactly as hosts/verda/startup.sh's log() already warns for the same reason.
+  [ -s "$f" ] || { echo "  !! could not write the auth file for $name (checked $f)" >&2; return 1; }
+  echo "$f"
 }
 _base_token_validate(){ # <NAME> <from> — 200 accepted; 401/403 FAIL naming the source, never the value; else "could not validate"
   local name="$1" from="$2" url="" code

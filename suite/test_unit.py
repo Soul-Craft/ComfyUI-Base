@@ -2265,3 +2265,50 @@ def test_unit_the_install_lock_serialises_installs_only_on_a_shared_volume(tmp_p
     lock.mkdir(exist_ok=True)
     r = _bash('_base_install_lock && echo GOT', env={**env, "BASE_VOLUME_SHARED": "0"})
     assert "GOT" in r.stdout and "installing" not in r.stdout, r.stdout
+
+
+def test_unit_auth_file_reads_its_own_argument_not_the_callers_scope(tmp_path):
+    """MEASURED on a machine (2.5.1): `local name="$1" f="...$name"` expands every word BEFORE local binds any, so
+    the second `$name` read the CALLER's scope. It worked only because every in-tree caller happened to hold `name`
+    set to the same token name. A caller with `name=""` wrote `.auth-` carrying the WRONG value and no error, so a
+    bearer token for the wrong name went out and read as a plain auth failure."""
+    env = {"BASE_VOLUME": str(tmp_path), "BASE_HOST": "local", "HF_TOKEN": "tok-correct", "OTHER_TOKEN": "tok-wrong"}
+    # the caller holds `name` set to something ELSE, which is the silent-wrong case
+    r = _bash('_base_tmp; name=OTHER_TOKEN; f="$(_base_auth_file HF_TOKEN)"; echo "PATH=$(basename "$f")"; cat "$f"', env=env)
+    assert "PATH=.auth-HF_TOKEN" in r.stdout, "the file must be named for the ARGUMENT: " + r.stdout + r.stderr
+    assert "Bearer tok-correct" in r.stdout, "the wrong token went out: " + r.stdout
+    assert "tok-wrong" not in r.stdout
+    # and a caller with no `name` in scope at all must not abort under set -u
+    r = _bash('set -u; _base_tmp; f="$(_base_auth_file HF_TOKEN)"; echo "OK=$(basename "$f")"', env=env)
+    assert "OK=.auth-HF_TOKEN" in r.stdout, r.stdout + r.stderr
+
+    # the third outcome, and the one the split declaration alone cannot prevent: a name the CALLER passes with a
+    # slash in it makes the write fail in a subshell whose failure was discarded, and the function used to hand
+    # back a path to a file it had not created. curl then said "option -H: error encountered when reading a file"
+    # and HTTP 000, which points at curl and the vendor rather than here. It must name itself instead.
+    r = _bash('_base_tmp; f="$(_base_auth_file "a/b")" && echo "RETURNED=$f" || echo "REFUSED"', env=env)
+    assert "REFUSED" in r.stdout and "RETURNED=" not in r.stdout, "a failed write must not return a path: " + r.stdout
+    assert "could not write the auth file" in r.stdout or "could not write the auth file" in r.stderr, r.stdout + r.stderr
+
+
+def test_unit_the_library_link_ignores_everything_comfyui_itself_ships(tmp_path):
+    """2.5.1: the placeholder filter covered put_*_here and missed models/configs/v1-inference*.yaml, which ComfyUI
+    ships too, so the refusal fired on every fresh machine and printed advice nobody could act on: the files it
+    objected to were ComfyUI's own."""
+    lib = tmp_path / "library"; (lib / "models").mkdir(parents=True)
+    comfy = tmp_path / "ComfyUI"
+    (comfy / "models" / "configs").mkdir(parents=True)
+    (comfy / "models" / "checkpoints").mkdir(parents=True)
+    (comfy / "models" / "checkpoints" / "put_checkpoints_here").write_text("")
+    (comfy / "models" / "configs" / "v1-inference.yaml").write_text("model: {}\n")
+    (comfy / "models" / "configs" / "v1-inference_clip_skip_2.yaml").write_text("model: {}\n")
+    r = _bash(f'COMFY="{comfy}"; BASE_LIBRARY="{lib}"; EXTRA_YAML="{comfy}/extra_model_paths.yaml"; _base_library_link')
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (comfy / "models").is_symlink(), "ComfyUI's own configs are not the operator's models: " + r.stdout
+    # and they are not thrown away either: the shared tree should look like a ComfyUI models/ does
+    assert (lib / "models" / "configs" / "v1-inference.yaml").exists(), "the configs must move to the library, not vanish"
+    # a real model still stops it, which is the whole point of the guard
+    c2 = tmp_path / "ComfyUI2"; (c2 / "models" / "vae").mkdir(parents=True)
+    (c2 / "models" / "vae" / "real.safetensors").write_text("x")
+    r2 = _bash(f'COMFY="{c2}"; BASE_LIBRARY="{lib}"; EXTRA_YAML="{c2}/extra_model_paths.yaml"; _base_library_link')
+    assert not (c2 / "models").is_symlink() and "real.safetensors" in r2.stdout, r2.stdout

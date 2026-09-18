@@ -133,7 +133,11 @@ _base_library_link(){ # 2.4.0: make ComfyUI's own models/ BE the shared library
     # (put_checkpoints_here and friends), so a freshly materialised models/ is never empty. Counting those as
     # content made the refusal below fire on exactly the fresh machine this is for, which would have sent every
     # machine back to its own copy of the library, silently and looking like it worked.
-    n="$(find "$local_models" -mindepth 1 -type f ! -name 'put_*_here' ! -name '.gitkeep' ! -name '.DS_Store' 2>/dev/null | head -1)"
+    # ComfyUI's own tree ships more than the placeholders: models/configs/ carries v1-inference*.yaml and friends.
+    # Counting those as content made the refusal fire on every fresh machine and print advice nobody can act on,
+    # because the files it objects to are ComfyUI's, not the operator's. Measured on a live machine (2.5.1).
+    n="$(find "$local_models" -mindepth 1 -type f ! -name 'put_*_here' ! -name '.gitkeep' ! -name '.DS_Store' \
+         ! -name '*.yaml' ! -name '*.yml' ! -name 'README*' ! -name '*.md' 2>/dev/null | head -1)"
     if [ -n "$n" ]; then
       # never move a machine's models without being asked: say exactly what to run, and register the library as a
       # search path meanwhile so the standard categories at least resolve
@@ -142,10 +146,14 @@ _base_library_link(){ # 2.4.0: make ComfyUI's own models/ BE the shared library
       _base_yaml_library
       return 0
     fi
-    if [ "$BASE_DRY" = "1" ]; then would "replace $local_models (placeholders only) with a symlink to $lib"; return 0; fi
-    # delete the placeholders BY NAME and then the empty directories bottom up. Never `rm -rf` a path built from a
-    # variable: the two finds can only remove what was just proven to be placeholders and empty folders.
-    find "$local_models" -type f \( -name 'put_*_here' -o -name '.gitkeep' -o -name '.DS_Store' \) -delete 2>/dev/null
+    if [ "$BASE_DRY" = "1" ]; then would "replace $local_models (ComfyUI's own scaffolding only) with a symlink to $lib"; return 0; fi
+    # Everything left here is ComfyUI's own: the placeholders and models/configs/*.yaml. COPY it onto the library
+    # first, without clobbering, so the shared tree ends up looking exactly like a ComfyUI models/ should and the
+    # configs are shared like everything else. Only then take the local tree down: the placeholders by name, and
+    # the directories bottom up while they are empty. Never `rm -rf` a path built from a variable.
+    cp -Rn "$local_models/." "$lib/" 2>/dev/null || true
+    find "$local_models" -type f \( -name 'put_*_here' -o -name '.gitkeep' -o -name '.DS_Store' \
+         -o -name '*.yaml' -o -name '*.yml' -o -name 'README*' -o -name '*.md' \) -delete 2>/dev/null
     find "$local_models" -depth -type d -empty -delete 2>/dev/null
     if [ -e "$local_models" ]; then
       warn "could not clear $local_models (something is still in it) - the shared library is a search path instead"

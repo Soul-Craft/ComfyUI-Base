@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -403,6 +403,11 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.1: `_base_auth_file` read its own argument. `local a="$1" b="...$a"` expands every word before `local`
+  binds any, so the second read the CALLER's scope; it worked only because every in-tree caller held `name` set to
+  the same token name, and a caller holding a different one sent a bearer token for the wrong name with no error.
+  The library link also ignores everything ComfyUI itself ships, `models/configs/*.yaml` as well as the
+  placeholders, and copies it onto the library rather than discarding it.
 - 2.5.0: `BASE_VOLUME_SHARED`, the whole root on the shared store (§0.14), which is what makes a machine
   disposable rather than only its models shared. `user/` and `temp/` move to `BASE_LOCAL_STATE`; installs take a
   mkdir lock on the store, honoured for two hours and then broken with the owner named; running is unlocked. On
