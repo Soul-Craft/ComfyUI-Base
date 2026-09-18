@@ -238,3 +238,19 @@ def test_unit_the_testbed_port_file_picks_the_server(tmp_path):
     env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"]), "BASE_NODE_SRC": "", "BASE_SERVER": ""}
     r = subprocess.run(["bash", "-c", 'source "%s/base.sh"; BASE_NODE_SRC=""; BASE_SERVER=""; _base_use_testbed; echo "S=$BASE_SERVER"' % base], capture_output=True, text=True, env=env)
     assert "S=127.0.0.1:8299" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_a_shared_root_makes_a_separate_library_redundant(tmp_path):
+    """2.5.2, measured on a live machine: with BASE_VOLUME_SHARED the whole root IS the store, so a BASE_LIBRARY
+    pointing at the same store mounts it twice. The run then warns about "another ComfyUI tree" which is its own
+    seen through the second path, and --output-directory goes to the other mount. They are alternatives."""
+    vol = tmp_path / "store"; vol.mkdir()
+    lib = tmp_path / "mnt"; lib.mkdir()
+    r = _bash('base_env_setup 2>&1; echo "LIB=[$BASE_LIBRARY] SHARED=$BASE_VOLUME_SHARED"',
+              env={"BASE_VOLUME": str(vol), "BASE_HOST": "local", "BASE_VOLUME_SHARED": "1", "BASE_LIBRARY": str(lib)})
+    assert "LIB=[] SHARED=1" in r.stdout, r.stdout + r.stderr
+    assert "redundant and is ignored" in r.stdout, r.stdout
+    # and without a shared root the library is untouched, because that is the narrower shape and still valid
+    r = _bash('base_env_setup 2>&1; echo "LIB=[$BASE_LIBRARY]"',
+              env={"BASE_VOLUME": str(vol), "BASE_HOST": "local", "BASE_VOLUME_SHARED": "0", "BASE_LIBRARY": str(lib)})
+    assert "LIB=[%s]" % lib in r.stdout, r.stdout + r.stderr

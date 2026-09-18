@@ -192,9 +192,18 @@ mount_workspace_share() {
   systemctl daemon-reload 2>/dev/null
   if findmnt -n "$MOUNT" >/dev/null 2>&1; then
     src=$(findmnt -n -o SOURCE "$MOUNT")
-    [ "$src" = "$WORKSPACE_SRC" ] || log "WARNING $MOUNT is mounted from $src, not $WORKSPACE_SRC, left alone"
-    log "$MOUNT already mounted from $src"
-    return 0
+    if [ "$src" = "$WORKSPACE_SRC" ]; then
+      log "$MOUNT already mounted from $src"
+      return 0
+    fi
+    # MEASURED on a live machine: the fstab line is rewritten but the mount is NOT, because $MOUNT is already
+    # occupied by the block device and mount(8) will not replace it under a running system. Reporting success here
+    # made READY say mounted=yes while the machine was still on its own disk, which is the one lie a report line
+    # must never tell. The fstab is correct, so a reboot completes it; say exactly that and fail the step.
+    log "$MOUNT is mounted from $src, NOT the share. The fstab line is written, so REBOOT to complete the switch"
+    log "  (nothing can remount $MOUNT under a running system while the base and ComfyUI live on it)"
+    DISK="$src"
+    return 1
   fi
   local tries=0
   while [ "$tries" -lt 6 ]; do

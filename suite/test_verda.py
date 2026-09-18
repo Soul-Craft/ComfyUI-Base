@@ -843,3 +843,16 @@ def test_unit_verda_startup_script_can_mount_the_share_as_the_workspace():
     assert 'if [ -n "$WORKSPACE_SRC" ]; then\n    mount_workspace_share' in s
     # fstab is the only record of it, because host.env lives ON the share it would have to name
     assert "recalled from fstab" in s
+
+
+def test_unit_workspace_share_refuses_to_claim_a_mount_it_did_not_make():
+    """MEASURED on a live machine: ensure --workspace-shared rewrote the fstab line correctly, but /workspace was
+    already mounted from the block device and mount(8) will not replace a mount under a running system. The script
+    reported success anyway, so READY said mounted=yes while the machine was still on its own disk. A report line
+    that lies is worse than a failure: it now says REBOOT and fails the step, because the fstab IS correct."""
+    s = STARTUP.read_bytes().decode("ascii")
+    i = s.index("mount_workspace_share()")
+    body = s[i:s.index("\nmount_data_disk()", i)]
+    assert "NOT the share" in body and "REBOOT to complete the switch" in body, body[:400]
+    # the success branch must be the ONLY one that returns 0 from an existing mount
+    assert 'if [ "$src" = "$WORKSPACE_SRC" ]; then' in body, body[:400]

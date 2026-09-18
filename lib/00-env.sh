@@ -264,6 +264,13 @@ _base_host_resolve(){ # BASE_HOST from the evidence at hand, then the two settin
       *:/*) BASE_VOLUME_SHARED=1 ;;                 # an nfs export as the root is a shared root by definition
     esac
   fi
+  # 2.5.2: the two shapes are alternatives, not layers. With the WHOLE root on the store, a separate library
+  # pointing at the same store mounts it twice, makes the run warn about "another ComfyUI tree" that is its own
+  # through the second path, and sends --output-directory at the other mount. MEASURED on a live machine.
+  if [ "$BASE_VOLUME_SHARED" = "1" ] && [ -n "$BASE_LIBRARY" ]; then
+    echo "  ○ the whole root is the shared store, so BASE_LIBRARY=$BASE_LIBRARY is redundant and is ignored" >&2
+    BASE_LIBRARY=""
+  fi
   export BASE_HOST BASE_VOLUME BASE_VOLUME_KIND BASE_LISTEN BASE_LIBRARY BASE_VOLUME_SHARED BASE_LOCAL_STATE
 }
 
