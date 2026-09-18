@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -403,6 +403,9 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.3: the Verda host is no longer EXPERIMENTAL. The three questions its README asked are answered by live
+  runs: the ssh user is root, the startup script does re-run on a redeploy and fstab survives on the OS volume, and
+  `ip` populates within about 30 s. The driver no longer prints the warning on every command.
 - 2.5.2: proven on a live machine, and two things it found. `ensure --workspace-shared` could not swap a mount
   under a running system, so the script reported success while the machine was still on its own disk; it now says
   REBOOT and fails the step, because a report line that lies is worse than an error. And `BASE_VOLUME_SHARED` with

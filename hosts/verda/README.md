@@ -1,18 +1,16 @@
 # hosts/verda: ComfyUI Base on a Verda (DataCrunch) VM
 
-**EXPERIMENTAL.** This host was written from Verda's own documentation (docs.verda.com and the API reference at
-api.verda.com/v1/docs) and has not yet been proven on a live account. `podctl --provider verda` says so on
-every run. The first live pass must verify, in this order, and this notice comes off only when all three are known:
+**PROVEN on a live account**, 2026-09-17 and 2026-09-18. What the live runs answered, in the order this file used
+to ask:
 
-1. **The ssh user.** The provider assumes `root` on port 22 of the public ip (Verda's docs say the images log in as
-   root). If a first `ssh verda hostname` is refused, try `ubuntu` and change `ssh_user` in `provider.py`.
-2. **Whether the startup script re-runs on a redeploy from an OS volume.** The docs say a startup script runs once,
-   on the first deploy of a fresh image. The provider does not depend on it either way (`podctl ensure` runs the
-   same script's `--ensure` pass over ssh), but the answer decides whether a `podctl start <os volume>` machine
-   is ready before or only after `ensure`.
-3. **When `ip` populates.** The provider polls `GET /instances/{id}` until `status == "running"` and `ip` is not
-   null, then probes port 22 for an ssh banner. If the ip is present while provisioning, or absent for a while
-   after running, the wait still works but the timings in this README are wrong.
+1. **The ssh user is `root`** on port 22 of the public ip, as the docs said.
+2. **The startup script does re-run** on a redeploy from an OS volume, and `/etc/fstab` survives on that volume, so
+   a machine started from it re-mounts `/workspace` and any shared store by itself with no `ensure` needed.
+3. **`ip` populates within about 30 s** of `POST /instances`, which answers the new id as a bare JSON string.
+
+Exercised since: a shared filesystem created, attached to two instances at once and mounted as the whole
+workspace; a 150 GB migration at 509 MB/s; a stop that keeps every volume and a start that redeploys from the OS
+volume; and six volumes restored from the trash after a zero balance, byte for byte.
 
 Everything below is the recipe for a person. The Mac side is `_build/pod/podctl.py --provider verda ...`; the
 machine side is `hosts/verda/startup.sh` (mount the data volume, install the boot unit), and the base itself is

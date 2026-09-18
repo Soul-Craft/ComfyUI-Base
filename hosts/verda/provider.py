@@ -1,9 +1,10 @@
 """hosts/verda/provider.py: Verda (DataCrunch), the second host. A VM behind a REST API, an OS volume that IS the
 image next time, one data volume the first-boot script mounts at /workspace, and the base's boot as a systemd unit.
 
-Written from first-party docs (docs.verda.com, api.verda.com/v1/docs) and NOT yet proven on a live account, so
-`experimental = True` and the driver says so once per run. hosts/verda/README.md lists what the first live run must
-verify (the ssh user, whether the startup script re-runs on a redeploy from an OS volume, when `ip` populates).
+PROVEN on a live account (2026-09-17 and 2026-09-18): instances created, stopped and redeployed from an OS volume,
+a shared filesystem created, attached to two machines at once and mounted as the whole workspace, a 150 GB
+migration, and six volumes restored from the trash after a zero balance. hosts/verda/README.md records what the
+live runs answered and what they measured.
 
 The credentials are a client id + client secret pair: VERDA_CLIENT_ID + VERDA_CLIENT_SECRET, else ~/.verda/credentials
 (`client_id = ...` / `client_secret = ...`, quoted or not). They are exchanged for a bearer token at POST /oauth2/token
@@ -327,7 +328,7 @@ class VerdaProvider(Provider):
     ssh_user = "root"
     ssh_alias = "verda"
     key_path = KEY_PATH
-    experimental = True
+    experimental = False       # proven live 2026-09-18; see hosts/verda/README.md
 
     def __init__(self, api=None, env=None):
         self.api = api or Api(env=env)

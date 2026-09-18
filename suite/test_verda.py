@@ -556,7 +556,8 @@ def test_unit_verda_provider_shape_host_env_and_lazy_construction(monkeypatch, t
     mod = _verda(podctl)
     prov = mod.VerdaProvider(api=mod.Api("http://127.0.0.1:1", token="t"))
     assert prov.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\n"
-    assert prov.experimental is True and prov.name == "verda" and prov.ssh_user == "root" and prov.ssh_alias == "verda"
+    # experimental came off in 2.5.3: the host ran end to end on a live account, so the driver no longer warns
+    assert prov.experimental is False and prov.name == "verda" and prov.ssh_user == "root" and prov.ssh_alias == "verda"
     assert prov.volume_root == "/workspace" and str(prov.key_path).endswith("/.ssh/verda_comfyui")
     assert prov.record_volume({"kind": "volume", "id": OS_VOL}) is None      # a volume is not a machine
     assert isinstance(prov, podctl.Provider)
@@ -593,7 +594,10 @@ def test_unit_verda_startup_script_parses_is_ascii_and_installs_the_unit_and_the
         assert needle in s, needle
     assert not re.search(r"^\s*set -e", s, re.M)                                 # a partial boot still reaches READY
     readme = README.read_text(encoding="utf-8")
-    assert "EXPERIMENTAL" in readme and "\u2014" not in readme and "\u2013" not in readme
+    # the README must now say it is PROVEN and answer the three questions the first live run was to settle
+    assert "PROVEN on a live account" in readme and "EXPERIMENTAL" not in readme
+    assert "The ssh user is `root`" in readme and "startup script does re-run" in readme and "`ip` populates" in readme
+    assert "\u2014" not in readme and "\u2013" not in readme
 
 
 # ---------------------------------------------------------------- 2.4.0: the shared library
