@@ -76,6 +76,92 @@ _base_yaml_register(){ # <section> <key> <path> — register a folder in extra_m
   else printf '%s:\n    %s: %s\n' "$section" "$key" "$path" > "$y"; BASE_CHANGED+=("created extra_model_paths.yaml ($section.$key)"); ok "created $y"; fi
 }
 
+_base_yaml_library(){ # 2.4.0: the shared library as ComfyUI's FIRST extra base_path: the fallback when models/ cannot be a link
+  local y="${EXTRA_YAML:-$COMFY/extra_model_paths.yaml}" lib="$BASE_LIBRARY/models" cat_keys tmp
+  if [ -f "$y" ] && grep -q '^comfy-library:' "$y"; then
+    if grep -qF "base_path: $lib" "$y"; then ok "extra_model_paths.yaml: comfy-library -> $lib"; return 0; fi
+    warn "extra_model_paths.yaml has a comfy-library section pointing elsewhere, left alone"; return 0
+  fi
+  if [ "$BASE_DRY" = "1" ]; then would "register the shared library $lib as the first base_path in $y"; return 0; fi
+  # FIRST in the file, because base_discover reads the first base_path it finds. is_default sends ComfyUI's own
+  # downloads here too. The freeform categories (LLM, RMBG, SEEDVR2, sams, grounding-dino, depthanything,
+  # insightface) are listed as well: packs that ask folder_paths for them find the shared copy.
+  tmp="$(mktemp)"
+  {
+    printf 'comfy-library:\n    base_path: %s\n    is_default: true\n' "$lib"
+    for cat_keys in checkpoints diffusion_models text_encoders clip clip_vision vae loras controlnet embeddings \
+                    upscale_models latent_upscale_models sams depthanything grounding-dino insightface \
+                    LLM RMBG SEEDVR2 style_models diffusers vae_approx; do
+      printf '    %s: %s\n' "$cat_keys" "$cat_keys"
+    done
+    if [ -f "$y" ]; then printf '\n'; cat "$y"; fi
+  } > "$tmp"
+  mv "$tmp" "$y"
+  BASE_CHANGED+=("extra_model_paths.yaml: + comfy-library -> $lib")
+  ok "extra_model_paths.yaml: comfy-library -> $lib (first base_path)"
+}
+
+_base_yaml_library_drop(){ # the link and a search path to the SAME place would list every model twice
+  # Reachable on the migration this very function tells people to run: a first run finds real models in
+  # ComfyUI's tree, refuses to link and registers the library as a search path; the operator moves the models and
+  # runs again; the second run links. Without this, both are now true and every dropdown is doubled.
+  local y="${EXTRA_YAML:-$COMFY/extra_model_paths.yaml}"
+  [ -f "$y" ] || return 0
+  grep -q '^comfy-library:' "$y" || return 0
+  if [ "$BASE_DRY" = "1" ]; then would "remove the now-redundant comfy-library section from $y"; return 0; fi
+  awk '/^comfy-library:/{skip=1; next} skip && /^[^[:space:]]/{skip=0} !skip{print}' "$y" | _base_replace_file "$y"
+  grep -q '[^[:space:]]' "$y" || rm -f "$y"        # a file holding nothing but blank lines is noise
+  BASE_CHANGED+=("extra_model_paths.yaml: - comfy-library (models/ IS the library now)")
+  ok "extra_model_paths.yaml: comfy-library removed, models/ IS the library"
+}
+
+_base_library_link(){ # 2.4.0: make ComfyUI's own models/ BE the shared library
+  # Why a link and not extra_model_paths alone: several packs this base installs never ask folder_paths where
+  # their weights are: they join folder_paths.models_dir with their own folder name (RMBG, SeedVR2,
+  # DepthAnythingV2, insightface's FaceAnalysis root). An extra search path is invisible to those, and they would
+  # re-download 21 GB onto each machine's own disk. A link moves models_dir itself, so every consumer agrees.
+  [ -n "$BASE_LIBRARY" ] || return 0
+  local local_models="$COMFY/models" lib="$BASE_LIBRARY/models" n
+  mkdir -p "$lib" 2>/dev/null || true
+  if [ -L "$local_models" ]; then
+    if [ "$(readlink "$local_models")" = "$lib" ]; then ok "models/ is the shared library ($lib)"; _base_yaml_library_drop; return 0; fi
+    warn "$local_models is a symlink to $(readlink "$local_models"), not the library, left alone"
+    _base_yaml_library; return 0
+  fi
+  if [ -d "$local_models" ]; then
+    # "holds files" is NOT "holds models": ComfyUI's own tree ships a placeholder in every category folder
+    # (put_checkpoints_here and friends), so a freshly materialised models/ is never empty. Counting those as
+    # content made the refusal below fire on exactly the fresh machine this is for, which would have sent every
+    # machine back to its own copy of the library, silently and looking like it worked.
+    n="$(find "$local_models" -mindepth 1 -type f ! -name 'put_*_here' ! -name '.gitkeep' ! -name '.DS_Store' 2>/dev/null | head -1)"
+    if [ -n "$n" ]; then
+      # never move a machine's models without being asked: say exactly what to run, and register the library as a
+      # search path meanwhile so the standard categories at least resolve
+      warn "$local_models still holds files of its own (e.g. $(basename "$n")), so it was not replaced by a link to the shared library."
+      warn "  move them once, then re-run this script:  rsync -a --remove-source-files '$local_models/' '$lib/'"
+      _base_yaml_library
+      return 0
+    fi
+    if [ "$BASE_DRY" = "1" ]; then would "replace $local_models (placeholders only) with a symlink to $lib"; return 0; fi
+    # delete the placeholders BY NAME and then the empty directories bottom up. Never `rm -rf` a path built from a
+    # variable: the two finds can only remove what was just proven to be placeholders and empty folders.
+    find "$local_models" -type f \( -name 'put_*_here' -o -name '.gitkeep' -o -name '.DS_Store' \) -delete 2>/dev/null
+    find "$local_models" -depth -type d -empty -delete 2>/dev/null
+    if [ -e "$local_models" ]; then
+      warn "could not clear $local_models (something is still in it) - the shared library is a search path instead"
+      _base_yaml_library; return 0
+    fi
+  fi
+  if [ "$BASE_DRY" = "1" ]; then would "link $local_models -> $lib"; return 0; fi
+  if ln -s "$lib" "$local_models" 2>/dev/null; then
+    BASE_CHANGED+=("models/ -> $lib (shared library)"); ok "models/ -> $lib (shared library)"
+    _base_yaml_library_drop
+  else
+    warn "could not link $local_models -> $lib"; _base_yaml_library
+  fi
+  return 0
+}
+
 base_hygiene(){
   hdr "HYGIENE · comfyui_args.txt · ComfyUI-Manager"
   local before=${#BASE_CHANGED[@]} row name val
@@ -85,6 +171,15 @@ base_hygiene(){
   _base_args_ensure --preview-method auto
   _base_args_ensure --preview-size "${BASE_PREVIEW_SIZE:-1024}"
   _base_args_ensure --disable-api-nodes
+  # 2.4.0: with a shared library, ComfyUI's output/ and input/ live on it too, so a still one machine renders is
+  # there for the machine that animates it. user/ and temp/ stay local on purpose: user/ holds the saved
+  # workflows App Mode opens and each machine has only its own package, and temp/ is churn nobody shares.
+  if [ -n "$BASE_LIBRARY" ]; then
+    _base_args_ensure --output-directory "$BASE_LIBRARY/output"
+    _base_args_ensure --input-directory "$BASE_LIBRARY/input"
+    if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LIBRARY/output" "$BASE_LIBRARY/input" 2>/dev/null || true; fi
+  fi
+  _base_library_link
   for row in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do
     name="${row%% *}"; val=""; [ "$row" != "$name" ] && val="${row#* }"
     _base_args_ensure "$name" $val

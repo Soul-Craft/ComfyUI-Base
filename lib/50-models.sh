@@ -266,9 +266,14 @@ _base_volume_quota_gb(){ # the volume size podctl recorded (state/volume.env), o
   [ -f "$f" ] && sed -n "s/^VOLUME_GB='\{0,1\}\([0-9]*\)'\{0,1\}$/\1/p" "$f" | head -1
   return 0
 }
-_base_volume_used_kb(){ # what the volume holds, in kB (the suite sets BASE_FAKE_USED_KB)
+_base_volume_used_kb(){ # what the filesystem the disk gate judges holds, in kB (the suite sets BASE_FAKE_USED_KB)
+  # 2.4.0: the gate judges the LIBRARY ($M), and with a shared library that is NOT $BASE_VOLUME. `du -x` never
+  # crosses a mount point, so measuring /workspace would weigh a few GB of venv against a 500 GB library quota
+  # and call a full library nearly empty, which is the one direction a disk gate must never be wrong in.
   if [ -n "${BASE_FAKE_USED_KB:-}" ]; then echo "$BASE_FAKE_USED_KB"; return 0; fi
-  du -skx "${VOL:-$BASE_VOLUME}" 2>/dev/null | cut -f1 | grep -E '^[0-9]+$' || echo 0
+  local where="${VOL:-$BASE_VOLUME}"
+  if [ -n "${BASE_LIBRARY:-}" ] && [ -d "$BASE_LIBRARY" ]; then where="$BASE_LIBRARY"; fi
+  du -skx "$where" 2>/dev/null | cut -f1 | grep -E '^[0-9]+$' || echo 0
 }
 _base_disk_gate(){ # <needed bytes> → 0 proceed, 1 stop. Honest about a pooled filesystem it cannot measure.
   local need="$1" free_b need_b
@@ -329,7 +334,7 @@ base_models(){
       elif [ "$url" = "LOCAL" ]; then
         # a LOCAL snapshot never downloads: a folder of that name holding a config.json, anywhere on the pod, is moved into place
         while IFS= read -r sdir_c; do
-          if [ -n "$sdir_c" ] && [ "$sdir_c" != "$dest" ] && [ -f "$sdir_c/config.json" ]; then case "$sdir_c" in "$STAGING"/*) ;; *) sdir="$sdir_c"; break;; esac; fi
+          if [ -n "$sdir_c" ] && [ "$sdir_c" != "$dest" ] && [ -f "$sdir_c/config.json" ]; then case "$sdir_c" in "$STAGING_ROOT"/*) ;; *) sdir="$sdir_c"; break;; esac; fi
         done < <(_base_find_dirs "$base")
         if [ -n "$sdir" ]; then
           if [ "$BASE_DRY" = "1" ]; then would "move the snapshot folder $sdir → $rel"; MODEL_MOVED+=("$rel (would move from $sdir)")
@@ -357,7 +362,7 @@ base_models(){
     # shellcheck disable=SC2086
     while IFS=$'\t' read -r size path; do
       if [ -z "$path" ] || [ ! -f "$path" ] || [ "$path" = "$dest" ]; then continue; fi
-      case "$path" in "$STAGING"/*|*.partial) continue;; esac
+      case "$path" in "$STAGING_ROOT"/*|*.partial) continue;; esac
       if _base_size_ok "$size" "$bytes"; then
         if [ -z "$cand" ] || { [ "$cand_dev" != "$mdev" ] && [ "$(_base_fdev "$path")" = "$mdev" ]; }; then cand="$path"; cand_dev="$(_base_fdev "$path")"; fi
       else note "$base: same name, different size, left alone: $path ($(_base_bytes_to_gb "$size") GB)"; fi
@@ -406,6 +411,7 @@ base_models(){
         else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
       done
       rmdir "$STAGING" 2>/dev/null || true
+      [ "$STAGING" = "$STAGING_ROOT" ] || rmdir "$STAGING_ROOT" 2>/dev/null || true
       # a *.partial this run renamed is dropped once its complete copy is verified in place
       local keep=() kept_bytes=0 f
       for f in ${DEL_FILES[@]+"${DEL_FILES[@]}"}; do

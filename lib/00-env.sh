@@ -29,6 +29,12 @@
 # BASE_VOLUME_KIND       2.2.0: mount (the default: the root must be a mountpoint on a pod) | dir (an owned box)
 # BASE_LISTEN            2.2.0: the address ComfyUI and JupyterLab bind. 0.0.0.0 on RunPod (its HTTP proxy needs it),
 #                        127.0.0.1 everywhere else (Verda has no cloud firewall; the driver's tunnel is the way in)
+# BASE_LIBRARY           2.4.0: the SHARED library's mount point, or empty. One store several machines mount at once
+#                        (on Verda an NVMe_Shared volume over NFS, mounted by hosts/verda/startup.sh): the model
+#                        library is <it>/models, and ComfyUI's output/ and input/ are <it>/output and <it>/input, so a
+#                        LoRA one machine trains and a still one machine renders are visible to every other machine
+#                        with no copy. Explicit, else the driver's state/host.env. Unlike BASE_VOLUME it is optional:
+#                        with none, every machine keeps its own library on its own volume, as before 2.4.0.
 # BASE_NO_SUITE=1        2.1.0: the package's suite does not run at the end of the install (a baked image's first boot:
 #                        the suite ran when the image was built; a customer's first boot is not the place for pytest)
 # BASE_SEED=1            2.1.0: a baked image's seed build (a brand's image generator): toolchain and packs only; base_run
@@ -41,6 +47,7 @@ BASE_FAKE_ROOT="${BASE_FAKE_ROOT:-}"
 BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk — a code tree the base must never adopt or scan
 BASE_FAKE_PID1_ENV="${BASE_FAKE_PID1_ENV:-}"       # fake: the file that stands in for /proc/1/environ
 BASE_FAKE_NO_VOLUME="${BASE_FAKE_NO_VOLUME:-0}"    # fake: /workspace is not a mounted network volume
+BASE_LIBRARY="${BASE_LIBRARY:-}"                   # 2.4.0: the shared library's mount point (empty: no shared library)
 BASE_NO_NET="${BASE_NO_NET:-0}"
 BASE_YES="${BASE_YES:-0}"
 BASE_RESTART="${BASE_RESTART:-0}"
@@ -218,7 +225,21 @@ _base_host_resolve(){ # BASE_HOST from the evidence at hand, then the two settin
   case "$BASE_HOST" in runpod|verda|crusoe|local|vm) ;; *) echo "  !! BASE_HOST='$BASE_HOST' is not one of runpod, verda, crusoe, local, vm" >&2; BASE_HOST=vm;; esac
   if [ -z "$BASE_VOLUME_KIND" ]; then if [ "$BASE_HOST" = local ]; then BASE_VOLUME_KIND=dir; else BASE_VOLUME_KIND=mount; fi; fi
   if [ -z "$BASE_LISTEN" ]; then if [ "$BASE_HOST" = runpod ]; then BASE_LISTEN=0.0.0.0; else BASE_LISTEN=127.0.0.1; fi; fi
-  export BASE_HOST BASE_VOLUME BASE_VOLUME_KIND BASE_LISTEN
+  # 2.4.0: the shared library, from the same host.env the driver wrote. Read whatever BASE_HOST turned out to be:
+  # a machine can be told its host explicitly and still have a library recorded.
+  if [ -z "$BASE_LIBRARY" ]; then
+    local lf="$BASE_VOLUME/comfy-base/state/host.env"
+    [ -n "$BASE_FAKE_ROOT" ] && lf="$BASE_FAKE_ROOT/comfy-base/state/host.env"
+    [ -f "$lf" ] && BASE_LIBRARY="$(sed -n 's/^BASE_LIBRARY=//p' "$lf" | head -1)"
+  fi
+  BASE_LIBRARY="${BASE_LIBRARY%/}"
+  # a recorded library that is not there is a broken machine, not a silent fallback: say so, then carry on
+  # without it, so the run fails on the models it cannot find rather than on a path nobody mentioned.
+  if [ -n "$BASE_LIBRARY" ] && [ ! -d "$BASE_LIBRARY" ]; then
+    echo "  !! BASE_LIBRARY=$BASE_LIBRARY is recorded but is not a directory on this machine, continuing WITHOUT the shared library" >&2
+    BASE_LIBRARY=""
+  fi
+  export BASE_HOST BASE_VOLUME BASE_VOLUME_KIND BASE_LISTEN BASE_LIBRARY
 }
 
 # ---------------------------------------------------------------- environment for uv / pip / the Hub

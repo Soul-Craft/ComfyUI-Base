@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import sys
 import time
 import urllib.error
@@ -38,6 +39,8 @@ VOLUME_ROOT = "/workspace"                         # where startup.sh mounts the
 DEFAULT_API_URL = "https://api.verda.com/v1"
 KEY_PATH = pathlib.Path.home() / ".ssh" / "verda_comfyui"
 CREDENTIALS_PATH = pathlib.Path.home() / ".verda" / "credentials"
+LIBRARY_MOUNT = "/mnt/comfy-library"               # where startup.sh mounts the SHARED library; the base's BASE_LIBRARY
+LIBRARY_SRC_ENV = "VERDA_LIBRARY"                  # the library's NFS endpoint, e.g. nfs.fin-02.verda.com:/pseudo
 STARTUP_SCRIPT_NAME = "comfy-base-startup"         # the name the script is registered under (GET /scripts)
 STARTUP_SCRIPT_FILE = HERE / "startup.sh"
 REMOTE_STARTUP = "/root/comfy-base-startup.sh"     # where `ensure` puts the script on the running machine
@@ -45,8 +48,13 @@ SSH_PORT = 22
 KEY_NAME = "comfyui-mac"                           # the name the Mac key is registered under (POST /sshkeys)
 
 # Verda's `status` vocabulary (api.verda.com/v1/docs) and the driver's four words.
-STATUS = {"running": "running", "offline": "stopped", "notfound": "gone", "deleting": "gone"}
-TRANSITIONAL = ("provisioning", "discontinued", "unknown", "ordered", "new", "error", "validating", "no_capacity", "installation_failed")
+STATUS = {"running": "running", "offline": "stopped", "notfound": "gone", "deleting": "gone", "discontinued": "gone"}
+# "discontinued" reads as GONE, not transitional. Verda answers it for an instance that has been DELETED (the
+# record survives the delete, with volume_ids []) and also for one killed by a zero balance; either way the
+# machine is not coming back and `start` must refuse it rather than silently pass it through as "on its way".
+# Deletion itself is confirmed from the instance LIST, not from this word, because the two cases share it.
+TRANSITIONAL = ("provisioning", "unknown", "ordered", "new", "error", "validating", "no_capacity", "installation_failed")
+STATUS_DELETED = "discontinued"
 
 
 def _c():
@@ -201,6 +209,47 @@ def is_volume(rec):
     return (rec or {}).get("kind") == "volume"
 
 
+def is_shared_volume(v):
+    """A Verda SHARED FILESYSTEM is not a separate object: it is a volume whose type is one of the shared ones
+    (GET /volume-types marks them is_shared_fs: NVMe_Shared, HDD_Shared, NVMe_Shared_Cluster). The difference
+    that matters here is that it attaches to SEVERAL instances at once (POST /volumes takes instance_ids, and
+    PUT /volumes action attach takes instance_ids), while a plain block volume attaches to exactly one. That is
+    what lets one model library serve every machine instead of a copy per machine."""
+    if (v or {}).get("is_shared_fs") is True:
+        return True
+    return "shared" in ((v or {}).get("type") or "").lower()
+
+
+def volume_instance_ids(v):
+    """Every instance id a volume record names. A plain volume answers one (instance_id); a shared one answers
+    several, and the API spells them in more than one place depending on the call."""
+    out = []
+    one = (v or {}).get("instance_id")
+    if one:
+        out.append(str(one))
+    for i in ((v or {}).get("instance_ids") or []):
+        out.append(str(i))
+    for inst in ((v or {}).get("instances") or []):
+        if isinstance(inst, dict) and inst.get("id"):
+            out.append(str(inst["id"]))
+        elif isinstance(inst, str):
+            out.append(inst)
+    return out
+
+
+def library_src_from(v):
+    """The NFS endpoint a shared volume is mounted from. MEASURED on a live account (2026-09-17): it arrives as
+    `target`, e.g. `nfs.fin-03.datacrunch.io:/comfy-library-<id>`, beside `pseudo_path` and ready-made
+    `mount_command` / `filesystem_to_fstab_command` strings. `target` is overloaded, on a plain BLOCK volume it
+    is the device name, "vda", so the host:/export shape is what decides, never the key alone. That makes this
+    safe to read for any volume, and it is why --library is an override rather than the only route."""
+    for k in ("target", "nfs_endpoint", "nfs_path", "export_path", "share_path", "endpoint"):
+        val = (v or {}).get(k)
+        if isinstance(val, str) and re.match(r"^[^\s:]+:/\S*$", val):
+            return val
+    return ""
+
+
 def new_id(resp):
     """POST /instances answers the new id as a JSON string or as {"id": ...}; accept both."""
     if isinstance(resp, str):
@@ -256,12 +305,15 @@ def startup_script_text():
 REMOTE_EOF = "COMFY_BASE_STARTUP_EOF"
 
 
-def remote_ensure_cmd(text):
-    """One ssh command: land startup.sh on the machine through a quoted heredoc and run its --ensure pass."""
+def remote_ensure_cmd(text, library=""):
+    """One ssh command: land startup.sh on the machine through a quoted heredoc and run its --ensure pass.
+    With a library, the endpoint is passed so the script writes the fstab line and mounts it; without one the
+    script recalls whatever endpoint it recorded last time, so a plain `ensure` never drops a machine's library."""
     if REMOTE_EOF in text:
         raise PodctlError("startup.sh contains the heredoc delimiter %s" % REMOTE_EOF)
-    return "cat > %s <<'%s'\n%s\n%s\nchmod 700 %s && bash %s --ensure" % (REMOTE_STARTUP, REMOTE_EOF, text.rstrip("\n"), REMOTE_EOF,
-                                                                       REMOTE_STARTUP, REMOTE_STARTUP)
+    tail = " --ensure" + ((" --library " + shlex.quote(library)) if library else "")
+    return "cat > %s <<'%s'\n%s\n%s\nchmod 700 %s && bash %s%s" % (REMOTE_STARTUP, REMOTE_EOF, text.rstrip("\n"), REMOTE_EOF,
+                                                                  REMOTE_STARTUP, REMOTE_STARTUP, tail)
 
 
 # ---------------------------------------------------------------- the provider
@@ -280,6 +332,9 @@ class VerdaProvider(Provider):
         self.api = api or Api(env=env)
         self.env = os.environ if env is None else env
         self.sleep = time.sleep
+        self.library_mount = LIBRARY_MOUNT
+        self._library_src = ""      # set by ensure(): the endpoint the machine was told to mount
+        self._library_on = False    # whether the machine ensure() last addressed has a shared library
 
     # -- small plumbing
     def banner(self, host, port=SSH_PORT):
@@ -319,6 +374,17 @@ class VerdaProvider(Provider):
 
     def _detached(self, vols=None):
         return [v for v in (vols if vols is not None else self._volumes()) if (v.get("status") or "").lower() == "detached"]
+
+    def _shared_volumes(self, vols=None):
+        return [v for v in (vols if vols is not None else self._volumes()) if is_shared_volume(v)]
+
+    def _library_for(self, pod_id, vols=None):
+        """The shared volume this instance is attached to, or None. This is the whole of the driver's knowledge of
+        the library: nothing is remembered on the Mac, so a machine's library is always read back from the account."""
+        for v in self._shared_volumes(vols):
+            if str(pod_id) in volume_instance_ids(v):
+                return v
+        return None
 
     def _volume_record(self, v):
         rec = dict(v)
@@ -396,6 +462,11 @@ class VerdaProvider(Provider):
     def pods(self):
         out = [i for i in (self.api.get("/instances") or []) if isinstance(i, dict)]
         out += [self._volume_record(v) for v in self._detached()]
+        # the shared library is listed whatever its status. MEASURED: a fresh one is `created`, an ATTACHED one is
+        # `exported` (not "attached"), and only a detached one says `detached`, so _detached() never shows it, and
+        # a store three machines depend on would be invisible in `podctl pods` exactly when it is in use.
+        seen = {str(p.get("id")) for p in out}
+        out += [self._volume_record(v) for v in self._shared_volumes() if str(v.get("id")) not in seen]
         return out
 
     def pod(self, ident):
@@ -425,13 +496,15 @@ class VerdaProvider(Provider):
 
     def status_text(self, pod):
         if is_volume(pod):
-            kind = "OS volume" if pod.get("is_os_volume") else "data volume"
+            kind = "shared library (attaches to several machines at once)" if is_shared_volume(pod) else ("OS volume" if pod.get("is_os_volume") else "data volume")
             lines = ["volume     %s (%s)" % (pod.get("id"), pod.get("name") or ""),
                      "kind       %s, %s" % (kind, pod.get("status")),
                      "size       %s GB %s" % (pod.get("size", "?"), pod.get("type") or ""),
                      "location   %s" % (pod.get("location") or "?")]
             if pod.get("is_os_volume"):
                 lines.append("next       podctl start %s (redeploys from this OS volume; the data volumes sharing its name come along)" % pod.get("id"))
+            elif is_shared_volume(pod):
+                lines.append("next       attached to every machine started in %s, by type and location, not by name" % (pod.get("location") or "?"))
             else:
                 lines.append("next       attached automatically when its OS volume is started (name prefix), or by the console")
             return "\n".join(lines)
@@ -458,7 +531,7 @@ class VerdaProvider(Provider):
         for p in self.pods():
             if is_volume(p):
                 out.append("%-36s %-18s %-22s %-12s %-15s %s" % (p.get("id"), (p.get("name") or "")[:18],
-                                                                  "%s volume, %s GB" % ("OS" if p.get("is_os_volume") else "data", p.get("size", "?")),
+                                                                  "%s volume, %s GB" % ("shared" if is_shared_volume(p) else ("OS" if p.get("is_os_volume") else "data"), p.get("size", "?")),
                                                                   "detached", "-", p.get("location") or ""))
             else:
                 out.append("%-36s %-18s %-22s %-12s %-15s %s" % (p.get("id"), (p.get("hostname") or "")[:18], (p.get("instance_type") or "")[:22],
@@ -475,13 +548,30 @@ class VerdaProvider(Provider):
             if vol is not None:
                 return "%s is a %s volume, already detached: nothing to stop" % (pod_id, "OS" if vol.get("is_os_volume") else "data")
             raise PodctlError("%s: no such Verda instance" % pod_id)
+        if (inst.get("status") or "").lower() == STATUS_DELETED:
+            # the record outlives the delete; deleting it again would be a second charge-free no-op, but saying so is honest
+            return ("%s is already %s: the instance is gone and its volumes were kept. `podctl pods` lists them; "
+                    "`podctl start <os volume>` brings a machine back" % (pod_id, STATUS_DELETED))
         os_vol = inst.get("os_volume_id") or "?"
         data = [str(v) for v in (inst.get("volume_ids") or [])]
         self.api.put("/instances", {"id": pod_id, "action": "delete", "volume_ids": []})
         if wait:
             def gone():
+                # MEASURED on a live account (2026-09-17): a DELETED Verda instance is not 404 and does not say
+                # notfound. GET /instances/{id} keeps answering the full record indefinitely, with
+                # status "discontinued" and volume_ids [], so a probe that waits for None, "deleting" or
+                # "notfound" can never come true and `stop --wait` gave up after 300 s on a delete that had in
+                # fact completed a minute earlier. Status cannot decide this anyway: Verda uses the same word
+                # "discontinued" for an instance killed by a zero balance. Absence from the LIST is the
+                # authoritative signal, so that is what is polled; the per-id checks stay as a fast path.
                 cur = self._instance(pod_id)
-                return cur is None or (cur.get("status") or "").lower() in ("deleting", "notfound")
+                if cur is None or (cur.get("status") or "").lower() in ("deleting", "notfound"):
+                    return True
+                try:
+                    listed = self.api.get("/instances") or []
+                except HttpError:
+                    return False
+                return not any(str((i or {}).get("id")) == str(pod_id) for i in listed if isinstance(i, dict))
             self._wait(gone, "%s to be deleted" % pod_id, tries=60, every=5)
         return ("stopped %s: instance deleted, volumes kept: OS volume %s%s. `podctl start %s` redeploys from the OS volume; "
                 "the ip will be new" % (pod_id, os_vol, (", data volumes " + ", ".join(data)) if data else " (no data volumes)", os_vol))
@@ -517,8 +607,14 @@ class VerdaProvider(Provider):
                 raise PodctlError("which instance type? export VERDA_INSTANCE_TYPE=<type> (GET /instance-types names them; hosts/verda/README.md)")
             for dv in self._detached():
                 if dv.get("id") != vol.get("id") and not dv.get("is_os_volume") and (dv.get("location") or "") == location \
-                        and stems_match(dv.get("name"), vol.get("name")):
+                        and stems_match(dv.get("name"), vol.get("name")) and not is_shared_volume(dv):
                     attached.append(str(dv["id"]))
+            # the SHARED library comes along by TYPE and location, never by name: one library serves machines whose
+            # names differ (comfy-base, comfy-cc, comfy-mm), so the stem rule that finds a machine's own data volume
+            # cannot find it, and must not: a stem match would tie the library to one machine's name.
+            for sv in self._shared_volumes():
+                if (sv.get("location") or "") == location and str(sv.get("id")) not in attached:
+                    attached.append(str(sv["id"]))
             body = {"hostname": hostname_for(volume_stem(vol.get("name")) or vol.get("name")), "image": str(vol["id"]), "instance_type": itype,
                     "location_code": location, "ssh_key_ids": self.key_ids(register=True), "existing_volumes": attached,
                     "description": "ComfyUI Base, redeployed from OS volume %s by podctl" % vol["id"]}
@@ -557,7 +653,7 @@ class VerdaProvider(Provider):
         inst, host = self._up_and_configured(pod_id, ssh_config)
         return "restarted %s: ssh answers on %s:%d (Host %s updated)" % (pod_id, host, SSH_PORT, _c().SSH_ALIAS)
 
-    def ensure(self, pod_id, pubkey, ssh_config, log=print, **kw):
+    def ensure(self, pod_id, pubkey, ssh_config, log=print, library=None, **kw):
         """Make the machine reachable and hand its boot to the base. Idempotent:
         (1) the Mac key is registered; (2) hosts/verda/startup.sh is registered as comfy-base-startup so the console's
         next fresh deploy can pick it; (3) running + ip + banner; (4) the Host block; (5) startup.sh --ensure over ssh,
@@ -579,7 +675,24 @@ class VerdaProvider(Provider):
         if not inst.get("ssh_key_ids") or not any(str(k) in ids for k in inst.get("ssh_key_ids") or []):
             log("ensure: note: the instance was deployed without the Mac key (ssh_key_ids %s); if `ssh %s` is refused, add the key in the console"
                 % (inst.get("ssh_key_ids"), _c().SSH_ALIAS))
-        r = _c().ssh_run(remote_ensure_cmd(startup_script_text()), timeout=900)
+        # the shared library: which one this machine is attached to is read back from the account, never remembered
+        # on the Mac, so a machine's library is whatever Verda says it is. The NFS endpoint is the one thing the API
+        # may not carry yet (hosts/verda/README.md), hence --library / VERDA_LIBRARY.
+        lib_vol = self._library_for(pod_id)
+        src = (library or "").strip() or (self.env.get(LIBRARY_SRC_ENV) or "").strip() or (library_src_from(lib_vol) if lib_vol else "")
+        self._library_on = lib_vol is not None and bool(src)
+        self._library_src = src
+        if lib_vol is not None:
+            log("ensure: shared library %s (%s, %s GB) is attached to this machine" % (lib_vol.get("name") or "", lib_vol.get("id"), lib_vol.get("size")))
+            if not src:
+                log("ensure: WARNING its NFS endpoint is not in the API record, so it was NOT mounted. Pass --library "
+                    "host:/export (the console's mount command names it) or set %s, then run ensure again." % LIBRARY_SRC_ENV)
+        elif src:
+            log("ensure: library %s was given but no shared volume is attached to %s, attach it in the console (or "
+                "PUT /volumes action attach with instance_ids) first" % (src, pod_id))
+            src = ""
+            self._library_on = False
+        r = _c().ssh_run(remote_ensure_cmd(startup_script_text(), library=src), timeout=900)
         if r.returncode != 0:
             raise PodctlError("startup.sh --ensure failed on %s (rc %s): %s" % (pod_id, r.returncode, ((r.stderr or "") + (r.stdout or "")).strip()[-400:]))
         out_lines = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()      # startup.sh logs on stderr
@@ -597,10 +710,14 @@ class VerdaProvider(Provider):
             raise PodctlError("%s: no such Verda instance (a stopped machine is an OS volume: podctl start <volume id> instead)" % like)
         st = (src.get("status") or "").lower()
         if st != "offline":
-            raise PodctlError("%s is %s: a Verda volume attaches to ONE instance at a time, so the source must be shut down (offline) before "
-                              "its data volumes can move to the clone. Shut it down in the console (or `PUT /instances action shutdown`) "
-                              "and deploy again; podctl stop would delete it instead" % (like, st))
-        data = [str(v) for v in (src.get("volume_ids") or [])]
+            raise PodctlError("%s is %s: a Verda BLOCK volume attaches to one instance at a time, so the source must be shut down (offline) "
+                              "before its data volumes can move to the clone. (A SHARED volume is different: it attaches to several at once "
+                              "and is carried to the clone without being detached.) Shut it down in the console (or `PUT /instances action "
+                              "shutdown`) and deploy again; podctl stop would delete it instead" % (like, st))
+        data, shared = [], []
+        for vid in (src.get("volume_ids") or []):
+            rec = self._volume(str(vid))
+            (shared if (rec is not None and is_shared_volume(rec)) else data).append(str(vid))
         for vid in data:
             self.api.put("/volumes", {"id": vid, "action": "detach", "instance_id": like})
         itype = gpu or src.get("instance_type")
@@ -609,7 +726,7 @@ class VerdaProvider(Provider):
         if not src.get("image"):
             raise PodctlError("%s: the API did not name the image; deploy from the console" % like)
         body = {"hostname": hostname_for(name or "%s-2" % (src.get("hostname") or "comfy-base")), "image": src["image"], "instance_type": itype,
-                "location_code": src.get("location") or "", "ssh_key_ids": self.key_ids(register=True), "existing_volumes": data,
+                "location_code": src.get("location") or "", "ssh_key_ids": self.key_ids(register=True), "existing_volumes": data + shared,
                 "description": "ComfyUI Base, cloned from %s by podctl" % like, "is_spot": bool(src.get("is_spot"))}
         sid = self.script_id(register=True)
         if sid:
@@ -623,7 +740,38 @@ class VerdaProvider(Provider):
         say("  ssh answers on %s:%d (Host %s -> %s)" % (host, SSH_PORT, _c().SSH_ALIAS, pod_id))
         return pod_id
 
+    def host_env(self):
+        """BASE_HOST and BASE_VOLUME, plus BASE_LIBRARY when the machine has a shared library.
+        This override is not optional: podctl's write_host_env() runs right after ensure() and overwrites the file
+        startup.sh just wrote, so a library recorded only by the script would be erased a second later."""
+        text = Provider.host_env(self)
+        if self._library_on:
+            text += "BASE_LIBRARY=%s\n" % self.library_mount
+        return text
+
     def record_volume(self, pod, env=None):
-        """Nothing: Verda's data volume is a real block device, so `df` on /workspace is honest and the base's disk gate
-        needs no recorded quota."""
-        return None
+        """With a SHARED library, record ITS size in state/volume.env; with only a block volume, record nothing.
+        Why: the base's disk gate measures free space on the library's filesystem, and _base_fs_is_pool treats any
+        `host:/path` device, every NFS mount, as a pool it cannot measure, so without a recorded quota the gate
+        prints 'free space is not verifiable here' and never fires. A plain Verda data volume needs no record: it
+        is a real block device and `df` on /workspace is honest."""
+        import datetime
+        if is_volume(pod):
+            return None
+        pod_id = str((pod or {}).get("id") or "")
+        if not pod_id:
+            return None
+        vol = self._library_for(pod_id)
+        if vol is None:
+            return None
+        size = vol.get("size")
+        if size is None:
+            return None
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        path = "%s/comfy-base/state" % self.volume_root
+        cmd = ("mkdir -p %s && printf 'VOLUME_GB=%%s\\nVOLUME_ID=%%s\\nRECORDED=%%s\\n' %s %s %s > %s/volume.env"
+               % (shlex.quote(path), shlex.quote(str(size)), shlex.quote(str(vol.get("id") or "")), shlex.quote(ts), shlex.quote(path)))
+        r = _c().ssh_run(cmd, env=env)
+        if r.returncode != 0:
+            raise PodctlError("could not record the library size on the machine: %s" % ((r.stderr or r.stdout) or "").strip()[-300:])
+        return "library %s GB (%s, shared) recorded in state/volume.env: the disk gate measures the library, not /workspace" % (size, vol.get("name") or vol.get("id"))

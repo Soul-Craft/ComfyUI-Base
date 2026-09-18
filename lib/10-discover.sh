@@ -136,11 +136,16 @@ base_discover(){ # base_discover [quiet] → 3 when the pod has no network volum
   fi
   COMFY_LOG="$BASE_STATE/logs/comfyui.log"
 
-  # the library: extra_model_paths.yaml's first base_path if it IS a library (holds category folders),
-  # else its models/ child, else $COMFY/models
+  # the library: the SHARED library when the machine has one (2.4.0), else extra_model_paths.yaml's first
+  # base_path if it IS a library (holds category folders), else its models/ child, else $COMFY/models.
+  # BASE_LIBRARY wins over the yaml on purpose: it is true before the yaml exists, on the very first install of
+  # a fresh machine, which is exactly when a download to the wrong place would cost a second copy of 125 GB.
   EXTRA_YAML="$COMFY/extra_model_paths.yaml"
   M="$COMFY/models"; M_SRC="default"
-  if [ -f "$EXTRA_YAML" ]; then
+  if [ -n "$BASE_LIBRARY" ] && [ -d "$BASE_LIBRARY" ]; then
+    M="$BASE_LIBRARY/models"; M_SRC="BASE_LIBRARY (shared)"
+    mkdir -p "$M" 2>/dev/null || true
+  elif [ -f "$EXTRA_YAML" ]; then
     local base
     base="$(grep -m1 -E '^[[:space:]]+base_path:' "$EXTRA_YAML" | sed -E 's/^[[:space:]]+base_path:[[:space:]]*//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' || true)"
     base="${base%/}"
@@ -150,7 +155,12 @@ base_discover(){ # base_discover [quiet] → 3 when the pod has no network volum
       elif [ -d "$base/models" ]; then M="$base/models"; M_SRC="extra_model_paths.yaml (base_path/models)"; fi
     fi
   fi
-  STAGING="$M/.comfy-base-staging"             # same filesystem as the library, never /tmp (container disk)
+  # staging sits on the library's own filesystem (never /tmp, which is container disk, and never a second device:
+  # a finished download is renamed into place, not copied). On a SHARED library several machines stage into the
+  # same tree, so each gets its own subdirectory and two concurrent installs can never write one another's
+  # half-file. BASE_PRUNE drops .comfy-base-staging by NAME, so every machine's subdirectory stays out of the index.
+  STAGING_ROOT="$M/.comfy-base-staging"
+  if [ -n "$BASE_LIBRARY" ]; then STAGING="$STAGING_ROOT/$(hostname -s 2>/dev/null || echo machine)"; else STAGING="$STAGING_ROOT"; fi
 
   # the venv: $COMFY/.venv* first (start.sh activates exactly that path), then the usual places
   VENV=""; local v first_exec=""

@@ -52,6 +52,11 @@ def test_unit_version_file_is_semver_and_base_prints_it():
     assert re.fullmatch(r"\d+\.\d+\.\d+", v)
     r = subprocess.run(["bash", str(BASE / "base.sh"), "version"], capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == v
+    # 2.4.0: the handbook SHIPS inside comfyui-base.zip, so a stale version line installs a guide describing a base
+    # the machine is not running. Nothing executes prose, so nothing caught it until a person read it; this does.
+    hb = (BASE / "comfyui-base-handbook.md").read_text()
+    assert "**Version %s.**" % v in hb, "the handbook does not open with **Version %s.** - it has drifted from VERSION" % v
+    assert "\n- %s:" % v in hb, "the handbook's Record section has no '- %s:' entry" % v
 
 
 def test_unit_sourcing_defines_the_contract_helpers():
@@ -2178,3 +2183,52 @@ def test_unit_every_shipped_workflow_models_array_equals_its_rows():
     if unstamped:
         pytest.skip("not stamped yet (run `base.sh stamp-models <dir>` in each package, with its bump): %s" % ", ".join(unstamped))
 
+
+
+def test_unit_the_shared_library_link_replaces_comfyui_placeholders_but_never_real_models(tmp_path):
+    """MEASURED: a freshly materialised ComfyUI tree is never empty. It ships a placeholder in every category
+    folder (put_checkpoints_here and friends), so counting "has files" as "has models" made the link refuse on
+    exactly the fresh machine it exists for, sending every machine back to its own copy of the library, silently
+    and looking like it had worked."""
+    lib = tmp_path / "library"
+    (lib / "models").mkdir(parents=True)
+
+    comfy = tmp_path / "ComfyUI"
+    for d in ("checkpoints", "loras", "vae"):
+        (comfy / "models" / d).mkdir(parents=True)
+        (comfy / "models" / d / ("put_%s_here" % d)).write_text("")
+    r = _bash(f'COMFY="{comfy}"; BASE_LIBRARY="{lib}"; EXTRA_YAML="{comfy}/extra_model_paths.yaml"; _base_library_link')
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (comfy / "models").is_symlink(), "placeholders are not content: it must link. said: " + r.stdout
+    assert os.readlink(str(comfy / "models")) == str(lib / "models")
+    # with models/ pointing AT the library, a search path to the same place would list every model twice
+    assert not (comfy / "extra_model_paths.yaml").exists(), r.stdout
+
+    # a real model IS content: never moved without being asked, and the library becomes a search path instead
+    comfy2 = tmp_path / "ComfyUI2"
+    (comfy2 / "models" / "loras").mkdir(parents=True)
+    (comfy2 / "models" / "loras" / "put_loras_here").write_text("")
+    (comfy2 / "models" / "loras" / "real.safetensors").write_text("x")
+    r2 = _bash(f'COMFY="{comfy2}"; BASE_LIBRARY="{lib}"; EXTRA_YAML="{comfy2}/extra_model_paths.yaml"; _base_library_link')
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert not (comfy2 / "models").is_symlink(), "a tree holding a real model must be left alone"
+    assert (comfy2 / "models" / "loras" / "real.safetensors").exists(), "it must never delete a model"
+    assert "real.safetensors" in r2.stdout, "it must name what stopped it: " + r2.stdout
+    y = (comfy2 / "extra_model_paths.yaml").read_text()
+    assert "comfy-library:" in y and str(lib / "models") in y
+
+    # the migration this function's own warning tells people to run: move the models, run again. The link is made
+    # AND the now-redundant search path is dropped, or every model would be listed twice in every dropdown.
+    (comfy2 / "models" / "loras" / "real.safetensors").unlink()
+    r2b = _bash(f'COMFY="{comfy2}"; BASE_LIBRARY="{lib}"; EXTRA_YAML="{comfy2}/extra_model_paths.yaml"; _base_library_link')
+    assert r2b.returncode == 0, r2b.stdout + r2b.stderr
+    assert (comfy2 / "models").is_symlink(), r2b.stdout
+    assert not (comfy2 / "extra_model_paths.yaml").exists(), (
+        "the search path must go when models/ becomes the library itself, or every model is listed twice: " + r2b.stdout)
+
+    # no library configured: nothing happens at all, on any host
+    comfy3 = tmp_path / "ComfyUI3"
+    (comfy3 / "models").mkdir(parents=True)
+    r3 = _bash(f'COMFY="{comfy3}"; BASE_LIBRARY=""; EXTRA_YAML="{comfy3}/extra_model_paths.yaml"; _base_library_link')
+    assert r3.returncode == 0 and not (comfy3 / "models").is_symlink()
+    assert not (comfy3 / "extra_model_paths.yaml").exists()

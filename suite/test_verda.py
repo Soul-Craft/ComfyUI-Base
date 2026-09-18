@@ -25,6 +25,8 @@ OS_VOL = "aaaaaaaa-0000-4000-8000-00000000000a"
 DATA_VOL = "bbbbbbbb-0000-4000-8000-00000000000b"
 OTHER_OS = "cccccccc-0000-4000-8000-00000000000c"
 OTHER_DATA = "dddddddd-0000-4000-8000-00000000000d"
+LIB_VOL = "eeeeeeee-0000-4000-8000-00000000000e"
+LIB_SRC = "nfs.fin-01.verda.com:/pseudo/comfy-library"
 ITYPE = "1RTXPRO6000.10V"
 IMAGE = "ubuntu-24.04-cuda-13.0-open-docker"
 
@@ -57,6 +59,20 @@ def _volume(vid, name, is_os, status="attached", instance_id=INST_ID, location="
             "is_os_volume": is_os, "location": location}
 
 
+def _shared(vid=LIB_VOL, name="comfy-library", instances=(INST_ID,), location="FIN-01", size=500, **over):
+    """A Verda SHARED filesystem: a volume of a shared type, attached to SEVERAL instances at once. The record
+    names them in `instances`, which is what GET /volumes returns for one (api.verda.com/v1/docs)."""
+    # MEASURED: an ATTACHED shared volume reads "exported", a fresh one "created", and `target` carries the
+    # NFS endpoint (on a plain block volume the same key carries the device name instead).
+    v = {"id": vid, "name": name, "size": size, "type": "NVMe_Shared", "is_shared_fs": True,
+         "status": ("exported" if instances else "created"),
+         "target": "nfs.fin-01.datacrunch.io:/%s-abc" % name, "pseudo_path": "/%s-abc" % name,
+         "instance_id": (instances[0] if instances else None), "instances": [{"id": i} for i in instances],
+         "is_os_volume": False, "location": location}
+    v.update(over)
+    return v
+
+
 class FakeVerda:
     """An in-memory Verda REST v1: /oauth2/token, /instances (GET, POST, PUT actions), /volumes (GET, POST, PUT
     attach|detach), /sshkeys, /scripts. Records every request as (method, path, body) plus its auth and UA headers.
@@ -71,6 +87,11 @@ class FakeVerda:
         self.headers = []
         self.token_requests = []
         self.provision_polls = provision_polls
+        # 2.4.0: a live account showed that DELETING an instance does not make GET /instances/{id} a 404, the
+        # record survives, status discontinued. `on_delete` lets a test model that, and `listed` lets the LIST
+        # differ from the per-id read, which is the only place the truth shows.
+        self.on_delete = None
+        self.listed = None          # None: every instance is listed
         self.polls = {}
         self.counter = 0
         self.token = token
@@ -109,7 +130,7 @@ class FakeVerda:
                     return
                 p = self.path
                 if p == "/instances":
-                    return self._send(200, list(srv.instances.values()))
+                    return self._send(200, [i for k, i in srv.instances.items() if srv.listed is None or k in srv.listed])
                 if p.startswith("/instances/"):
                     iid = p.split("/")[2]
                     inst = srv.instances.get(iid)
@@ -194,7 +215,10 @@ class FakeVerda:
                                     del srv.volumes[vid]
                                 else:
                                     vol["status"], vol["instance_id"] = "detached", None
-                        del srv.instances[inst["id"]]
+                        if srv.on_delete is not None:
+                            srv.on_delete(inst["id"])
+                        else:
+                            del srv.instances[inst["id"]]
                     else:
                         return self._send(400, {"code": "bad_action"})
                     return self._send(202, {})
@@ -322,7 +346,10 @@ def test_unit_verda_facts_normalise_the_status_vocabulary_and_address_waits_for_
     for raw, want in [("running", "running"), ("offline", "stopped"), ("notfound", "gone"), ("deleting", "gone"),
                       ("provisioning", "transitional"), ("ordered", "transitional"), ("new", "transitional"), ("validating", "transitional"),
                       ("no_capacity", "transitional"), ("installation_failed", "transitional"), ("error", "transitional"),
-                      ("discontinued", "transitional"), ("unknown", "transitional"), (None, "transitional")]:
+                      # a live account answers "discontinued" for a DELETED instance (the record outlives the
+                      # delete) and for a zero-balance kill. Either way it is gone, not on its way somewhere:
+                      # as "transitional" it made `start` pass a deleted machine straight through.
+                      ("discontinued", "gone"), ("unknown", "transitional"), (None, "transitional")]:
         assert prov.facts(_instance(status=raw))["status"] == want, raw
     f = prov.facts(_instance())
     assert (f["host"], f["port"], f["user"], f["image"], f["gpu"]) == ("127.0.0.1", 22, "root", IMAGE, "RTX PRO 6000")
@@ -466,7 +493,7 @@ def test_unit_verda_ensure_registers_the_key_and_the_script_once_writes_the_bloc
         assert len(calls) == 1
         cmd = calls[0]
         assert "cat > /root/comfy-base-startup.sh <<'COMFY_BASE_STARTUP_EOF'\n" in cmd and cmd.rstrip().endswith("bash /root/comfy-base-startup.sh --ensure")
-        assert "RequiresMountsFor=/workspace" in cmd and "BASE_HOST=verda" in cmd
+        assert "RequiresMountsFor=$req" in cmd and 'req="/workspace"' in cmd and "BASE_HOST=verda" in cmd
         assert any("READY disk=/dev/vdb" in l for l in logs)
         assert MAC_KEY.split()[1] not in " ".join(l for l in logs if "registering" in l)  # the key body is never logged
         assert "Host verda\n  HostName 127.0.0.1\n  Port 22\n  User root\n" in cfg.read_text(encoding="utf-8")
@@ -531,7 +558,7 @@ def test_unit_verda_provider_shape_host_env_and_lazy_construction(monkeypatch, t
     assert prov.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\n"
     assert prov.experimental is True and prov.name == "verda" and prov.ssh_user == "root" and prov.ssh_alias == "verda"
     assert prov.volume_root == "/workspace" and str(prov.key_path).endswith("/.ssh/verda_comfyui")
-    assert prov.record_volume(_instance()) is None and prov.record_volume(_instance(), env={}) is None
+    assert prov.record_volume({"kind": "volume", "id": OS_VOL}) is None      # a volume is not a machine
     assert isinstance(prov, podctl.Provider)
     # the driver picks the one Provider subclass in the module
     subclasses = [v for v in vars(mod).values() if isinstance(v, type) and issubclass(v, podctl.Provider) and v is not podctl.Provider]
@@ -557,10 +584,214 @@ def test_unit_verda_startup_script_parses_is_ascii_and_installs_the_unit_and_the
     r = subprocess.run(["bash", "-n", str(STARTUP)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     s = text.decode()
-    for needle in ("comfy-base-boot", "RequiresMountsFor=/workspace", "BASE_HOST=verda", "BASE_VOLUME=/workspace",
+    for needle in ("comfy-base-boot", "RequiresMountsFor=$req", 'req="/workspace"', "BASE_HOST=verda", "BASE_VOLUME=/workspace",
                    "nofail,x-systemd.device-timeout=30", "mkfs.ext4", "comfy-volume", "/var/log/comfy-base-startup.log",
-                   "/dev/vd[b-z]", "--ensure", "systemctl daemon-reload", "enable --now", "READY"):
+                   "/dev/vd[b-z]", "--ensure", "systemctl daemon-reload", "enable --now", "READY",
+                   # 2.4.0: the shared library, and the two packages the Verda image ships without
+                   "/mnt/comfy-library", "nconnect=16", "nfs-common", "python3-venv", "--library",
+                   "COMFY_LIBRARY_SRC=", "BASE_LIBRARY=", "recall_library", "mount_library"):
         assert needle in s, needle
     assert not re.search(r"^\s*set -e", s, re.M)                                 # a partial boot still reaches READY
     readme = README.read_text(encoding="utf-8")
     assert "EXPERIMENTAL" in readme and "\u2014" not in readme and "\u2013" not in readme
+
+
+# ---------------------------------------------------------------- 2.4.0: the shared library
+
+def test_unit_verda_ensure_mounts_the_shared_library_and_records_it_in_host_env_and_volume_env(tmp_path, monkeypatch):
+    """A shared volume attached to the machine is what makes a library, and the driver reads that back from the
+    account rather than remembering it on the Mac. The NFS endpoint is the one thing the API may not carry, so it
+    comes from --library; without it the library is NOT mounted and the run says so instead of pretending."""
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance()],
+                     volumes=[_volume(OS_VOL, "comfy-base-os", True), _volume(DATA_VOL, "comfy-base-data", False),
+                              _shared()])
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
+    calls = []
+
+    def fake_ssh_run(cmd, env=None, timeout=None):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="READY disk=/dev/vdb mounted=yes library=mounted unit=active\n")
+    monkeypatch.setattr(podctl, "ssh_run", fake_ssh_run)
+    monkeypatch.setattr(podctl, "_ssh_hostname", lambda: "comfy-base")
+    logs = []
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=logs.append, library=LIB_SRC)
+        assert calls[-1].rstrip().endswith("bash /root/comfy-base-startup.sh --ensure --library %s" % LIB_SRC)
+        assert any("shared library comfy-library" in l for l in logs)
+        # host.env must carry it: podctl's write_host_env runs right after ensure and overwrites what the script wrote
+        assert prov.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\nBASE_LIBRARY=/mnt/comfy-library\n"
+        # the library's SIZE is recorded, because df on an NFS mount reads as an unmeasurable pool to the disk gate
+        line = prov.record_volume(_instance())
+        assert "500 GB" in line and "comfy-library" in line
+        rec = next(c for c in calls if "volume.env" in c)
+        assert "VOLUME_GB=%s" in rec and "500" in rec and LIB_VOL in rec
+
+    finally:
+        fake.close()
+
+    # attached, but this record carries no usable endpoint: no --library, no BASE_LIBRARY, and a warning rather
+    # than a mount nobody asked for
+    fake2 = FakeVerda(instances=[_instance()], volumes=[_volume(OS_VOL, "comfy-base-os", True), _shared(target=None)])
+    logs2, calls2 = [], []
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: (calls2.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr="READY\n"))[1])
+    try:
+        prov2 = _prov(podctl, fake2, tmp_path)
+        prov2.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=logs2.append)
+        assert calls2[-1].rstrip().endswith("--ensure")
+        assert any("NFS endpoint is not in the API record" in l for l in logs2)
+        assert prov2.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\n"
+    finally:
+        fake2.close()
+
+
+def test_unit_verda_ensure_refuses_a_library_endpoint_when_no_shared_volume_is_attached(tmp_path, monkeypatch):
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance()], volumes=[_volume(OS_VOL, "comfy-base-os", True)])
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
+    calls = []
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: (calls.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr="READY\n"))[1])
+    monkeypatch.setattr(podctl, "_ssh_hostname", lambda: "comfy-base")
+    logs = []
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=logs.append, library=LIB_SRC)
+        assert calls[-1].rstrip().endswith("--ensure")                      # never mounted: nothing to mount
+        assert any("no shared volume is attached" in l for l in logs)
+        assert prov.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\n"
+        assert prov.record_volume(_instance()) is None                       # no library, nothing to record
+    finally:
+        fake.close()
+
+
+def test_unit_verda_start_attaches_the_shared_library_by_type_and_location_never_by_name(tmp_path, monkeypatch):
+    """The stem rule finds a machine's own data volume by name. It cannot find the library and must not: one
+    library serves comfy-base, comfy-cc and comfy-mm, whose stems all differ. Type and location decide instead."""
+    podctl = _load()
+    fake = FakeVerda(volumes=[_volume(OS_VOL, "comfy-base-os", True, status="detached", instance_id=None),
+                              _volume(DATA_VOL, "comfy-base-data", False, status="detached", instance_id=None),
+                              _shared(instances=("some-other-machine",)),                      # still attached elsewhere
+                              _shared(vid="ffff", name="other-region-library", instances=(), location="ICE-01")])
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
+    try:
+        prov = _prov(podctl, fake, tmp_path, env={"VERDA_INSTANCE_TYPE": ITYPE})
+        prov.start(OS_VOL, wait=True, ssh_config=cfg)
+        (_, _, post), = fake.calls("POST", "/instances")
+        assert post["existing_volumes"] == [DATA_VOL, LIB_VOL]      # its own data volume, and the library of THIS location
+        assert "ffff" not in post["existing_volumes"]               # a library in another location is another library
+    finally:
+        fake.close()
+
+
+def test_unit_verda_deploy_like_carries_the_shared_library_without_detaching_it(tmp_path, monkeypatch):
+    """A block volume must be detached from the source before it can move; a shared one attaches to several
+    machines at once, so detaching it would take the library away from every other machine."""
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance(status="offline", ip=None, volume_ids=[DATA_VOL, LIB_VOL])],
+                     volumes=[_volume(OS_VOL, "comfy-base-os", True), _volume(DATA_VOL, "comfy-base-data", False),
+                              _shared()],
+                     keys=[{"id": "key-1", "name": "mac", "key": MAC_KEY, "fingerprint": "x"}])
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov.deploy_like(INST_ID, name="comfy-base-2", wait=True, ssh_config=cfg, say=lambda s: None)
+        detaches = [b for m, p, b in fake.requests if m == "PUT" and p == "/volumes" and b.get("action") == "detach"]
+        assert [b["id"] for b in detaches] == [DATA_VOL]                      # the library was NOT detached
+        (_, _, post), = fake.calls("POST", "/instances")
+        assert post["existing_volumes"] == [DATA_VOL, LIB_VOL]
+        assert fake.volumes[LIB_VOL]["status"] == "attached"
+    finally:
+        fake.close()
+
+
+def test_unit_verda_shared_volume_helpers_read_every_shape_the_api_uses():
+    podctl = _load()
+    mod = _verda(podctl)
+    assert mod.is_shared_volume({"type": "NVMe_Shared"}) and mod.is_shared_volume({"is_shared_fs": True, "type": "x"})
+    assert mod.is_shared_volume({"type": "HDD_Shared"}) and mod.is_shared_volume({"type": "NVMe_Shared_Cluster"})
+    assert not mod.is_shared_volume({"type": "NVMe"}) and not mod.is_shared_volume({}) and not mod.is_shared_volume(None)
+    # the id lists the docs show: one instance_id, an instance_ids array, or an instances array of records
+    assert mod.volume_instance_ids({"instance_id": "a"}) == ["a"]
+    assert mod.volume_instance_ids({"instance_ids": ["b", "c"]}) == ["b", "c"]
+    assert mod.volume_instance_ids({"instances": [{"id": "d"}, "e"]}) == ["d", "e"]
+    assert mod.volume_instance_ids({}) == [] and mod.volume_instance_ids(None) == []
+    # the endpoint is taken from the record only when it LOOKS like host:/export, never guessed
+    # `target` is where a live account puts it, and the same key on a BLOCK volume is a device name
+    assert mod.library_src_from({"target": LIB_SRC}) == LIB_SRC
+    assert mod.library_src_from({"target": "vda"}) == ""
+    assert mod.library_src_from({"nfs_path": LIB_SRC}) == LIB_SRC
+    assert mod.library_src_from({"mount_point": "/mnt/somewhere"}) == ""
+    assert mod.library_src_from({}) == "" and mod.library_src_from(None) == ""
+    # the library's own name must not stem-match a machine, or start would tie it to one machine
+    assert not mod.stems_match("comfy-library", "comfy-base-os")
+
+
+def test_unit_verda_stop_wait_ends_when_the_instance_leaves_the_list_not_when_its_status_changes(tmp_path, monkeypatch):
+    """MEASURED on a live account: a deleted Verda instance is not 404 and never says notfound. GET /instances/{id}
+    keeps answering the full record with status discontinued and volume_ids [], so a probe that waits for None or
+    for a status gave up after 300 s on a delete that had already completed. Absence from GET /instances is the
+    signal, and it has to be, because Verda says discontinued for a zero-balance kill as well as for a delete."""
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance()],
+                     volumes=[_volume(OS_VOL, "comfy-base-os", True), _volume(DATA_VOL, "comfy-base-data", False)])
+
+    # Verda's real behaviour: PUT delete empties volume_ids and sets discontinued, and the record stays readable
+    fake.listed = set(fake.instances)
+
+    def delete_like_verda(inst_id):
+        fake.instances[inst_id].update(status="discontinued", volume_ids=[], ip=None)
+        fake.listed.discard(inst_id)                 # gone from the LIST, still readable by id
+    fake.on_delete = delete_like_verda
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        out = prov.stop(INST_ID, wait=True)
+        assert "instance deleted, volumes kept" in out and OS_VOL in out
+        assert fake.instances[INST_ID]["status"] == "discontinued"        # still readable by id, as Verda leaves it
+        # and the word reads as gone, so start refuses instead of passing it through as transitional
+        assert podctl_norm(podctl, "discontinued") == "gone"
+        with pytest.raises(podctl.PodctlError) as ei:
+            prov.start(INST_ID, wait=False)
+        assert "nothing to start" in str(ei.value)
+        # stopping it again is a no-op that says so rather than deleting a second time
+        assert "already discontinued" in prov.stop(INST_ID, wait=False)
+    finally:
+        fake.close()
+
+
+def podctl_norm(podctl, raw):
+    return _verda(podctl).norm_status(raw)
+
+
+def test_unit_verda_the_library_is_listed_and_mounted_without_being_told_its_endpoint(tmp_path, monkeypatch):
+    """MEASURED on a live account: a shared volume's own record carries `target`, the NFS endpoint, so ensure
+    needs no --library; and an ATTACHED one reads "exported", which _detached() would hide, so pods() lists
+    shared volumes whatever their status or the library is invisible exactly while three machines depend on it."""
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance()],
+                     volumes=[_volume(OS_VOL, "comfy-base-os", True), _volume(DATA_VOL, "comfy-base-data", False),
+                              _shared()])
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
+    calls = []
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: (calls.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr="READY\n"))[1])
+    monkeypatch.setattr(podctl, "_ssh_hostname", lambda: "comfy-base")
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=lambda s: None)   # no --library given
+        assert calls[-1].rstrip().endswith("--ensure --library nfs.fin-01.datacrunch.io:/comfy-library-abc")
+        assert prov.host_env().endswith("BASE_LIBRARY=/mnt/comfy-library\n")
+        # an attached (exported) library still shows in pods, beside the instance
+        rows = prov.pods()
+        assert any(is_lib(r) for r in rows), rows
+        assert prov.status_text(prov.pod(LIB_VOL)).splitlines()[1].startswith("kind       shared library")
+    finally:
+        fake.close()
+
+
+def is_lib(rec):
+    return str(rec.get("id")) == LIB_VOL

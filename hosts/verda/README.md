@@ -63,6 +63,61 @@ redeploy.
   `nofail`. A disk that already carries a filesystem is kept, never reformatted. Attach exactly ONE data disk;
   with two the script refuses to choose (set `COMFY_DATA_DISK=/dev/vdX` and run `--ensure` if you must).
 
+## 3b. The shared library (2.4.0)
+
+Several machines can draw models from ONE store instead of each keeping a copy. On Verda that store is a volume of
+a SHARED type: `GET /volume-types` marks `NVMe_Shared`, `HDD_Shared` and `NVMe_Shared_Cluster` with
+`is_shared_fs: true`, and unlike a plain block volume (one instance at a time) a shared one attaches to several at
+once. `POST /volumes` takes `instance_ids`, and `PUT /volumes {"action": "attach", "instance_ids": [...]}` adds
+more later. NVMe_Shared costs the same per GiB as plain NVMe.
+
+- **Create it** in the console or with `POST /volumes` (`name`, `size`, `type: NVMe_Shared`, `location_code`), in
+  the SAME location as every machine that will use it. A location cannot be crossed, so the library's location is
+  the location all its machines live in.
+- **Mount it** by giving the endpoint to `ensure`: `podctl ensure <id> --library nfs.<dc>.verda.com:/<pseudo>`
+  (or `VERDA_LIBRARY` in the environment). `startup.sh` writes one fstab line with `nconnect=16,nofail,_netdev`,
+  mounts it at `/mnt/comfy-library`, and creates `models/`, `output/` and `input/` under it. A later plain
+  `podctl ensure <id>` keeps the library: the endpoint is recorded in `host.env` and the script recalls it.
+  `--no-library` drops one.
+- **What moves and what does not.** `models/` becomes ComfyUI's own `models/` (a symlink, so packs that join
+  `folder_paths.models_dir` with their own folder name find the shared copy instead of downloading 21 GB again),
+  and `--output-directory` / `--input-directory` put renders and inputs on it too. `user/` stays local, because it
+  holds the saved workflows App Mode opens and each machine carries only its own package; `temp/` stays local
+  because it is churn nobody shares. The venv, ComfyUI itself and the custom nodes stay on the machine's own data
+  volume: they are tens of thousands of small files, which is what NFS is worst at.
+- **No library, no server.** With one configured the boot unit gains `RequiresMountsFor=/mnt/comfy-library`, so a
+  machine whose library is missing does not start ComfyUI. An empty model dropdown looks like a broken package;
+  a unit that refuses to start says what is wrong in one line of the log.
+- **The disk gate.** `_base_fs_is_pool` treats every `host:/path` device as a pool whose `df` cannot be trusted
+  (it was written for MooseFS), so `podctl ensure` records the library volume's size in `state/volume.env` and the
+  gate measures against that. Without the record it would print "free space is not verifiable here" and never fire.
+- **Starting and cloning.** `podctl start <os volume>` attaches the library by TYPE and LOCATION, never by name:
+  one library serves machines called `comfy-base`, `comfy-cc` and `comfy-mm`, whose name stems all differ, so the
+  stem rule that finds a machine's own data volume cannot find it and must not. `podctl deploy --like` carries a
+  shared volume to the clone WITHOUT detaching it, because detaching would take the library from every other
+  machine.
+
+**Measured on a live account, 2026-09-17** (a 1 GB `NVMe_Shared` probe volume attached to a running instance):
+
+- **A shared volume is NOT a block device.** `lsblk` is byte for byte identical before and after the attach, no new
+  `/dev/vd*`, nothing in `dmesg`. So `startup.sh`'s "the one unmounted `/dev/vd[b-z]`" rule is not endangered and
+  `COMFY_DATA_DISK` is not needed: a machine with a library is still a two-disk machine plus an NFS mount.
+- **The record carries the whole recipe**, so nothing has to be typed. `target` is the endpoint
+  (`nfs.fin-03.datacrunch.io:/comfy-library-<id>`), beside `pseudo_path`, `create_directory_command`,
+  `mount_command` and `filesystem_to_fstab_command`. The driver reads `target`; `--library` is an override.
+  Note `target` is overloaded: on a plain block volume it is the device name, `vda`, so the `host:/export` SHAPE
+  is what the driver tests, never the key alone.
+- **The mount is NFS 4.2**, `nconnect=16`, `rsize/wsize=1048576`, `hard`, `proto=tcp`, over the instance's PRIVATE
+  address. `df` and `stat -f` report the volume's real size and usage, not a pool's.
+- **Attach is `PUT /volumes {"id": ..., "action": "attach", "instance_id": ...}`**, which answers `[null]`; detach
+  takes the same shape.
+- **Cross-location is refused** with `HTTP 400 invalid_request`: "Volume location (FIN-02) does not match instance
+  location (FIN-03)". One library serves one location, and that decides where its machines live.
+- **The status vocabulary differs from a block volume's.** A fresh shared volume is `created`; an ATTACHED one is
+  `exported`, not `attached`; only after a detach does it read `detached`. `pods()` therefore lists shared volumes
+  whatever their status, because `_detached()` would hide the library exactly while it is in use.
+- **Price** confirmed at `monthly_price: 0.2` per GB, the same as plain NVMe.
+
 ## 4. The first deploy
 
 Either way, the sequence ends with `ensure` and `install`.

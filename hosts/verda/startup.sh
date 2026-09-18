@@ -6,16 +6,26 @@
 #   bash startup.sh --ensure    the same work, idempotently, on a machine that is already running (what
 #                               `podctl ensure` does over ssh: an instance deployed without the script, or
 #                               redeployed from an OS volume, ends up equal to one that had it)
+#   bash startup.sh --ensure --library nfs.fin-02.verda.com:/pseudo
+#                               the same, and mount that Verda shared filesystem at /mnt/comfy-library
 #
 # What it does, in order:
+#   0. installs what the image lacks and the base needs: nfs-common (the shared library) and python3-venv
+#      (the ubuntu-24.04-cuda-13.0-open-docker image ships no ensurepip, so `python3 -m venv` cannot run);
 #   1. finds the one data disk (/dev/vd[b-z], unmounted, not the OS disk), waits up to 10 minutes for it,
 #      refuses when there is more than one candidate, makes an ext4 filesystem labelled comfy-volume when
 #      the disk is blank, adds an fstab line by UUID at /workspace (nofail, 30 s device timeout), mounts it;
-#   2. writes and enables the comfy-base-boot systemd unit, which runs /workspace/comfy-base/boot.sh when
+#   2. mounts the SHARED LIBRARY when one is configured: a Verda NVMe_Shared volume, reached over NFS, one
+#      fstab line at /mnt/comfy-library (nconnect=16, nofail, _netdev), holding models/, output/ and input/
+#      for every machine at once. The endpoint comes from --library, else COMFY_LIBRARY, else the value a
+#      previous run recorded in host.env, so a plain `--ensure` keeps the library it already had;
+#   3. writes and enables the comfy-base-boot systemd unit, which runs /workspace/comfy-base/boot.sh when
 #      the base is installed there and sleeps otherwise (so the unit is always healthy, and a base install
-#      followed by `systemctl restart comfy-base-boot` or a machine restart boots the base);
-#   3. writes /workspace/comfy-base/state/host.env (BASE_HOST=verda, BASE_VOLUME=/workspace);
-#   4. prints one READY line.
+#      followed by `systemctl restart comfy-base-boot` or a machine restart boots the base). With a library
+#      configured the unit also RequiresMountsFor it: ComfyUI must not come up with empty model dropdowns,
+#      so no library means no server, said plainly in the log, rather than a silently empty panel;
+#   4. writes /workspace/comfy-base/state/host.env (BASE_HOST, BASE_VOLUME, and the library when there is one);
+#   5. prints one READY line.
 #
 # Never `set -e`: a partial first boot must still reach the READY line and the log. Pure ASCII.
 # Log: /var/log/comfy-base-startup.log (also stderr, which Verda keeps in the instance console).
@@ -27,8 +37,21 @@ UNIT=comfy-base-boot
 UNIT_FILE=/etc/systemd/system/$UNIT.service
 BOOT_HOME=$MOUNT/comfy-base
 DISK_WAIT=600
+LIB_MOUNT=/mnt/comfy-library
+LIB_OPTS=nconnect=16,nofail,_netdev
 MODE=first-boot
-[ "${1:-}" = "--ensure" ] && MODE=ensure
+LIBRARY="${COMFY_LIBRARY:-}"          # host:/export of the Verda shared filesystem, or empty for no library
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ensure)  MODE=ensure ;;
+    --library) LIBRARY="${2:-}"; shift ;;
+    --library=*) LIBRARY="${1#--library=}" ;;
+    --no-library) LIBRARY=""; NO_LIBRARY=1 ;;
+    *) ;;
+  esac
+  shift
+done
+NO_LIBRARY="${NO_LIBRARY:-0}"
 
 # stderr, not stdout: several functions below are called as $(...) and their stdout IS their answer
 log() { printf '%s comfy-base-startup[%s]: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MODE" "$*" | tee -a "$LOG" >&2; }
@@ -38,6 +61,38 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 touch "$LOG" 2>/dev/null
+
+# ---------------------------------------------------------------- 0. what the image lacks
+
+ensure_packages() {
+  # nfs-common: the shared library is an NFS mount. mount.nfs was present on one machine that had already had
+  # apt run on it, so the stock image may well carry it; the check costs nothing and the install only runs when
+  # it is genuinely missing.
+  # python3-venv: the image ships python3 without ensurepip, so `python3 -m venv` fails and the base's
+  # venv step dies on a machine that looks fine. Both are installed once and persist on the OS volume.
+  local need=() out
+  command -v mount.nfs >/dev/null 2>&1 || need+=(nfs-common)
+  python3 -c 'import ensurepip' >/dev/null 2>&1 || need+=(python3-venv)
+  if [ "${#need[@]}" = "0" ]; then
+    PACKAGES=present
+    return 0
+  fi
+  log "installing ${need[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  # -o DPkg::Lock::Timeout: unattended-upgrades often holds the dpkg lock on a first boot
+  if ! out=$(apt-get -o DPkg::Lock::Timeout=300 update 2>&1); then
+    printf '%s\n' "$out" | tail -5 >>"$LOG"
+    log "apt-get update failed (see $LOG)"
+  fi
+  if apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends "${need[@]}" >>"$LOG" 2>&1; then
+    PACKAGES="installed ${need[*]}"
+    log "installed ${need[*]}"
+    return 0
+  fi
+  PACKAGES="FAILED ${need[*]}"
+  log "could not install ${need[*]} (see $LOG)"
+  return 1
+}
 
 # ---------------------------------------------------------------- 1. the data disk
 
@@ -151,17 +206,98 @@ mount_data_disk() {
   return 1
 }
 
+# ---------------------------------------------------------------- 1b. the shared library
+
+recall_library() {
+  # A plain `--ensure` must keep the library the machine already had: the endpoint was recorded in host.env
+  # by the run that set it up. An explicit --no-library is the only way to drop one.
+  local f="$BOOT_HOME/state/host.env"
+  [ -z "$LIBRARY" ] || return 0
+  [ "$NO_LIBRARY" = "1" ] && return 0
+  [ -f "$f" ] || return 0
+  LIBRARY="$(sed -n 's/^COMFY_LIBRARY_SRC=//p' "$f" | head -1)"
+  [ -n "$LIBRARY" ] && log "library $LIBRARY recalled from host.env"
+  return 0
+}
+
+mount_library() {
+  # The Verda shared filesystem (an NVMe_Shared volume) reached over NFS. One fstab line, nconnect=16 as
+  # Verda's own documentation gives it, nofail so a boot never hangs on it, _netdev so it waits for the network.
+  local line src tries=0
+  LIBRARY_STATE=none
+  if [ -z "$LIBRARY" ]; then
+    log "no shared library configured (--library host:/export, or COMFY_LIBRARY)"
+    return 0
+  fi
+  case "$LIBRARY" in
+    *:/*) ;;
+    *) log "library '$LIBRARY' is not host:/export, ignored"; LIBRARY=""; LIBRARY_STATE=invalid; return 1 ;;
+  esac
+  if ! command -v mount.nfs >/dev/null 2>&1; then
+    log "library $LIBRARY: no mount.nfs on this machine (nfs-common did not install), not mounted"
+    LIBRARY_STATE=no-nfs-client
+    return 1
+  fi
+  mkdir -p "$LIB_MOUNT"
+  line="$LIBRARY $LIB_MOUNT nfs defaults,$LIB_OPTS 0 0"
+  if grep -qF "$line" /etc/fstab 2>/dev/null; then
+    log "library fstab line present"
+  else
+    if awk -v m="$LIB_MOUNT" '$1 !~ /^#/ && $2 == m { found = 1 } END { exit !found }' /etc/fstab 2>/dev/null; then
+      cp /etc/fstab /etc/fstab.comfy-base.bak
+      awk -v m="$LIB_MOUNT" '$1 !~ /^#/ && $2 == m { next } { print }' /etc/fstab.comfy-base.bak >/etc/fstab
+      log "replaced the old fstab line for $LIB_MOUNT (backup /etc/fstab.comfy-base.bak)"
+    fi
+    printf '%s\n' "$line" >>/etc/fstab
+    log "fstab: $line"
+  fi
+  systemctl daemon-reload 2>/dev/null
+  if findmnt -n "$LIB_MOUNT" >/dev/null 2>&1; then
+    src=$(findmnt -n -o SOURCE "$LIB_MOUNT")
+    if [ "$src" != "$LIBRARY" ]; then
+      log "WARNING $LIB_MOUNT is already mounted from $src, not $LIBRARY, left alone; unmount it and re-run --ensure to change it"
+    fi
+    LIBRARY_STATE=mounted
+  else
+    # the network may not be up yet on a first boot; the fstab line covers every boot after this one
+    while [ "$tries" -lt 6 ]; do
+      mount "$LIB_MOUNT" >>"$LOG" 2>&1 && break
+      tries=$((tries + 1))
+      [ "$tries" = "1" ] && log "library not mounting yet, retrying for 30s"
+      sleep 5
+    done
+    if findmnt -n "$LIB_MOUNT" >/dev/null 2>&1; then
+      LIBRARY_STATE=mounted
+      log "$LIB_MOUNT mounted from $LIBRARY"
+    else
+      LIBRARY_STATE=NOT-MOUNTED
+      log "$LIB_MOUNT is NOT mounted from $LIBRARY (see $LOG); the fstab line stays, so a reboot retries"
+      return 1
+    fi
+  fi
+  # the three trees every machine shares; ComfyUI is pointed at them by the base, never by this script
+  if ! mkdir -p "$LIB_MOUNT/models" "$LIB_MOUNT/output" "$LIB_MOUNT/input" 2>>"$LOG"; then
+    log "could not create models/ output/ input/ under $LIB_MOUNT"
+    return 1
+  fi
+  log "library ready at $LIB_MOUNT (models, output, input)"
+  return 0
+}
+
 # ---------------------------------------------------------------- 2. the boot unit
 
 write_unit() {
-  local tmp
+  local tmp req="/workspace"
+  # a configured library is a hard requirement of the server: ComfyUI must never come up with empty model
+  # dropdowns because an NFS mount was late or gone. No library, no server, and the log says which.
+  [ -n "$LIBRARY" ] && req="/workspace $LIB_MOUNT"
   tmp=$(mktemp)
   cat >"$tmp" <<UNIT_EOF
 [Unit]
 Description=ComfyUI Base boot (sshd, JupyterLab, ComfyUI) from $BOOT_HOME
 After=network-online.target local-fs.target
 Wants=network-online.target
-RequiresMountsFor=/workspace
+RequiresMountsFor=$req
 
 [Service]
 Type=simple
@@ -205,6 +341,10 @@ write_host_env() {
     return 1
   fi
   want=$(printf 'BASE_HOST=verda\nBASE_VOLUME=/workspace\n')
+  # BASE_LIBRARY is the mount point the base reads; COMFY_LIBRARY_SRC is the endpoint this script remounts from
+  if [ -n "$LIBRARY" ]; then
+    want=$(printf '%s\nBASE_LIBRARY=%s\nCOMFY_LIBRARY_SRC=%s\n' "$want" "$LIB_MOUNT" "$LIBRARY")
+  fi
   if [ -f "$dir/host.env" ] && [ "$(cat "$dir/host.env")" = "$want" ]; then
     HOST_ENV=kept
   else
@@ -220,10 +360,15 @@ write_host_env() {
 DISK=none
 UNIT_STATE=absent
 HOST_ENV=skipped
+PACKAGES=unknown
+LIBRARY_STATE=none
 RC=0
 
 log "start ($(hostname), kernel $(uname -r))"
+ensure_packages || RC=1
 mount_data_disk || RC=1
+recall_library
+mount_library || RC=1
 write_unit || RC=1
 write_host_env || RC=1
 
@@ -232,8 +377,8 @@ findmnt -n "$MOUNT" >/dev/null 2>&1 && MOUNTED=yes
 BOOT=absent
 [ -x "$BOOT_HOME/boot.sh" ] && BOOT=present
 if [ "$RC" = "0" ]; then
-  log "READY disk=$DISK mounted=$MOUNTED unit=$UNIT_STATE boot.sh=$BOOT host.env=$HOST_ENV"
+  log "READY disk=$DISK mounted=$MOUNTED library=$LIBRARY_STATE unit=$UNIT_STATE boot.sh=$BOOT host.env=$HOST_ENV packages=$PACKAGES"
 else
-  log "READY-WITH-ERRORS disk=$DISK mounted=$MOUNTED unit=$UNIT_STATE boot.sh=$BOOT host.env=$HOST_ENV (read $LOG)"
+  log "READY-WITH-ERRORS disk=$DISK mounted=$MOUNTED library=$LIBRARY_STATE unit=$UNIT_STATE boot.sh=$BOOT host.env=$HOST_ENV packages=$PACKAGES (read $LOG)"
 fi
 exit $RC

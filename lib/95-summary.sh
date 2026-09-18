@@ -43,6 +43,7 @@ base_init(){
     if ! base_discover; then exit 3; fi
   fi
   if ! _base_validate_tables; then err "the package's declarations are invalid (see above)"; exit 2; fi
+  _base_library_link          # 2.4.0: models/ IS the shared library, before anything imports, downloads or renders
   _base_tmp
   if ! base_banner; then base_summary; fi    # the driver gate failed: the summary exits 1
 }
@@ -226,6 +227,7 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
     done;;
   esac
   echo "  ComfyUI    $COMFY_OLD → $COMFY_NEW   (${COMFY:-?})"
+  if [ -n "${BASE_LIBRARY:-}" ]; then echo "  library    shared: $BASE_LIBRARY (models, output, input): every machine on this volume sees the same files"; fi
   echo "  packs      present ${#PACK_PRESENT[@]} · updated ${#PACK_UPDATED[@]} · cloned ${#PACK_CLONED[@]} · local edits ${#PACK_DIRTY[@]}"
   [ "${#PACK_UPDATED[@]}" -gt 0 ] && _base_list "${PACK_UPDATED[@]}" || true
   [ "${#PACK_CLONED[@]}" -gt 0 ] && _base_list "${PACK_CLONED[@]}" || true

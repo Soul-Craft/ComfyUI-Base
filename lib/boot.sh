@@ -53,8 +53,16 @@ boot_host(){ # 2.2.0: which host this is and where it may listen. RunPod's own v
   BASE_HOST="${BASE_HOST:-${h:-vm}}"
   if [ -z "${BASE_LISTEN:-}" ]; then if [ "$BASE_HOST" = runpod ]; then BASE_LISTEN=0.0.0.0; else BASE_LISTEN=127.0.0.1; fi; fi
   BOOT_VOLUME="$(dirname "$BOOT_HOME")"
-  export BASE_HOST BASE_LISTEN
-  echo "boot: host $BASE_HOST · listen $BASE_LISTEN · volume $BOOT_VOLUME"
+  # 2.4.0: the shared library, so the machine's own boot starts ComfyUI on the same output/ and input/ the
+  # install pointed it at. The unit RequiresMountsFor it, so by here it is mounted or the server never ran.
+  if [ -z "${BASE_LIBRARY:-}" ] && [ -f "$f" ]; then BASE_LIBRARY="$(sed -n 's/^BASE_LIBRARY=//p' "$f" | head -1)"; fi
+  BASE_LIBRARY="${BASE_LIBRARY%/}"
+  if [ -n "${BASE_LIBRARY:-}" ] && [ ! -d "$BASE_LIBRARY" ]; then
+    echo "boot: BASE_LIBRARY=$BASE_LIBRARY is not a directory, starting WITHOUT the shared library"
+    BASE_LIBRARY=""
+  fi
+  export BASE_HOST BASE_LISTEN BASE_LIBRARY
+  echo "boot: host $BASE_HOST · listen $BASE_LISTEN · volume $BOOT_VOLUME · library ${BASE_LIBRARY:-none}"
 }
 boot_extensions(){ # 2.2.0: a project's own boot stages, ext/*.sh, sourced in name order. Looked for on the volume first, then beside
   # this very file: on a baked image's FIRST boot the volume is empty and the seed's own ext/ (beside the seed's boot.sh) is the

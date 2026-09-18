@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.3.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.4.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -78,6 +78,16 @@ run once per machine as **step one**; then each workflow package is **step two**
     (`BASE_SEED=1`: toolchain and packs, no models) and parked on the container disk; a boot extension (`ext/`, §9)
     copies it onto an empty volume once. The base ships neither the generator nor the extension: what is specific to a
     project lives in that project's repository. Nothing about rules 1 to 11 changes on an unpinned machine.
+13. **The model library may be SHARED by several machines** (2.4.0). `BASE_LIBRARY` names a store that more than
+    one machine mounts at once, and with it set `models/` and ComfyUI's `output/` and `input/` live there instead of
+    on the machine's own volume: a model is downloaded once for all of them rather than once each, and a file one
+    machine writes is there for the next with no copy. ComfyUI's own `models/` becomes a LINK to it, not an extra
+    search path, because several packs never ask `folder_paths` where their weights are and join
+    `folder_paths.models_dir` with their own folder name instead. `user/` and `temp/` stay on the machine: `user/`
+    holds the saved workflows the App view opens, and each machine carries only its own package. With no library set
+    nothing changes and every path in this handbook reads as it always did. On Verda the store is an `NVMe_Shared`
+    volume over NFS at `/mnt/comfy-library`, and a configured library is a hard requirement of the boot unit, so a
+    missing mount means no server rather than a panel of empty dropdowns.
 
 ## 1. Hosts
 
@@ -384,6 +394,10 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.4.0: `BASE_LIBRARY`, a model library several machines mount at once (§0.13). Discovery prefers it over
+  `extra_model_paths.yaml`, which is not yet written on a machine's first install; staging is per machine so two
+  installs cannot collide on one half-file; the disk gate measures the library rather than the volume. On Verda:
+  a shared volume is resolved from the account and attached by type and location, never by name stem.
 - 2.3.0: the first public release. Models come from Hugging Face and GitHub only; model families are a brand's list,
   not the base's; the loader map covers ComfyUI's core loaders and the shared packs', packages extend it with
   `LOADER_CATS`; the fake-pod layouts are `official | community | bare | volume`.
