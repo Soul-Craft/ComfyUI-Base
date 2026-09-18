@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.4.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -403,6 +403,19 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.4: a dry run is a report, not a gate, where a report is all it can honestly be. `--check` failed any
+  `LOCAL` model row whose file was not on disk, although a `LOCAL` row is placed by the package's own
+  `pkg_pre_models`, which does nothing under `BASE_DRY`. So the file was absent BY DESIGN at check time and its
+  absence carried no information, and `podctl install --pkg` was gated on a condition the gate itself created:
+  every package with a `LOCAL` row stopped at "nothing was run" before it could place the file. Both `LOCAL`
+  branches, the file one and the folder-snapshot one, now report the row as unjudgeable **when the package
+  declares `pkg_pre_models`**, and are unchanged otherwise: with no such hook a missing file really is missing
+  and saying so before the run is the useful answer. A real run still fails either way. Measured on
+  video-creator-minimax-h3, whose engine is CivitAI only and has no Hub mirror. Four cases in one test hold it,
+  including the positive control that a `LOCAL` file which IS present still reports ok, so the guard cannot
+  quietly widen to every row. Also: a `SUPERSEDED` entry the sweep can never match (a path, or a dotfile) is
+  still skipped, because that sweep matches basenames only and a path pattern would widen it across a store
+  several machines share, but it now says so once per pattern instead of silently doing nothing.
 - 2.5.3: the Verda host is no longer EXPERIMENTAL. The three questions its README asked are answered by live
   runs: the ssh user is root, the startup script does re-run on a redeploy and fstab survives on the OS volume, and
   `ip` populates within about 30 s. The driver no longer prints the warning on every command.

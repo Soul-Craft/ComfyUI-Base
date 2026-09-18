@@ -340,6 +340,8 @@ base_models(){
           if [ "$BASE_DRY" = "1" ]; then would "move the snapshot folder $sdir → $rel"; MODEL_MOVED+=("$rel (would move from $sdir)")
           elif _base_move_dir_into_place "$sdir" "$dest"; then ok "$rel ← moved from $sdir"; MODEL_MOVED+=("$rel ← $sdir"); MODEL_MOVED_GB="$(_base_add_gb "$MODEL_MOVED_GB" "$(_base_bytes_to_gb "$(_base_dir_size "$dest")")")"
           else err "move failed: $sdir → $dest"; MODEL_FAIL+=("$rel (move failed)"); BASE_FAILED+=("snapshot move failed: $rel"); fi
+        elif [ "$BASE_DRY" = "1" ] && declare -F pkg_pre_models >/dev/null; then
+          would "find or be given the snapshot folder for $rel (LOCAL, and this package's pkg_pre_models may place it before the list is walked, so --check cannot judge it)"
         else
           err "$rel is declared LOCAL and no folder '$base' holding a config.json exists anywhere on this pod — place it on the volume and re-run"
           MODEL_LOCAL_MISSING+=("$rel"); MODEL_FAIL+=("$rel (LOCAL, not found)"); BASE_FAILED+=("LOCAL snapshot not found on this pod: $base → $rel")
@@ -373,7 +375,17 @@ base_models(){
       else err "move failed: $cand → $dest"; TODO+=("FILE|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes)); fi
       continue
     fi
-    # ---- LOCAL rows never download: not found is a failure, by name
+    # ---- LOCAL rows never download: not found is a failure, by name.
+    # UNLESS this is a dry run AND the package declares pkg_pre_models. A LOCAL row is placed by that hook, which
+    # does nothing under BASE_DRY, so at --check time the file is absent BY DESIGN and its absence carries no
+    # information: `podctl install --pkg` was gated on a condition the gate itself created and every package with
+    # a LOCAL row stopped before it could place the file. Same shape as _base_disk_gate, which reports free space
+    # it cannot measure. A package with NO such hook is still gated, because there a missing file really is
+    # missing and saying so before the run is the useful answer.
+    if [ "$url" = "LOCAL" ] && [ "$BASE_DRY" = "1" ] && declare -F pkg_pre_models >/dev/null; then
+      would "find or be given $rel (LOCAL, and this package's pkg_pre_models may place it before the list is walked, so --check cannot judge it)"
+      continue
+    fi
     if [ "$url" = "LOCAL" ]; then
       err "$rel is declared LOCAL and was not found anywhere on this pod — place $base on the volume and re-run"
       MODEL_LOCAL_MISSING+=("$rel"); MODEL_FAIL+=("$rel (LOCAL, not found)")
@@ -488,6 +500,18 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
   done <<< "$rows"
   # ---- superseded: only inside this package's own family folders (and its declared legacy dirs), only by basename
   local fdirs; fdirs="$(_base_family_dirs)"
+  # A pattern the sweep below can never match is skipped by design (basenames only, ever: a path pattern would
+  # widen the sweep across a store several machines share, and a trained LoRA is an output, not a row). The
+  # SILENCE was the defect: a package declaring such a row got no signal that its entry did nothing. Hoisted out
+  # of the per-file loop so it says this once per pattern, not once per indexed file.
+  local _sp
+  for _sp in ${SUPERSEDED[@]+"${SUPERSEDED[@]}"}; do
+    case "$_sp" in
+      */*) warn "SUPERSEDED entry ignored, it is a path and this sweep matches basenames only: $_sp";;
+      .*)  warn "SUPERSEDED entry ignored, it starts with a dot: $_sp";;
+      "")  ;;
+    esac
+  done
   while IFS=$'\t' read -r size path; do
     if [ -z "$path" ] || [ ! -f "$path" ] || [ -L "$path" ]; then continue; fi
     base="$(basename "$path")"; lbase="$(_base_lower "$base")"; hit=0

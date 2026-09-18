@@ -453,6 +453,41 @@ def test_unit_a_found_local_file_is_relocated_any_size(tmp_path):
     assert "FAILED=0" in r.stdout and "mine.safetensors" in r.stdout, r.stdout + r.stderr
 
 
+def test_unit_a_dry_run_cannot_judge_a_local_row_a_hook_will_place_but_still_gates_one_nothing_will(tmp_path):
+    """A LOCAL row is placed by the package's own pkg_pre_models, which does nothing under BASE_DRY, so at --check
+    time the file is absent BY DESIGN and its absence carries no information. Before this guard, `podctl install
+    --pkg` died on --check for every package with a LOCAL row: a gate on a condition the gate itself creates.
+    But the relaxation is only honest where a hook exists, so all four cases live in one test and none of them
+    can be deleted without the others."""
+    c = _pod(tmp_path); env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path)}
+    tail = f'MODELS=("{ROW_LOCAL}"); base_env_setup; base_discover quiet; base_models; echo FAILED=${{#BASE_FAILED[@]}}'
+    hook = 'pkg_pre_models(){ :; }; '
+
+    dry_hook = _bash(hook + tail, env={**env, "BASE_DRY": "1"})
+    assert "FAILED=0" in dry_hook.stdout, "a hook may place it, so --check cannot judge it" + dry_hook.stdout + dry_hook.stderr
+    assert "mine.safetensors" in dry_hook.stdout, "the report must still NAME the row it could not judge" + dry_hook.stdout
+
+    dry_nohook = _bash(tail, env={**env, "BASE_DRY": "1"})
+    assert "FAILED=1" in dry_nohook.stdout, \
+        "with no pkg_pre_models nothing will ever place it, so --check must still say so" + dry_nohook.stdout + dry_nohook.stderr
+
+    for label, extra in (("with a hook", hook), ("without one", "")):
+        real = _bash(extra + tail, env=env)
+        assert "FAILED=1" in real.stdout, f"a real run must still fail on a LOCAL row nothing placed ({label})" + real.stdout + real.stderr
+
+
+def test_unit_a_dry_run_still_reports_a_local_file_that_is_present_as_ok(tmp_path):
+    """The positive control, and the reason the guard above stays honest. If a careless edit ever widened it to
+    every LOCAL row, the dry run would report each one as unjudgeable and stop being able to tell anyone
+    anything. A LOCAL file that IS on disk is judgeable, so it is judged, hook or no hook."""
+    c = _pod(tmp_path); (tmp_path / "somewhere").mkdir(); (tmp_path / "somewhere" / "mine.safetensors").write_bytes(b"xyz")
+    r = _bash(f'pkg_pre_models(){{ :; }}; MODELS=("{ROW_LOCAL}"); base_env_setup; base_discover quiet; base_models; echo FAILED=${{#BASE_FAILED[@]}}',
+              env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path), "BASE_DRY": "1"})
+    assert "FAILED=0" in r.stdout, r.stdout + r.stderr
+    assert "cannot judge" not in r.stdout, \
+        "a LOCAL file that is present must be reported as found, never as unjudgeable: " + r.stdout
+
+
 def test_unit_the_disk_gate_runs_before_anything_is_downloaded_and_admits_what_it_cannot_check(tmp_path):
     c = _pod(tmp_path)
     r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; echo FAILED=${{#BASE_FAILED[@]}} DL=${{#MODEL_DL[@]}}',
@@ -472,6 +507,20 @@ def test_unit_prune_offers_only_unclaimed_duplicates_and_needs_the_prompt(tmp_pa
     assert "DEL=2" in r.stdout and dup.exists() and sup.exists(), r.stdout + r.stderr          # no TTY → No
     r = _bash(f'MODELS=("{ROW_A}"); SUPERSEDED=(old.safetensors); base_env_setup; base_discover quiet; base_models; base_prune', env={**env, "BASE_YES": "1"})
     assert not dup.exists() and not sup.exists() and other.exists() and (dest / "a.safetensors").exists(), r.stdout + r.stderr
+
+
+def test_unit_prune_warns_once_about_a_superseded_pattern_it_ignores(tmp_path):
+    """SUPERSEDED matches basenames ONLY, ever: a pattern with a slash would widen the sweep across a store three
+    machines share, and a trained LoRA is an output, not a row. The constraint stays; the SILENCE was the defect.
+    A package inheriting such a row (video-creator-minimax-h3 has one) got no signal that its entry did nothing.
+    The warning is hoisted out of the per-file loop, so it fires once per pattern and not once per indexed file."""
+    c = _pod(tmp_path); d = c / "models" / "diffusion_models" / "Example"; d.mkdir(parents=True)
+    for n in ("one.safetensors", "two.safetensors", "three.safetensors"): (d / n).write_bytes(b"1")
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path)}
+    r = _bash(f'MODELS=("{ROW_A}"); SUPERSEDED=(sub/dir/old.safetensors); base_env_setup; base_discover quiet; base_models; base_prune; echo WARN=${{#BASE_WARN[@]}}',
+              env=env)
+    assert "sub/dir/old.safetensors" in r.stdout, "the ignored pattern must be named: " + r.stdout + r.stderr
+    assert "WARN=1" in r.stdout, "once per pattern, not once per indexed file: " + r.stdout + r.stderr
 
 
 def test_unit_prune_never_deletes_a_symlink_or_uses_rm_rf_on_files():
