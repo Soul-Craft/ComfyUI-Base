@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.4.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -89,6 +89,15 @@ run once per machine as **step one**; then each workflow package is **step two**
     volume over NFS at `/mnt/comfy-library`, and a configured library is a hard requirement of the boot unit, so a
     missing mount means no server rather than a panel of empty dropdowns.
 
+14. **The WHOLE root may be the shared store, and then a machine is just a GPU** (2.5.0). This is the RunPod shape
+    carried to a host whose machines are virtual machines rather than containers. On RunPod a pod has no disk of its
+    own: one network volume mounts at `/workspace` and holds `comfy-base/`, ComfyUI, the venv, `packages/` and the
+    models, so the pod is disposable and the volume is the asset. With `BASE_VOLUME_SHARED=1` the same is true here,
+    and a machine carries only the disk it boots from. Two things follow, and the base does both for you: ComfyUI's
+    `user/` and `temp/` move to `BASE_LOCAL_STATE` on the machine itself, because saved workflows, frontend settings
+    and scratch are per machine and two servers writing one `user/` tread on each other; and an install takes a
+    lock on the store, because pip and uv write a venv in place and neither expects a second writer. RUNNING takes
+    no lock at all, which is what makes several GPUs on one store safe: running only reads.
 ## 1. Hosts
 
 The core of the base (`lib/`, `py/`, `suite/`) runs on any NVIDIA GPU on any Linux with one persistent volume root.
@@ -394,6 +403,11 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.0: `BASE_VOLUME_SHARED`, the whole root on the shared store (§0.14), which is what makes a machine
+  disposable rather than only its models shared. `user/` and `temp/` move to `BASE_LOCAL_STATE`; installs take a
+  mkdir lock on the store, honoured for two hours and then broken with the owner named; running is unlocked. On
+  Verda `podctl ensure --workspace-shared` mounts the shared volume AS `/workspace`, so the machine needs no data
+  volume and `startup.sh` never hunts for one.
 - 2.4.0: `BASE_LIBRARY`, a model library several machines mount at once (§0.13). Discovery prefers it over
   `extra_model_paths.yaml`, which is not yet written on a machine's first install; staging is per machine so two
   installs cannot collide on one half-file; the disk gate measures the library rather than the volume. On Verda:

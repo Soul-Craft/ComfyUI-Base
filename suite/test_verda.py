@@ -642,7 +642,11 @@ def test_unit_verda_ensure_mounts_the_shared_library_and_records_it_in_host_env_
         prov2.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=logs2.append)
         assert calls2[-1].rstrip().endswith("--ensure")
         assert any("NFS endpoint is not in the API record" in l for l in logs2)
-        assert prov2.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\n"
+        # host.env still NAMES the library, because the volume IS attached to this machine and every verb that
+        # writes host.env must answer the same way. The base then says "recorded but is not a directory" and runs
+        # without it, which is louder than a line quietly missing: podctl install used to drop this line and
+        # silently un-configure a machine whose library was mounted.
+        assert prov2.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\nBASE_LIBRARY=/mnt/comfy-library\n"
     finally:
         fake2.close()
 
@@ -795,3 +799,47 @@ def test_unit_verda_the_library_is_listed_and_mounted_without_being_told_its_end
 
 def is_lib(rec):
     return str(rec.get("id")) == LIB_VOL
+
+
+def test_unit_verda_workspace_shared_makes_the_store_the_root_and_records_it(tmp_path, monkeypatch):
+    """2.5.0, the RunPod shape on a VM host: one network store holds the base, ComfyUI, the venv, the packages and
+    the models, so the machine is disposable and carries no data volume. The endpoint is the same one the library
+    uses, resolved the same way, so it is never typed twice; and BASE_VOLUME_SHARED is recorded because two things
+    follow from it, per-machine user/ and temp/ and a lock before an install."""
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance()], volumes=[_volume(OS_VOL, "comfy-base-os", True), _shared()])
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
+    calls = []
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: (calls.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr="READY\n"))[1])
+    monkeypatch.setattr(podctl, "_ssh_hostname", lambda: "comfy-base")
+    logs = []
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=logs.append, workspace_shared=True)
+        src = "nfs.fin-01.datacrunch.io:/comfy-library-abc"
+        assert calls[-1].rstrip().endswith("--ensure --library %s --workspace %s" % (src, src))
+        assert any("needs no data volume" in l for l in logs)
+        assert prov.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\nBASE_VOLUME_SHARED=1\n"
+    finally:
+        fake.close()
+
+    # no shared volume attached: refuse rather than mount /workspace from nothing and hang the boot for 600 s
+    fake2 = FakeVerda(instances=[_instance()], volumes=[_volume(OS_VOL, "comfy-base-os", True)])
+    try:
+        prov2 = _prov(podctl, fake2, tmp_path)
+        with pytest.raises(podctl.PodctlError) as ei:
+            prov2.ensure(INST_ID, pubkey=MAC_KEY, ssh_config=cfg, log=lambda s: None, workspace_shared=True)
+        assert "attach it" in str(ei.value)
+    finally:
+        fake2.close()
+
+
+def test_unit_verda_startup_script_can_mount_the_share_as_the_workspace():
+    s = STARTUP.read_bytes().decode("ascii")
+    for needle in ("--workspace", "WORKSPACE_SRC", "mount_workspace_share", "recall_workspace", "BASE_VOLUME_SHARED=1"):
+        assert needle in s, needle
+    # with a shared workspace there is NO data disk to find, so the 600 s hunt must be skipped entirely
+    assert 'if [ -n "$WORKSPACE_SRC" ]; then\n    mount_workspace_share' in s
+    # fstab is the only record of it, because host.env lives ON the share it would have to name
+    assert "recalled from fstab" in s

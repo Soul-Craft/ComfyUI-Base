@@ -29,6 +29,15 @@
 # BASE_VOLUME_KIND       2.2.0: mount (the default: the root must be a mountpoint on a pod) | dir (an owned box)
 # BASE_LISTEN            2.2.0: the address ComfyUI and JupyterLab bind. 0.0.0.0 on RunPod (its HTTP proxy needs it),
 #                        127.0.0.1 everywhere else (Verda has no cloud firewall; the driver's tunnel is the way in)
+# BASE_VOLUME_SHARED     2.5.0: 1 when BASE_VOLUME IS the shared store, which is the RunPod shape carried to a VM host:
+#                        one network volume holds the base, ComfyUI, the venv, the packages and the models, so the
+#                        machine is disposable and the volume is the asset. Read from the driver's state/host.env,
+#                        else detected from the root's own filesystem. Two things follow: ComfyUI's user/ and temp/
+#                        move to BASE_LOCAL_STATE, because saved workflows and scratch are per machine and two
+#                        servers writing one user/ tread on each other; and an install takes a lock, because two
+#                        machines writing one venv corrupts it. RUNNING takes no lock: running only reads, which is
+#                        what makes several GPUs on one store safe.
+# BASE_LOCAL_STATE       2.5.0: the per-machine root (default /var/lib/comfy-base-machine) for exactly those things.
 # BASE_LIBRARY           2.4.0: the SHARED library's mount point, or empty. One store several machines mount at once
 #                        (on Verda an NVMe_Shared volume over NFS, mounted by hosts/verda/startup.sh): the model
 #                        library is <it>/models, and ComfyUI's output/ and input/ are <it>/output and <it>/input, so a
@@ -48,6 +57,10 @@ BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk �
 BASE_FAKE_PID1_ENV="${BASE_FAKE_PID1_ENV:-}"       # fake: the file that stands in for /proc/1/environ
 BASE_FAKE_NO_VOLUME="${BASE_FAKE_NO_VOLUME:-0}"    # fake: /workspace is not a mounted network volume
 BASE_LIBRARY="${BASE_LIBRARY:-}"                   # 2.4.0: the shared library's mount point (empty: no shared library)
+BASE_VOLUME_SHARED="${BASE_VOLUME_SHARED:-0}"      # 2.5.0: 1 when BASE_VOLUME itself is network storage SEVERAL machines mount
+BASE_LOCAL_STATE="${BASE_LOCAL_STATE:-/var/lib/comfy-base-machine}"   # 2.5.0: the per-machine root, never on the shared volume
+BASE_LOCK_WAIT="${BASE_LOCK_WAIT:-1800}"           # 2.5.0: seconds to wait for another machine's install lock (0: do not wait)
+BASE_LOCK_STALE="${BASE_LOCK_STALE:-7200}"         # 2.5.0: an install lock older than this was left by a dead run
 BASE_NO_NET="${BASE_NO_NET:-0}"
 BASE_YES="${BASE_YES:-0}"
 BASE_RESTART="${BASE_RESTART:-0}"
@@ -201,6 +214,7 @@ _base_on_err(){ # ERR trap: set -e is about to end the run — say where, and wh
 }
 _base_on_exit(){
   local rc=$? d
+  _base_install_unlock                               # 2.5.0: never leave a shared volume locked by a dead run
   for d in ${BASE_TMPDIRS[@]+"${BASE_TMPDIRS[@]}"}; do if [ -n "$d" ] && [ -d "$d" ]; then rm -rf "$d"; fi; done
   if [ "$rc" -ne 0 ] && [ "$BASE_SUMMARY_DONE" = "0" ] && [ -n "$BASE_LOG" ]; then echo "  aborted (exit $rc) — log: $BASE_LOG"; fi
   [ "$BASE_LOGGING" = "1" ] && sleep 0.3   # let tee flush the last lines
@@ -239,8 +253,62 @@ _base_host_resolve(){ # BASE_HOST from the evidence at hand, then the two settin
     echo "  !! BASE_LIBRARY=$BASE_LIBRARY is recorded but is not a directory on this machine, continuing WITHOUT the shared library" >&2
     BASE_LIBRARY=""
   fi
-  export BASE_HOST BASE_VOLUME BASE_VOLUME_KIND BASE_LISTEN BASE_LIBRARY
+  # 2.5.0: is this root shared with other machines? The driver records it; a network device says so on its own.
+  if [ "$BASE_VOLUME_SHARED" != "1" ]; then
+    local sf="$BASE_VOLUME/comfy-base/state/host.env"
+    [ -n "$BASE_FAKE_ROOT" ] && sf="$BASE_FAKE_ROOT/comfy-base/state/host.env"
+    if [ -f "$sf" ] && [ "$(sed -n 's/^BASE_VOLUME_SHARED=//p' "$sf" | head -1)" = "1" ]; then BASE_VOLUME_SHARED=1; fi
+  fi
+  if [ "$BASE_VOLUME_SHARED" != "1" ] && [ -z "$BASE_FAKE_ROOT" ] && [ -d "$BASE_VOLUME" ]; then
+    case "$(df -Pk "$BASE_VOLUME" 2>/dev/null | awk 'NR==2{print $1}')" in
+      *:/*) BASE_VOLUME_SHARED=1 ;;                 # an nfs export as the root is a shared root by definition
+    esac
+  fi
+  export BASE_HOST BASE_VOLUME BASE_VOLUME_KIND BASE_LISTEN BASE_LIBRARY BASE_VOLUME_SHARED BASE_LOCAL_STATE
 }
+
+# ---------------------------------------------------------------- the install lock (2.5.0), for a SHARED volume only
+# Two machines installing into one venv is how a shared workspace breaks: pip and uv both write it in place and
+# neither expects a second writer. mkdir is the lock rather than flock: it is atomic over NFSv4 and needs no file
+# descriptor held across the run. A lock whose owner died is honoured for BASE_LOCK_STALE and then broken with it
+# named, and BASE_LOCK_WAIT bounds the wait (0 refuses at once) so no run can hang on another machine forever.
+BASE_INSTALL_LOCK=""
+_base_install_lock(){
+  [ "$BASE_VOLUME_SHARED" = "1" ] || return 0
+  [ "$BASE_DRY" = "1" ] && return 0                  # --check writes nothing, so it needs nothing
+  local d="$BASE_VOLUME/comfy-base/state/install.lock" waited=0 age now since who
+  mkdir -p "$(dirname "$d")" 2>/dev/null || true
+  while :; do
+    if mkdir "$d" 2>/dev/null; then
+      printf 'host=%s
+pid=%s
+since=%s
+' "$(hostname 2>/dev/null)" "$$" "$(date -u +%s)" > "$d/owner" 2>/dev/null || true
+      BASE_INSTALL_LOCK="$d"
+      return 0
+    fi
+    who="$(sed -n 's/^host=//p' "$d/owner" 2>/dev/null | head -1)"
+    now="$(date -u +%s)"; since="$(sed -n 's/^since=//p' "$d/owner" 2>/dev/null | head -1)"
+    age=$(( now - ${since:-$now} ))
+    if [ "$age" -gt "$BASE_LOCK_STALE" ]; then
+      warn "breaking a ${age}s-old install lock left by ${who:-an unknown machine} on the shared volume"
+      rm -rf "$d" 2>/dev/null; continue
+    fi
+    if [ "$BASE_LOCK_WAIT" -le 0 ]; then
+      err "${who:-another machine} is installing on this shared volume (lock: $d); not waiting (BASE_LOCK_WAIT=0)"
+      BASE_FAILED+=("install lock held by ${who:-another machine}")
+      return 1
+    fi
+    if [ "$waited" = "0" ]; then note "${who:-another machine} is installing on this shared volume: waiting (up to $((BASE_LOCK_WAIT / 60)) min)"; fi
+    sleep 5; waited=$((waited + 5))
+    if [ "$waited" -ge "$BASE_LOCK_WAIT" ]; then
+      err "gave up after ${waited}s waiting for ${who:-another machine} to finish installing (lock: $d)"
+      BASE_FAILED+=("install lock held by ${who:-another machine} for over ${waited}s")
+      return 1
+    fi
+  done
+}
+_base_install_unlock(){ [ -n "$BASE_INSTALL_LOCK" ] && rm -rf "$BASE_INSTALL_LOCK" 2>/dev/null; BASE_INSTALL_LOCK=""; return 0; }
 
 # ---------------------------------------------------------------- environment for uv / pip / the Hub
 base_env_setup(){

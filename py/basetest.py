@@ -21,7 +21,12 @@ MODEL_EXTS = (".safetensors", ".pt", ".pth", ".gguf", ".ckpt", ".bin", ".onnx")
 _LEAK = {"HF_TOKEN", "HF_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_API_KEY", "COMFY_DIR", "BASE_NODE_SRC", "BASE_SERVER", "BASE_SEARCH_ROOTS", "BASE_YES", "BASE_RESTART", "BASE_DRY",
          "BASE_FAKE_ROOT", "BASE_NO_NET", "BASE_FAKE_FREE_GB", "BASE_FAKE_DL", "BASE_PERSIST_ROOT_FORCE", "BASE_LATEST", "BASE_DECLARE_ONLY",
          "BASE_FAKE_PID1_ENV", "BASE_FAKE_IMAGE_ROOT",
-         "BASE_HOST", "BASE_VOLUME", "BASE_VOLUME_KIND", "BASE_LISTEN", "PODCTL_PROVIDER", "PODCTL_HOST"}
+         "BASE_HOST", "BASE_VOLUME", "BASE_VOLUME_KIND", "BASE_LISTEN", "BASE_LIBRARY", "PODCTL_PROVIDER", "PODCTL_HOST",
+         # the base DERIVES these from BASE_VOLUME with ${X:-default}, so an ambient value wins over the test's
+         # volume and the test then measures the machine rather than what it set up. They only leak on a machine,
+         # where a previous base run exported them, which is why this passed on every Mac and failed on the first
+         # live install (2.4.0).
+         "UV_CACHE_DIR", "PIP_CACHE_DIR", "HF_HOME", "HF_XET_CACHE"}
 
 
 def code_only(text):

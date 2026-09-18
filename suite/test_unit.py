@@ -2232,3 +2232,36 @@ def test_unit_the_shared_library_link_replaces_comfyui_placeholders_but_never_re
     r3 = _bash(f'COMFY="{comfy3}"; BASE_LIBRARY=""; EXTRA_YAML="{comfy3}/extra_model_paths.yaml"; _base_library_link')
     assert r3.returncode == 0 and not (comfy3 / "models").is_symlink()
     assert not (comfy3 / "extra_model_paths.yaml").exists()
+
+
+def test_unit_the_install_lock_serialises_installs_only_on_a_shared_volume(tmp_path):
+    """2.5.0: with the whole root on a store several machines mount, two installs writing one venv corrupts it,
+    because pip and uv write in place and neither expects a second writer. RUNNING is never locked: running only
+    reads, which is what makes several GPUs on one store safe. mkdir is the lock because it is atomic over NFSv4."""
+    vol = tmp_path / "vol"; (vol / "comfy-base" / "state").mkdir(parents=True)
+    lock = vol / "comfy-base" / "state" / "install.lock"
+    env = {"BASE_VOLUME": str(vol), "BASE_HOST": "local", "BASE_VOLUME_SHARED": "1", "BASE_DRY": "0"}
+
+    # a real run installs the traps first (base_main does), and the EXIT trap is what releases the lock, so a
+    # finished run never blocks the next machine. Without the traps the lock would outlive the process, which is
+    # why this asserts the release rather than assuming it.
+    r = _bash('_base_install_traps; _base_install_lock && echo GOT', env=env)
+    assert "GOT" in r.stdout, r.stdout + r.stderr
+    assert not lock.exists(), "the exit trap must release the lock: " + r.stdout
+
+    # a lock a LIVE run holds is honoured
+    lock.mkdir()
+    (lock / "owner").write_text("host=other-machine\npid=1\nsince=%d\n" % int(__import__("time").time()))
+    r = _bash('_base_install_lock && echo GOT || echo BLOCKED', env={**env, "BASE_LOCK_WAIT": "10"})
+    assert "GOT" not in r.stdout, "a live lock must not be taken: " + r.stdout
+    assert "other-machine is installing" in r.stdout, r.stdout
+
+    # a lock whose owner died is honoured for two hours, then broken WITH THE OWNER NAMED
+    (lock / "owner").write_text("host=dead-machine\npid=1\nsince=%d\n" % (int(__import__("time").time()) - 10800))
+    r = _bash('_base_install_lock && echo GOT', env=env)
+    assert "GOT" in r.stdout and "breaking" in r.stdout and "dead-machine" in r.stdout, r.stdout
+
+    # and none of it happens when the root is the machine's own disk
+    lock.mkdir(exist_ok=True)
+    r = _bash('_base_install_lock && echo GOT', env={**env, "BASE_VOLUME_SHARED": "0"})
+    assert "GOT" in r.stdout and "installing" not in r.stdout, r.stdout

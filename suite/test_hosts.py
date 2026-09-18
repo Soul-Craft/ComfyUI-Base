@@ -15,7 +15,12 @@ sys.path.insert(0, str(BASE / "py"))
 
 
 def _bash(snippet, env=None, cwd=None):
-    e = dict(os.environ); e.update(env or {})
+    # scrub what a machine's environment would otherwise lend the test: this helper built a raw os.environ, so an
+    # ambient UV_CACHE_DIR from a previous base run made test_unit_base_volume_moves_the_home_and_the_caches fail
+    # on every live install while passing on every Mac.
+    from basetest import _LEAK
+    e = {k: v for k, v in os.environ.items() if k not in _LEAK}
+    e.update(env or {})
     return subprocess.run(["bash", "-c", 'source "%s/base.sh"; %s' % (BASE, snippet)], capture_output=True, text=True, env=e, cwd=cwd)
 
 

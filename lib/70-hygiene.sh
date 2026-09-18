@@ -179,6 +179,14 @@ base_hygiene(){
     _base_args_ensure --input-directory "$BASE_LIBRARY/input"
     if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LIBRARY/output" "$BASE_LIBRARY/input" 2>/dev/null || true; fi
   fi
+  # 2.5.0: with a SHARED workspace, ComfyUI's user/ and temp/ must NOT be shared. user/ holds the saved workflows
+  # the App view opens and the frontend's settings, which are per machine and per package; temp/ is scratch two
+  # servers would overwrite. Everything else on the root is meant to be shared, which is the point.
+  if [ "$BASE_VOLUME_SHARED" = "1" ]; then
+    _base_args_ensure --user-directory "$BASE_LOCAL_STATE/user"
+    _base_args_ensure --temp-directory "$BASE_LOCAL_STATE/temp"
+    if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LOCAL_STATE/user" "$BASE_LOCAL_STATE/temp" 2>/dev/null || true; fi
+  fi
   _base_library_link
   for row in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do
     name="${row%% *}"; val=""; [ "$row" != "$name" ] && val="${row#* }"

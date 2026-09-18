@@ -118,6 +118,33 @@ more later. NVMe_Shared costs the same per GiB as plain NVMe.
   whatever their status, because `_detached()` would hide the library exactly while it is in use.
 - **Price** confirmed at `monthly_price: 0.2` per GB, the same as plain NVMe.
 
+### The shared store as the WHOLE workspace (2.5.0)
+
+The section above shares the models. This shares everything, and it is the RunPod shape: on RunPod a pod is a
+container with no disk of its own, one network volume mounts at `/workspace`, and it holds `comfy-base/`, ComfyUI,
+the venv, `packages/` and the models. The pod is disposable; the volume is the asset. A Verda instance is a virtual
+machine and must boot from a block device, so it keeps one OS volume, but nothing above the OS has to live there.
+
+    podctl ensure <id> --workspace-shared
+
+That mounts the attached shared volume at `/workspace` instead of hunting for a data disk, so **the machine needs
+no data volume at all**. The endpoint is the same `target` the library uses, resolved the same way, so it is never
+typed twice; with no shared volume attached the command refuses rather than leaving `startup.sh` to wait 600 s for
+a disk that will never appear. `fstab` is the only record of it, because `host.env` lives on the share it names.
+
+What the base does differently once `BASE_VOLUME_SHARED=1` is recorded:
+
+- **`user/` and `temp/` move off the store**, to `BASE_LOCAL_STATE` (`/var/lib/comfy-base-machine`). `user/` holds
+  the saved workflows the App view opens and the frontend's settings, which are per machine; `temp/` is scratch.
+  Everything else on the root is meant to be shared, which is the whole point.
+- **An install takes a lock** (`state/install.lock`, a directory, because mkdir is atomic over NFSv4). Two machines
+  writing one venv corrupts it: pip and uv write in place and neither expects a second writer. A lock whose owner
+  died is honoured for two hours and then broken, with the machine that left it named. **Running takes no lock**,
+  because running only reads, and that is what makes several GPUs on one store safe.
+
+So three workflows on three GPUs share one store: one base, one ComfyUI, one venv, one model library, and each
+workflow adds its own packs and rows to it the first time it is installed.
+
 ## 4. The first deploy
 
 Either way, the sequence ends with `ensure` and `install`.

@@ -1037,7 +1037,7 @@ def cmd_image(prov, args):
 
 def cmd_ensure(prov, args):
     print(prov.ensure(args.pod, pubkey=mac_public_key(args.pubkey), ssh_config=args.ssh_config, entry=getattr(args, "entry", None),
-                      library=getattr(args, "library", None)))
+                      library=getattr(args, "library", None), workspace_shared=getattr(args, "workspace_shared", False)))
     print(write_host_env(prov))
     line = prov.record_volume(prov.pod(args.pod))
     if line:
@@ -1073,6 +1073,9 @@ def build_parser():
     p = sub.add_parser("image", help="the image's entrypoint/cmd and how ensure would wrap them"); p.add_argument("pod")
     p = sub.add_parser("ensure", help="TCP 22, PUBLIC_KEY, the base's boot as the start command, Host runpod"); p.add_argument("pod")
     p.add_argument("--entry", help="the image's own start command when its config cannot be read, e.g. '/start_script.sh'")
+    p.add_argument("--workspace-shared", action="store_true", dest="workspace_shared",
+                   help="Verda: make the attached SHARED volume BE /workspace, so the base, ComfyUI, the venv, the packages and the "
+                        "models all live on one store and this machine needs no data volume (the RunPod shape)")
     p.add_argument("--library", metavar="HOST:/EXPORT", help="Verda: the NFS endpoint of the SHARED library to mount at /mnt/comfy-library "
                                                             "(the shared volume must already be attached to the machine; env VERDA_LIBRARY does the same)")
     p = sub.add_parser("ssh-config", help="write the Host runpod block from the pod's public ip and port 22"); p.add_argument("pod")

@@ -305,13 +305,14 @@ def startup_script_text():
 REMOTE_EOF = "COMFY_BASE_STARTUP_EOF"
 
 
-def remote_ensure_cmd(text, library=""):
+def remote_ensure_cmd(text, library="", workspace=""):
     """One ssh command: land startup.sh on the machine through a quoted heredoc and run its --ensure pass.
     With a library, the endpoint is passed so the script writes the fstab line and mounts it; without one the
     script recalls whatever endpoint it recorded last time, so a plain `ensure` never drops a machine's library."""
     if REMOTE_EOF in text:
         raise PodctlError("startup.sh contains the heredoc delimiter %s" % REMOTE_EOF)
     tail = " --ensure" + ((" --library " + shlex.quote(library)) if library else "")
+    tail += (" --workspace " + shlex.quote(workspace)) if workspace else ""
     return "cat > %s <<'%s'\n%s\n%s\nchmod 700 %s && bash %s%s" % (REMOTE_STARTUP, REMOTE_EOF, text.rstrip("\n"), REMOTE_EOF,
                                                                   REMOTE_STARTUP, REMOTE_STARTUP, tail)
 
@@ -334,7 +335,9 @@ class VerdaProvider(Provider):
         self.sleep = time.sleep
         self.library_mount = LIBRARY_MOUNT
         self._library_src = ""      # set by ensure(): the endpoint the machine was told to mount
-        self._library_on = False    # whether the machine ensure() last addressed has a shared library
+        self._library_on = False    # ensure() resolved a library for the machine it addressed
+        self._workspace_shared = False   # 2.5.0: /workspace IS the shared store on the machine ensure() addressed
+        self._last_pod = ""         # the machine this run addressed, for host_env()
 
     # -- small plumbing
     def banner(self, host, port=SSH_PORT):
@@ -470,6 +473,10 @@ class VerdaProvider(Provider):
         return out
 
     def pod(self, ident):
+        # remember which machine this run is addressing, so host_env() can answer for it. MEASURED: without this,
+        # `podctl install` rewrote state/host.env with no BASE_LIBRARY line and silently un-configured the library
+        # on a machine that had it mounted, because write_host_env() runs on a provider that never called ensure().
+        self._last_pod = str(ident)
         inst = self._instance(ident)
         if inst is not None:
             return inst
@@ -653,7 +660,7 @@ class VerdaProvider(Provider):
         inst, host = self._up_and_configured(pod_id, ssh_config)
         return "restarted %s: ssh answers on %s:%d (Host %s updated)" % (pod_id, host, SSH_PORT, _c().SSH_ALIAS)
 
-    def ensure(self, pod_id, pubkey, ssh_config, log=print, library=None, **kw):
+    def ensure(self, pod_id, pubkey, ssh_config, log=print, library=None, workspace_shared=False, **kw):
         """Make the machine reachable and hand its boot to the base. Idempotent:
         (1) the Mac key is registered; (2) hosts/verda/startup.sh is registered as comfy-base-startup so the console's
         next fresh deploy can pick it; (3) running + ip + banner; (4) the Host block; (5) startup.sh --ensure over ssh,
@@ -692,7 +699,18 @@ class VerdaProvider(Provider):
                 "PUT /volumes action attach with instance_ids) first" % (src, pod_id))
             src = ""
             self._library_on = False
-        r = _c().ssh_run(remote_ensure_cmd(startup_script_text(), library=src), timeout=900)
+        # 2.5.0: --workspace makes the shared volume BE /workspace, the RunPod shape on a VM host: the base,
+        # ComfyUI, the venv, the packages and the models all live on one store and the machine carries no data
+        # volume. The endpoint is the same one, so it is resolved the same way and never typed twice.
+        ws = ""
+        if workspace_shared:
+            if not src:
+                raise PodctlError("--workspace needs the shared volume attached to %s with a readable NFS endpoint; "
+                                  "attach it (PUT /volumes action attach) and run ensure again, or pass --library host:/export" % pod_id)
+            ws = src
+            log("ensure: /workspace will BE the shared store (%s): this machine needs no data volume" % ws)
+        self._workspace_shared = bool(ws)
+        r = _c().ssh_run(remote_ensure_cmd(startup_script_text(), library=src, workspace=ws), timeout=900)
         if r.returncode != 0:
             raise PodctlError("startup.sh --ensure failed on %s (rc %s): %s" % (pod_id, r.returncode, ((r.stderr or "") + (r.stdout or "")).strip()[-400:]))
         out_lines = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()      # startup.sh logs on stderr
@@ -745,7 +763,20 @@ class VerdaProvider(Provider):
         This override is not optional: podctl's write_host_env() runs right after ensure() and overwrites the file
         startup.sh just wrote, so a library recorded only by the script would be erased a second later."""
         text = Provider.host_env(self)
-        if self._library_on:
+        if self._workspace_shared:
+            # recorded on the shared store itself, which every machine reads: the base then keeps user/ and temp/
+            # per machine and takes a lock before it installs.
+            text += "BASE_VOLUME_SHARED=1\n"
+            return text
+        on = self._library_on
+        if not on and self._last_pod:
+            # every verb that writes host.env must answer the same way, not only ensure. The library is attached
+            # to the instance or it is not; that is a fact about the account, so read it rather than remember it.
+            try:
+                on = self._library_for(self._last_pod) is not None
+            except Exception:
+                on = False
+        if on:
             text += "BASE_LIBRARY=%s\n" % self.library_mount
         return text
 

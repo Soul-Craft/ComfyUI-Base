@@ -62,6 +62,8 @@ base_require_workflow(){ # the workflow beside the script must carry this script
 
 base_run(){ # the install, in the order the spec fixes; hooks run where a package declares them
   base_init
+  # 2.5.0: on a SHARED workspace only, one installer at a time. Nothing above this line writes to the volume.
+  if ! _base_install_lock; then base_summary; fi
   base_require_workflow
   base_tokens || true
   if [ "${#BASE_FAILED[@]}" -gt 0 ]; then err "a token was rejected — stopping before anything downloads"; base_summary; fi

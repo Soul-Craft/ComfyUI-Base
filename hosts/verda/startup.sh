@@ -41,11 +41,19 @@ LIB_MOUNT=/mnt/comfy-library
 LIB_OPTS=nconnect=16,nofail,_netdev
 MODE=first-boot
 LIBRARY="${COMFY_LIBRARY:-}"          # host:/export of the Verda shared filesystem, or empty for no library
+# 2.5.0: the shared filesystem AS the workspace, which is the RunPod shape carried over. On RunPod a pod is a
+# container with no disk of its own and one network volume at /workspace holding the base, ComfyUI, the venv, the
+# packages and the models, so the pod is disposable and the volume is the asset. A Verda VM must still boot from a
+# block device, but nothing above the OS has to live there: with this set, /workspace IS the share and the machine
+# carries no data volume at all.
+WORKSPACE_SRC="${COMFY_WORKSPACE:-}"  # host:/export to mount at /workspace instead of hunting for a data disk
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --ensure)  MODE=ensure ;;
     --library) LIBRARY="${2:-}"; shift ;;
     --library=*) LIBRARY="${1#--library=}" ;;
+    --workspace) WORKSPACE_SRC="${2:-}"; shift ;;
+    --workspace=*) WORKSPACE_SRC="${1#--workspace=}" ;;
     --no-library) LIBRARY=""; NO_LIBRARY=1 ;;
     *) ;;
   esac
@@ -155,8 +163,59 @@ find_data_disk() {
   done
 }
 
+mount_workspace_share() {
+  # /workspace from the shared filesystem: no data disk is looked for at all, and every machine that mounts the
+  # same export sees the same base, the same ComfyUI, the same venv and the same models.
+  local line src
+  DISK="$WORKSPACE_SRC"
+  case "$WORKSPACE_SRC" in
+    *:/*) ;;
+    *) log "workspace share '$WORKSPACE_SRC' is not host:/export, ignored"; WORKSPACE_SRC=""; return 1 ;;
+  esac
+  if ! command -v mount.nfs >/dev/null 2>&1; then
+    log "workspace share: no mount.nfs on this machine (nfs-common did not install)"
+    return 1
+  fi
+  mkdir -p "$MOUNT"
+  line="$WORKSPACE_SRC $MOUNT nfs defaults,$LIB_OPTS 0 0"
+  if grep -qxF "$line" /etc/fstab 2>/dev/null; then
+    log "workspace fstab line present"
+  else
+    if awk -v m="$MOUNT" '$1 !~ /^#/ && $2 == m { found = 1 } END { exit !found }' /etc/fstab 2>/dev/null; then
+      cp /etc/fstab /etc/fstab.comfy-base.bak
+      awk -v m="$MOUNT" '$1 !~ /^#/ && $2 == m { next } { print }' /etc/fstab.comfy-base.bak >/etc/fstab
+      log "replaced the old fstab line for $MOUNT (backup /etc/fstab.comfy-base.bak)"
+    fi
+    printf '%s\n' "$line" >>/etc/fstab
+    log "fstab: $line"
+  fi
+  systemctl daemon-reload 2>/dev/null
+  if findmnt -n "$MOUNT" >/dev/null 2>&1; then
+    src=$(findmnt -n -o SOURCE "$MOUNT")
+    [ "$src" = "$WORKSPACE_SRC" ] || log "WARNING $MOUNT is mounted from $src, not $WORKSPACE_SRC, left alone"
+    log "$MOUNT already mounted from $src"
+    return 0
+  fi
+  local tries=0
+  while [ "$tries" -lt 6 ]; do
+    mount "$MOUNT" >>"$LOG" 2>&1 && break
+    tries=$((tries + 1)); [ "$tries" = "1" ] && log "workspace not mounting yet, retrying for 30s"
+    sleep 5
+  done
+  if findmnt -n "$MOUNT" >/dev/null 2>&1; then
+    log "$MOUNT mounted from $WORKSPACE_SRC (shared)"
+    return 0
+  fi
+  log "$MOUNT is NOT mounted from $WORKSPACE_SRC (see $LOG)"
+  return 1
+}
+
 mount_data_disk() {
   local dev uuid fs line
+  if [ -n "$WORKSPACE_SRC" ]; then
+    mount_workspace_share
+    return $?
+  fi
   if findmnt -n "$MOUNT" >/dev/null 2>&1; then
     dev=$(findmnt -n -o SOURCE "$MOUNT")
     log "$MOUNT already mounted from $dev"
@@ -217,6 +276,15 @@ recall_library() {
   [ -f "$f" ] || return 0
   LIBRARY="$(sed -n 's/^COMFY_LIBRARY_SRC=//p' "$f" | head -1)"
   [ -n "$LIBRARY" ] && log "library $LIBRARY recalled from host.env"
+  return 0
+}
+
+recall_workspace() {
+  # the workspace share cannot be recalled from host.env, because host.env LIVES on it. fstab is the record: a
+  # machine that mounted it once has the line, and `--ensure` with no argument must not undo that.
+  [ -z "$WORKSPACE_SRC" ] || return 0
+  WORKSPACE_SRC="$(awk -v m="$MOUNT" '$1 !~ /^#/ && $2 == m && $3 == "nfs" { print $1; exit }' /etc/fstab 2>/dev/null)"
+  [ -n "$WORKSPACE_SRC" ] && log "workspace share $WORKSPACE_SRC recalled from fstab"
   return 0
 }
 
@@ -341,6 +409,10 @@ write_host_env() {
     return 1
   fi
   want=$(printf 'BASE_HOST=verda\nBASE_VOLUME=/workspace\n')
+  # a shared workspace is recorded so the base knows this root is network storage several machines write to
+  if [ -n "$WORKSPACE_SRC" ]; then
+    want=$(printf '%s\nBASE_VOLUME_SHARED=1\n' "$want")
+  fi
   # BASE_LIBRARY is the mount point the base reads; COMFY_LIBRARY_SRC is the endpoint this script remounts from
   if [ -n "$LIBRARY" ]; then
     want=$(printf '%s\nBASE_LIBRARY=%s\nCOMFY_LIBRARY_SRC=%s\n' "$want" "$LIB_MOUNT" "$LIBRARY")
@@ -366,6 +438,7 @@ RC=0
 
 log "start ($(hostname), kernel $(uname -r))"
 ensure_packages || RC=1
+recall_workspace
 mount_data_disk || RC=1
 recall_library
 mount_library || RC=1
