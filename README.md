@@ -80,6 +80,6 @@ pull request. You need `uv` on PATH.
 | RunPod | proven on live pods |
 | Verda | experimental: written from first-party docs and tested against a fake API server, not yet run on a live account |
 | Crusoe Cloud | interface only: every call mapped in `hosts/crusoe/provider.py`, nothing implemented yet |
-| an owned NVIDIA box | a recipe (`hosts/local/`), not yet run end to end |
+| an owned NVIDIA box | a recipe with a quickstart (`hosts/local/README.md`, RTX Pro 6000 / Blackwell), not yet reported end to end |
 
 The Verda and Crusoe providers, and a report from an owned box, are the open items; issues and pull requests welcome.

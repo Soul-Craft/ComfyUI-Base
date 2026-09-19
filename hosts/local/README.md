@@ -3,6 +3,12 @@
 No API, no provider: a machine you own, on your LAN, with a directory of your choosing as the volume root. This folder
 is a recipe and one script. Nothing about the driver applies; you are already on the box.
 
+## Status
+
+Still a recipe. The sequence below is the same code every host runs (the RunPod path is proven on live pods), but
+nobody has reported an owned box end to end, so nothing here claims to be tested on one. If you run it, the
+host-report issue template exists for exactly that, and a report either way moves the row in the top-level README.
+
 ## What the box needs
 
 - Ubuntu 22.04 or 24.04 on x86_64.
@@ -10,6 +16,29 @@ is a recipe and one script. Nothing about the driver applies; you are already on
   checks, and refuses an older one before downloading anything.
 - `uv` on PATH (`curl -LsSf https://astral.sh/uv/install.sh | sh`, then a new shell).
 - Disk: about 40 GB for the base, plus each package's models (a large image or video package is 60 to 130 GB).
+
+## An RTX Pro 6000, specifically
+
+The RTX Pro 6000 is Blackwell: compute capability 12.0, which the base reads from `nvidia-smi --query-gpu=compute_cap`
+and turns into `sm_120` (`lib/10-discover.sh`). Everything else on this host follows from that one number, and it is
+worth knowing the chain before something in it refuses to move:
+
+| | what happens | where |
+|---|---|---|
+| the architecture | `12.0` → `sm_120`, derived at runtime, never a constant | `lib/10-discover.sh` |
+| the wheels | CUDA 13 wheels are the only stable `sm_120` wheels, so torch comes from the `cu130` index | `py/torch_pick.py` |
+| the driver | CUDA 13 needs driver **>= 580**, so the gate refuses anything older *before downloading anything* | `_base_driver_gate` |
+| the version | the newest `+cu130` wheel for the interpreter's own `cpXY` tag; torch is not pinned to a number | `py/torch_pick.py` |
+| SageAttention | no wheel on PyPI carries `sm_100`/`sm_120` kernels, so it is built from source for this GPU's sm | `base_build_sageattention` |
+
+Two practical consequences. A driver below 580 stops the run at the gate with nothing downloaded and the venv
+untouched. That is the gate working, not a failure to work around: install a newer driver and run it again. And the
+SageAttention build wants the GPU visible, because it reads the compute capability to build for it; if you are
+building somewhere the card is not present, pass `SAGE_ARCHS="12.0"` or a prebuilt `SAGE_WHEEL=<url-or-path>`.
+
+The base prints what it found before it commits to anything. `bash base.sh status` on the box shows the driver, the
+derived sm, the tree it discovered and the venv's torch, which is the fastest way to tell whether the chain above
+lines up on your machine.
 
 ## The one command
 
@@ -32,6 +61,26 @@ The knobs it exports, and what the base does differently on this host:
 | `BASE_VOLUME` | `<dir>` | the base installs to `<dir>/comfy-base`, the packages to `<dir>/packages` |
 | `BASE_VOLUME_KIND` | `dir` | no volume mount check: a plain directory is fine, and `df` on it is the truth |
 | `BASE_LISTEN` | `127.0.0.1` | ComfyUI and JupyterLab bind loopback only; nothing on the LAN can reach them |
+
+## Driving it from an agent
+
+`BASE_MCP` defaults to 1, so the install puts `comfy-mcp` in the venv here too. There is no pod and no ssh alias to
+point at, so the client just runs it locally against the box's own ComfyUI:
+
+```json
+{
+  "mcpServers": {
+    "comfy": {
+      "command": "<volume dir>/ComfyUI/.venv-cu130/bin/comfy-mcp",
+      "env": { "COMFY_NO_TELEMETRY": "1", "DO_NOT_TRACK": "1" }
+    }
+  }
+}
+```
+
+With ComfyUI on its default `127.0.0.1:8188` nothing more is needed; on another port, add
+`"COMFY_LOCAL_URL": "http://127.0.0.1:<port>"`. From a laptop, forward 8188 as below and use the `--over tunnel`
+shape instead. Handbook §9.1 has the transports and why the telemetry switches are there.
 
 ## Reaching ComfyUI
 

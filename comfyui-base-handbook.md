@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.7.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.8.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -443,6 +443,15 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.8.0: the owned-box recipe says what a Blackwell card actually needs. `hosts/local/README.md` now sets out the
+  chain the whole host hangs on — compute capability 12.0 becomes `sm_120`, `sm_120` means the CUDA 13 wheels are
+  the only stable ones, CUDA 13 means driver >= 580, and torch is therefore the newest `+cu130` wheel for the
+  interpreter's tag rather than a pinned number — with the file each link lives in, so a refusal can be read
+  instead of guessed at. It also says why SageAttention is built from source here (no PyPI wheel carries
+  `sm_100`/`sm_120` kernels) and what to pass when the card is not visible at build time. The MCP shape for a box
+  with no pod and no ssh alias is written out, since 2.7.0's `podctl mcp` has nothing to point at locally. The row
+  stays honest: still a recipe, and the host-report template is there for the first person to run it end to end.
 
 - 2.7.0: the machine is drivable by an agent. `lib/45-mcp.sh` installs `comfy-cli` and `comfy-mcp` into the
   run's venv and binds comfy-cli to the discovered tree; `podctl mcp <machine>` writes the `.mcp.json`, over
