@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.12.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.13.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,14 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.13: a `models/` symlink left pointing outside the volume is repointed at it. `_base_library_link` wrote
+  `$COMFY/models -> $BASE_LIBRARY/models` when a machine had a separate library mounted; that symlink lives ON THE
+  STORE, so every later machine inherits it, and since 2.5.2 `BASE_LIBRARY` is correctly ignored when the whole
+  root IS the store, which means the function that created it returns at its first line and can never repair it.
+  A second mount of the same store hid this until the release that stopped making one. MEASURED 2026-09-19 on a
+  fresh boot: the link dangled, `df` on it failed, the disk gate read 0.00 GB free on a store with 272 GB free and
+  refused every install, and ComfyUI's own models directory did not resolve. Repaired in `base_discover`, before
+  `M` is chosen, rather than in hygiene, because hygiene runs after the model step this breaks.
 - 2.5.12: the deletion is staged and reversible. Every guard before it is an INFERENCE about identity, and 2.5.11
   fixed one that was wrong only after it had offered 63.52 GB of live models; an inference can be wrong again in a
   shape nobody has met, and the consequence is a model that exists nowhere while the ledger still calls it

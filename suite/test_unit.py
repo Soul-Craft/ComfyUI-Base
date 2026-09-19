@@ -509,6 +509,40 @@ def test_unit_prune_offers_only_unclaimed_duplicates_and_needs_the_prompt(tmp_pa
     assert not dup.exists() and not sup.exists() and other.exists() and (dest / "a.safetensors").exists(), r.stdout + r.stderr
 
 
+def test_unit_a_models_symlink_pointing_outside_the_store_is_repointed(tmp_path):
+    """MEASURED 2026-09-19 on a fresh boot: `/workspace/ComfyUI/models -> /mnt/comfy-library/models` with the
+    target absent, so `df` failed, the disk gate read 0.00 GB free on a store with 272 GB free, and every install
+    refused. ComfyUI's own models directory did not resolve either.
+
+    `_base_library_link` wrote that symlink when a machine had a separate library mounted, it lives ON THE STORE
+    so every later machine inherits it, and since 2.5.2 BASE_LIBRARY is correctly ignored under a shared root,
+    which means the function that created it returns at its first line and can never repair it. A second mount of
+    the same store hid the problem until the release that stopped making one."""
+    c = _pod(tmp_path)
+    (c / "models").rmdir() if (c / "models").is_dir() and not any((c / "models").iterdir()) else None
+    import os
+    import shutil
+    if (c / "models").exists() and not (c / "models").is_symlink():
+        shutil.rmtree(c / "models")
+    # the real shape: a target OUTSIDE the volume, left by the 2.4.0 library mount that no longer exists
+    os.symlink("/mnt/comfy-library/models", str(c / "models"))
+    assert (c / "models").is_symlink() and not (c / "models").exists(), "the fixture must dangle"
+
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path),
+           "BASE_VOLUME_SHARED": "1"}
+    r = _bash('base_env_setup; base_discover quiet; echo M=$M', env=env)
+    assert (c / "models").is_symlink(), "it must stay a symlink, not become a directory"
+    assert os.readlink(str(c / "models")).endswith("/models"), r.stdout + r.stderr
+    assert (c / "models").exists(), "the repointed models/ must resolve: " + r.stdout + r.stderr
+    assert "repointed" in r.stdout or "repointed" in r.stderr, r.stdout + r.stderr
+
+    # a symlink ALREADY inside the store is left exactly alone
+    before = os.readlink(str(c / "models"))
+    r = _bash('base_env_setup; base_discover quiet', env=env)
+    assert os.readlink(str(c / "models")) == before, "an already-correct link must not be rewritten"
+    assert "repointed" not in r.stdout, "it must not report a change it did not make: " + r.stdout
+
+
 def test_unit_prune_never_offers_one_file_reached_by_two_paths(tmp_path):
     """MEASURED on a live three-machine store, 2026-09-19: the sweep offered 63.52 GB of LIVE models for
     deletion (Krea 2 RAW, Turbo, the text encoder, the VAE and an adapter). The store was mounted at two

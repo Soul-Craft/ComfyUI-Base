@@ -141,6 +141,39 @@ base_discover(){ # base_discover [quiet] → 3 when the pod has no network volum
   # BASE_LIBRARY wins over the yaml on purpose: it is true before the yaml exists, on the very first install of
   # a fresh machine, which is exactly when a download to the wrong place would cost a second copy of 125 GB.
   EXTRA_YAML="$COMFY/extra_model_paths.yaml"
+  # 2.5.13: a models/ symlink left pointing OUTSIDE the volume, on a root that is now the whole store.
+  #
+  # `_base_library_link` (70-hygiene.sh) made `$COMFY/models` a symlink to `$BASE_LIBRARY/models` back when a
+  # machine had a separate library mounted at /mnt/comfy-library. That symlink lives ON THE STORE, so it outlives
+  # the machine that made it and every machine that mounts the store inherits it. Since 2.5.2 `BASE_LIBRARY` is
+  # correctly ignored when the whole root IS the store, which means the function that created the link now returns
+  # at its first line and can never repair it. While the store happened to be mounted twice the link still
+  # resolved and nobody saw it; the moment that second mount stopped being made, it dangled.
+  #
+  # MEASURED 2026-09-19 on a fresh boot: `/workspace/ComfyUI/models -> /mnt/comfy-library/models`, target absent,
+  # `df` on it fails, and the disk gate therefore reported 0.00 GB free on a store with 272 GB free and refused
+  # every install. ComfyUI's own models directory did not resolve at all. Repaired here rather than in hygiene
+  # because hygiene runs AFTER the model step, which is the step this breaks.
+  if [ "$BASE_VOLUME_SHARED" = "1" ] && [ -L "$COMFY/models" ]; then
+    local _ml_t _ml_vol
+    _ml_t="$(readlink "$COMFY/models")"
+    _ml_vol="${BASE_FAKE_ROOT:-$BASE_VOLUME}"        # the suite runs a whole pod under a temp root
+    case "$_ml_t" in
+      "$_ml_vol"/*) : ;;                             # already inside the store: leave it exactly as it is
+      *)
+        if [ "$BASE_DRY" = "1" ]; then
+          would "repoint $COMFY/models ($_ml_t is outside $_ml_vol) at $_ml_vol/models"
+        else
+          mkdir -p "$_ml_vol/models" 2>/dev/null || true
+          if ln -sfn "$_ml_vol/models" "$COMFY/models" 2>/dev/null; then
+            BASE_CHANGED+=("models/ repointed from $_ml_t to $_ml_vol/models")
+            note "models/ pointed outside the store at $_ml_t — repointed at $_ml_vol/models"
+          else
+            warn "models/ points outside the store at $_ml_t and could not be repointed"
+          fi
+        fi ;;
+    esac
+  fi
   M="$COMFY/models"; M_SRC="default"
   if [ -n "$BASE_LIBRARY" ] && [ -d "$BASE_LIBRARY" ]; then
     M="$BASE_LIBRARY/models"; M_SRC="BASE_LIBRARY (shared)"
