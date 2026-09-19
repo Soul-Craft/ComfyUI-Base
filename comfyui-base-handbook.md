@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.9.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.10.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,12 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.10: the Mac gate works again. 2.5.7's `test_unit_each_workflow_gets_its_own_local_port` loaded
+  `_build/pod/podctl.py` with its own inline import instead of the `_load()` helper beside it, and that helper
+  is where the "not a repo checkout" skip lives. The shipped zip contains no `_build/`, so the test raised
+  FileNotFoundError in every run from the extracted zip, which is exactly the run `podctl install` performs
+  before it uploads anything. Every session's install stopped at the gate, for a reason that had nothing to do
+  with what it was installing. Found while installing a package 2026-09-19.
 - 2.5.9: a video package's last node no longer dies on the encoder it asked for. VideoHelperSuite prefers its
   own bundled imageio_ffmpeg binary, and that build carries NO nvenc encoders, so a format asking for
   `h264_nvenc` failed at `VHS_VideoCombine` with "Unknown encoder" AFTER the whole sample had been computed and

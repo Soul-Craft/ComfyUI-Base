@@ -1191,9 +1191,10 @@ def test_unit_each_workflow_gets_its_own_local_port():
     only whichever ssh ran first gets the port. The rest fail, and because ExitOnForwardFailure is set the whole
     session dies and takes its OWN forward with it, which is why a second product could not be opened at all even
     though its port was free. Measured on two live machines."""
-    import importlib.util, pathlib
-    spec = importlib.util.spec_from_file_location("podctl", pathlib.Path(__file__).resolve().parents[1] / "_build" / "pod" / "podctl.py")
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    # _load(), not a second inline import: it carries the skip for a run from the extracted zip, which ships no
+    # _build/. The inline copy had no guard, so this test raised FileNotFoundError in every zip run and failed
+    # the Mac gate that `podctl install` puts in front of every upload, for every package and every session.
+    m = _load()
 
     # a plain port is unchanged, both sides the same and still an int
     assert m.tunnel_port("8188") == 8188 and m.tunnel_port(8188) == 8188
