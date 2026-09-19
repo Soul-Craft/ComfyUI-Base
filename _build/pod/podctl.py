@@ -19,6 +19,8 @@ import argparse
 import json
 import os
 import pathlib
+import posixpath
+import shutil
 import re
 import zipfile
 import sys
@@ -1102,15 +1104,31 @@ def mcp_default_bin(volume_root=None):
     return "%s/ComfyUI/%s/bin/comfy-mcp" % (root, MCP_VENV_DIRNAME)
 
 
-def mcp_server(alias, mode="ssh", bin_path=None, port=None):
+def mcp_comfy_bin(mcp_bin):
+    """comfy-mcp is a wrapper: its lifecycle and discovery tools shell out to comfy-cli, and it finds that
+    through COMFY_BIN or PATH. An MCP client is usually launched by a GUI, whose PATH is not your shell's, so
+    PATH is the thing not to rely on. MEASURED against a live ComfyUI: without COMFY_BIN, server_info returns
+    "Error executing tool server_info"; with it, it answers. `comfy` sits beside `comfy-mcp` in the venv."""
+    return posixpath.join(posixpath.dirname(mcp_bin), "comfy") if mcp_bin else None
+
+
+def mcp_server(alias, mode="ssh", bin_path=None, port=None, comfy_bin=None):
     """One `mcpServers` entry, as a client reads it. Pure: the suite builds it without a pod."""
     if mode == "ssh":
-        remote = " ".join("%s=%s" % (k, v) for k, v in sorted(MCP_ENV.items())) + " exec " + (bin_path or mcp_default_bin())
+        mcp_bin = bin_path or mcp_default_bin()
+        env = dict(MCP_ENV); env["COMFY_BIN"] = comfy_bin or mcp_comfy_bin(mcp_bin)
+        # the environment goes in the REMOTE command: an MCP client's "env" is applied here, and would
+        # configure the local ssh process instead of the server on the machine
+        remote = " ".join("%s=%s" % (k, v) for k, v in sorted(env.items())) + " exec " + mcp_bin
         return {"command": "ssh",
                 "args": ["-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", alias, remote]}
     if mode == "tunnel":
         local = port if port is not None else tunnel_locals(alias)["comfy"]
         env = dict(MCP_ENV); env["COMFYUI_URL"] = "http://127.0.0.1:%d" % int(local)
+        # comfy-mcp runs HERE in this mode, so name this machine's comfy when it can be found
+        found = comfy_bin or shutil.which("comfy")
+        if found:
+            env["COMFY_BIN"] = found
         return {"command": "comfy-mcp", "env": env}
     raise PodctlError("unknown mcp transport %r (ssh | tunnel)" % mode)
 
@@ -1151,6 +1169,10 @@ def cmd_mcp(prov, args):
     print("mcp     wrote %s  (server %s, over %s)" % (dest, name, args.over))
     if args.over == "tunnel":
         print("mcp     needs `podctl tunnel %s` running; ComfyUI is on local port %d" % (args.pod, tunnel_locals(alias)["comfy"]))
+        if not cfg["mcpServers"][name]["env"].get("COMFY_BIN"):
+            print("mcp     no `comfy` on this PATH, so COMFY_BIN is not set: comfy-mcp's discovery and lifecycle "
+                  "tools will fail if your client's PATH differs from your shell's. Add it by hand, or use --over ssh.",
+                  file=sys.stderr)
     return 0
 
 

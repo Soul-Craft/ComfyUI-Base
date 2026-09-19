@@ -1248,6 +1248,19 @@ def test_unit_mcp_over_ssh_runs_the_server_on_the_machine():
     assert a[-1].endswith("exec /workspace/ComfyUI/.venv-cu130/bin/comfy-mcp"), a[-1]
     # the remote command carries the environment: an MCP client's "env" is local, and would never reach the pod
     assert "DO_NOT_TRACK=1" in a[-1] and "COMFY_NO_TELEMETRY=1" in a[-1], a[-1]
+    # comfy-mcp shells out to comfy-cli for its discovery and lifecycle tools and finds it through COMFY_BIN or
+    # PATH. MEASURED against a live ComfyUI: without COMFY_BIN, server_info answers "Error executing tool
+    # server_info"; with it, it answers. An MCP client is usually launched by a GUI whose PATH is not a shell's,
+    # so naming the binary is the only reliable form.
+    assert "COMFY_BIN=/workspace/ComfyUI/.venv-cu130/bin/comfy " in a[-1], a[-1]
+
+
+def test_unit_mcp_names_the_comfy_binary_beside_comfy_mcp():
+    podctl = _load()
+    assert podctl.mcp_comfy_bin("/opt/v/bin/comfy-mcp") == "/opt/v/bin/comfy"
+    assert podctl.mcp_comfy_bin(None) is None
+    srv = podctl.mcp_server("runpod", "ssh", bin_path="/a/b/comfy-mcp", comfy_bin="/elsewhere/comfy")
+    assert "COMFY_BIN=/elsewhere/comfy " in srv["args"][-1], srv
 
 
 def test_unit_mcp_over_the_tunnel_takes_the_alias_own_port():

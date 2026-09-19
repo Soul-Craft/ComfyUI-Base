@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.8.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.8.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -433,6 +433,13 @@ installed there and ssh is the default. The ssh transport passes `ClearAllForwar
 holds them prints warnings onto the very stdio channel MCP is speaking. The tunnel transport takes the alias's
 own local port (`tunnel_locals`), so two machines never point at one tunnel.
 
+**`COMFY_BIN`.** comfy-mcp is a wrapper: its discovery and lifecycle tools shell out to comfy-cli, which it
+finds through `COMFY_BIN` or `PATH`. An MCP client is usually launched by a GUI, whose `PATH` is not your
+shell's, so `PATH` is the thing not to rely on. `podctl mcp` therefore names the binary: over ssh it is the
+`comfy` beside the machine's `comfy-mcp`, and over the tunnel it is this machine's, when one can be found (it
+says so when none can). MEASURED 2026-09-19 against a live ComfyUI: without it, `server_info` answers "Error
+executing tool server_info"; with it, it answers with the interpreter, the config path and the bound workspace.
+
 **Telemetry.** `comfy-cli` depends on `mixpanel` and `posthog`, and rule 9 says the outbound hosts are an
 allowlist and nothing is uploaded. That wheel is not our source, so the allowlist test cannot see it. Three
 things are done instead, in order of how much they can be relied on: `DO_NOT_TRACK` and `COMFY_NO_TELEMETRY`
@@ -443,6 +450,17 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.8.1: the MCP configuration names the `comfy` binary. comfy-mcp is a wrapper whose discovery and lifecycle
+  tools shell out to comfy-cli, found through `COMFY_BIN` or `PATH`, and an MCP client is usually launched by a
+  GUI whose `PATH` is not a shell's. 2.7.0 shipped neither transport with `COMFY_BIN` set, which left the ssh
+  form giving an absolute path to `comfy-mcp` and then hoping the machine's `PATH` had `comfy`. MEASURED
+  2026-09-19, driving the real stdio protocol against the testbed's ComfyUI: initialize returned protocol
+  2025-06-18 and 39 tools listed either way, but `server_info` answered "Error executing tool server_info"
+  without `COMFY_BIN` and answered properly with it. The unit tests could not have found this; they assert the
+  shape of a config, and the shape was fine. Over ssh the binary beside `comfy-mcp` is named; over the tunnel
+  this machine's is, when `comfy` can be found, and the command says so when it cannot rather than writing a
+  config that will fail later.
 
 - 2.8.0: the owned-box recipe says what a Blackwell card actually needs. `hosts/local/README.md` now sets out the
   chain the whole host hangs on — compute capability 12.0 becomes `sm_120`, `sm_120` means the CUDA 13 wheels are
