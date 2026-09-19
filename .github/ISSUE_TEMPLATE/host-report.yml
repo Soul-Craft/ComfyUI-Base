@@ -1,0 +1,43 @@
+name: Host report
+description: You ran the base on a host the status table calls unproven. Tell us how it went.
+title: "Host report: "
+labels: [host-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The status table has three open items: Verda (written from first-party docs, tested only against a
+        fake API server), Crusoe Cloud (interface only — every call mapped, nothing implemented) and an owned
+        NVIDIA box (a recipe in `hosts/local/`, not yet run end to end). A report either way moves a row.
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options: [Verda, Crusoe Cloud, an owned NVIDIA box, other]
+    validations: {required: true}
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Worked end to end
+        - Worked with changes (described below)
+        - Did not work
+    validations: {required: true}
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: RTX Pro 6000 Blackwell, driver 580.65.06
+    validations: {required: true}
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you ran, in order
+      description: Including `podctl` commands if you used the driver.
+      render: shell
+    validations: {required: true}
+  - type: textarea
+    id: notes
+    attributes:
+      label: What needed changing, and anything the docs got wrong

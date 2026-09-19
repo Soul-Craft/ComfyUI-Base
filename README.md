@@ -1,8 +1,10 @@
 # ComfyUI Base
 
+[![verify](https://github.com/Soul-Craft/ComfyUI-Base/actions/workflows/verify.yml/badge.svg)](https://github.com/Soul-Craft/ComfyUI-Base/actions/workflows/verify.yml)
+
 The shared toolchain for ComfyUI workflow packages on a rented or owned NVIDIA GPU: one installer that finds the
 machine's ComfyUI, pins its node packs to commits, downloads every model row a package declares, owns the launch line
-and the boot, and runs each package's own test suite from the zip it ships. Version 2.3.0, MIT, maintained by SoulCraft.
+and the boot, and runs each package's own test suite from the zip it ships. MIT, maintained by SoulCraft.
 
 ## What it is
 
@@ -45,6 +47,12 @@ that project's repository and plugs in through the seams the base leaves for it 
 `bash base.sh test` runs the base's own suite (tiers: unit, install, comfyui, runpod, gpu, bare); from the extracted zip
 it runs the same way. `bash _build/verify.sh` does both, for the base and for every package of the brand repository
 around it. A test that needs the shared ComfyUI testbed skips by name when there is none beside the base.
+
+## Contributing
+
+`CONTRIBUTING.md` has the gate, the house rules the suite enforces and the release flow. The short version: one
+command, `bash _build/verify.sh`, has to be green before any commit, and CI runs the same one on every push and
+pull request. You need `uv` on PATH.
 
 ## Status
 

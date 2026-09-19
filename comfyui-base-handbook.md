@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.13.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.14.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -407,6 +407,15 @@ The base ships no extension. A project's image adds its own stages this way (cop
 provisioning, a status page), in the project's own repository.
 
 ## 10. Record
+
+- 2.5.14: the suite runs without a RunPod credential. The three `test_podio_fetch_*` tests drive `PodIO.fetch`
+  against a fake ssh and never reach the API, but `PodIO(None, …)` builds a `RunPodProvider`, whose constructor
+  loads the key eagerly (`Api(load_api_key())`), and `load_api_key` falls back to `~/.runpod/config.toml`. On a
+  maintainer's machine that file exists, so the tests passed; anywhere without a RunPod account they raised
+  before the first assertion. MEASURED 2026-09-19 on a GitHub Actions ubuntu-24.04 runner: 3 failed, 293 passed,
+  15 skipped — the first run of the new CI job, which is exactly the class of bug a gate that only ever runs on
+  the author's machine cannot find. The tests now put a placeholder key in their own environment. Nothing about
+  auth is asserted by them, so nothing is being pretended; the credential is scaffolding for a constructor.
 
 - 2.5.13: a `models/` symlink left pointing outside the volume is repointed at it. `_base_library_link` wrote
   `$COMFY/models -> $BASE_LIBRARY/models` when a machine had a separate library mounted; that symlink lives ON THE

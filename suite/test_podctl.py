@@ -1044,6 +1044,11 @@ def test_podio_fetch_is_one_tar_stream_not_a_round_trip_per_file(tmp_path, monke
     fake.write_text('#!/bin/sh\necho "$@" >> %s\nshift\nexec bash -c "$1"\n' % shlex.quote(str(calls)), encoding="utf-8")
     fake.chmod(0o755)
     monkeypatch.setattr(podctl, "SSH_CMD", [str(fake)])
+    # PodIO(None, …) builds a RunPodProvider, which loads the API key eagerly (provider.py: `Api(load_api_key())`).
+    # These three tests never reach the API — they drive fetch() over a fake ssh — but the constructor still
+    # wants a key, and load_api_key falls back to ~/.runpod/config.toml. That made them pass on a maintainer's
+    # machine and fail anywhere without a RunPod account, CI included. A placeholder keeps them portable.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_fake_for_the_fetch_tests")
     io = podctl.PodIO(None, "pod", env=dict(os.environ, COPYFILE_DISABLE="1"))   # no ._ files from macOS tar
     local = tmp_path / "local"
     io.fetch(str(remote), local)
@@ -1075,6 +1080,11 @@ def test_podio_fetch_survives_a_log_that_grows_while_it_is_copied(tmp_path, monk
                     'echo "tar: ./comfyui.log: file changed as we read it" >&2\nexit 1\n', encoding="utf-8")
     fake.chmod(0o755)
     monkeypatch.setattr(podctl, "SSH_CMD", [str(fake)])
+    # PodIO(None, …) builds a RunPodProvider, which loads the API key eagerly (provider.py: `Api(load_api_key())`).
+    # These three tests never reach the API — they drive fetch() over a fake ssh — but the constructor still
+    # wants a key, and load_api_key falls back to ~/.runpod/config.toml. That made them pass on a maintainer's
+    # machine and fail anywhere without a RunPod account, CI included. A placeholder keeps them portable.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_fake_for_the_fetch_tests")
     io = podctl.PodIO(None, "pod", env=dict(os.environ, COPYFILE_DISABLE="1"))
     said = []
     monkeypatch.setattr(io, "say", said.append)
@@ -1112,6 +1122,11 @@ def test_podio_fetch_asks_the_pod_for_only_what_this_step_wrote(tmp_path, monkey
                     % (shlex.quote(str(calls)), shlex.quote(str(empty))), encoding="utf-8")
     fake.chmod(0o755)
     monkeypatch.setattr(podctl, "SSH_CMD", [str(fake)])
+    # PodIO(None, …) builds a RunPodProvider, which loads the API key eagerly (provider.py: `Api(load_api_key())`).
+    # These three tests never reach the API — they drive fetch() over a fake ssh — but the constructor still
+    # wants a key, and load_api_key falls back to ~/.runpod/config.toml. That made them pass on a maintainer's
+    # machine and fail anywhere without a RunPod account, CI included. A placeholder keeps them portable.
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_fake_for_the_fetch_tests")
     io = podctl.PodIO(None, "pod", env=dict(os.environ, COPYFILE_DISABLE="1"))
     console = "/workspace/comfy-base/state/logs/install_example_20260911-010203.console"
     io.fetch(str(remote), tmp_path / "local", newer_than=console)
