@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.10.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.11.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -462,6 +462,19 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.11.0: the driver stops knowing one brand's machines. `TUNNEL_LOCAL` was a hard-coded map of three
+  `verda-*` aliases belonging to the repository's own maintainer, and `tunnel_locals` read a machine's port
+  offset out of it. Everybody else's fleet fell through to 0, so their second machine silently shared 8188
+  with their first, and the only way to fix it was to edit the base - the one thing a consumer repository must
+  never do. The offset is a fact about somebody's fleet, not about the base or the host, so it comes from
+  `$PODCTL_TUNNEL_OFFSET` now, beside the `PODCTL_HOST` that already names the alias, and defaults to 0 so a
+  single machine needs nothing. A value that is not a whole number in 0-1000 is refused rather than read as 0,
+  because 0 is exactly the collision it was set to avoid. Found by building a foreign brand ("Colorado AI",
+  shipping to a different host) from scratch and checking what the base still assumed: everything else passed,
+  including the runtime in `lib/` and `py/`, which carries no brand name at all.
+  **Migration:** a fleet that relied on the old map must now export the offset per machine. What was
+  `verda-cc` is `PODCTL_TUNNEL_OFFSET=1`, `verda-h3` is `2`; everything else was already 0.
 
 - 2.10.1: the front page stops calling a proven host experimental. 2.5.3 promoted Verda after live runs on
   2026-09-17 and 2026-09-18: it set `experimental = False`, rewrote `hosts/verda/README.md` around what those

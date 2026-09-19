@@ -1225,11 +1225,22 @@ def test_unit_each_workflow_gets_its_own_local_port():
             m.tunnel_port(bad); raise AssertionError("accepted %r" % bad)
         except ValueError:
             pass
-    # and each alias's written block claims its own local port, so two machines do not both bind 8188
-    seen = {a: [l for l in m._block_for(a, "root", "/k").splitlines() if "localhost:8188" in l][0].split()[1]
-            for a in ("verda-krea2", "verda-cc", "verda-h3")}
-    assert len(set(seen.values())) == 3, seen
-    assert m._block_for("an-unknown-alias", "root", "/k").count("LocalForward 8188 localhost:8188") == 1
+    # 2.11.0: the offset is per DEPLOYMENT, from $PODCTL_TUNNEL_OFFSET, so ANY fleet gets its own ports and no
+    # brand's alias names live in the base. Nothing is configured here, so every machine keeps the defaults.
+    assert m.tunnel_offset(env={}) == 0
+    assert m.tunnel_locals(env={})["comfy"] == 8188
+    seen = {off: m.tunnel_locals(env={m.TUNNEL_OFFSET_ENV: str(off)})["comfy"] for off in (0, 1, 2)}
+    assert seen == {0: 8188, 1: 8189, 2: 8190}, seen
+    # every service moves together, or the second machine's jupyter collides while its comfy does not
+    two = m.tunnel_locals(env={m.TUNNEL_OFFSET_ENV: "2"})
+    assert two == {"comfy": 8190, "jupyter": 8890, "metrics": 9201, "ollama": 11436}, two
+    # a bad value is refused, never silently read as 0 - 0 is the collision it was set to avoid
+    for bad in ("x", "-1", "9999"):
+        try:
+            m.tunnel_offset(env={m.TUNNEL_OFFSET_ENV: bad}); raise AssertionError("accepted %r" % bad)
+        except m.PodctlError:
+            pass
+    assert m._block_for("any-alias", "root", "/k").count("LocalForward 8188 localhost:8188") == 1
 
 
 # ---------------------------------------------------------------- 2.7.0: the .mcp.json podctl writes
@@ -1263,18 +1274,20 @@ def test_unit_mcp_names_the_comfy_binary_beside_comfy_mcp():
     assert "COMFY_BIN=/elsewhere/comfy " in srv["args"][-1], srv
 
 
-def test_unit_mcp_over_the_tunnel_takes_the_alias_own_port():
-    """With one GPU per workflow every machine serves 8188, so the local side is offset per alias — otherwise
-    a second machine's config would point at the first machine's tunnel."""
+def test_unit_mcp_over_the_tunnel_takes_this_deployments_port():
+    """With one GPU per workflow every machine serves 8188, so the local side carries this deployment's offset -
+    otherwise a second machine's config points at the first machine's tunnel. 2.11.0: the offset is
+    $PODCTL_TUNNEL_OFFSET, a fact about somebody's fleet, so no alias names appear here or in the base."""
     podctl = _load()
-    base = podctl.mcp_server("verda", "tunnel")
+    base = podctl.mcp_server("any-alias", "tunnel")
     assert base["command"] == "comfy-mcp"
     assert base["env"]["COMFYUI_URL"] == "http://127.0.0.1:8188", base
     assert base["env"]["DO_NOT_TRACK"] == "1" and base["env"]["COMFY_NO_TELEMETRY"] == "1"
-    for alias, want in (("verda-cc", 8189), ("verda-h3", 8190)):
-        got = podctl.mcp_server(alias, "tunnel")["env"]["COMFYUI_URL"]
-        assert got == "http://127.0.0.1:%d" % want, (alias, got)
-        assert got != base["env"]["COMFYUI_URL"]
+    for off, want in ((1, 8189), (2, 8190)):
+        got = podctl.mcp_server("any-alias", "tunnel", port=podctl.tunnel_locals(env={podctl.TUNNEL_OFFSET_ENV: str(off)})["comfy"])
+        url = got["env"]["COMFYUI_URL"]
+        assert url == "http://127.0.0.1:%d" % want, (off, url)
+        assert url != base["env"]["COMFYUI_URL"]
 
 
 def test_unit_mcp_keeps_every_other_server_in_the_file():

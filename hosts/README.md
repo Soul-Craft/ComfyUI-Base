@@ -36,7 +36,14 @@ every boot. RunPod has no systemd and keeps its start-command wrap. The Mac-side
 
 `podctl` binds one provider per run: `--provider <host>` (before or after the command), else `$PODCTL_PROVIDER`, else
 the one `host = "..."` of the `brand.toml` files in the repository this base sits in (two brands on two hosts make
-`--provider` required), else `runpod`. An experimental provider says so once per run on stderr. `PODCTL_HOST` still
+`--provider` required), else `runpod`. An experimental provider says so once per run on stderr.
+
+`PODCTL_TUNNEL_OFFSET` (default 0) shifts every local port the driver forwards: ComfyUI 8188, JupyterLab 8888,
+9199 and 11434 all move together. With one GPU per workflow every machine serves 8188, so the second machine of
+a fleet needs an offset or its tunnel silently reaches the first one. It is a fact about your fleet, not about
+the base or the host, so it lives beside `PODCTL_HOST` in your environment: `export PODCTL_HOST=gpu-two` and
+`export PODCTL_TUNNEL_OFFSET=1`. A value that is not a whole number in 0-1000 is refused rather than read as 0,
+because 0 is the collision it was set to avoid. `PODCTL_HOST` still
 gives a session its own `Host <alias>` block; without it the alias is the provider's own name, so each host keeps its
 own block in `~/.ssh/config`.
 

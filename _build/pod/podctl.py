@@ -83,13 +83,17 @@ KEY_PATH = "~/.ssh/id_ed25519"
 VOLUME_ROOT = "/workspace"                              # the persistent root on the machine: the base's BASE_VOLUME there
 # 2.5.6: the ComfyUI forward is per ALIAS, because with one GPU per workflow every machine serves on 8188 and
 # identical LocalForward lines mean only whichever `ssh <alias>` ran first gets the port; the rest fail or, worse,
-# the operator reads one product's panel believing it is another's. TUNNEL_LOCAL maps alias to local port and an
-# unknown alias keeps 8188, so a single-machine setup is unchanged.
-# Every service is per alias, not just ComfyUI. The first machine's session took 9199 and 11434 as well, and
+# the operator reads one product's panel believing it is another's. The offset is per DEPLOYMENT, not per
+# provider: it says "this machine is my second one", which is a fact about somebody's fleet and not about the
+# base. It therefore comes from the environment, beside the PODCTL_HOST that already names the alias, and
+# defaults to 0 so a single-machine setup needs nothing.
+# Every service is offset, not just ComfyUI. The first machine's session took 9199 and 11434 as well, and
 # because ExitOnForwardFailure is set the SECOND machine's session then died on those and took its own ComfyUI
 # forward down with it, so a product could not be opened even though its own port was free. Measured on two live
-# machines. An unknown alias keeps the original numbers, so a single-machine setup is unchanged.
-TUNNEL_LOCAL = {"verda": 0, "runpod": 0, "verda-krea2": 0, "verda-cc": 1, "verda-h3": 2}
+# machines.
+# 2.11.0: this was a hard-coded map of one brand's three machine aliases, which meant anybody else's fleet
+# silently shared 8188 and could only fix it by editing the base - the one thing a consumer must never do.
+TUNNEL_OFFSET_ENV = "PODCTL_TUNNEL_OFFSET"
 # 11434 is Ollama's. The base installs no inference server and never will: the port is forwarded because a
 # PACKAGE may run one on the machine and talk to it on loopback, which is the shape a package uses when its
 # whole point is that nothing leaves the box. Forwarding it costs nothing when no package does, and its
@@ -101,10 +105,26 @@ SSH_BLOCK = ("Host {alias}\n  HostName {host}\n  Port {port}\n  User {user}\n  I
              "  LocalForward {metrics} localhost:9199\n  LocalForward {ollama} localhost:11434\n")
 
 
-def tunnel_locals(alias):
-    """The local port for each service on this alias: the remote port plus the alias's offset, so every machine
-    gets its own set and two of them never contend for one number."""
-    off = TUNNEL_LOCAL.get(alias, 0)
+def tunnel_offset(env=None):
+    """How far this machine's local ports sit from the defaults. $PODCTL_TUNNEL_OFFSET, else 0. A bad value is
+    refused rather than silently treated as 0, because 0 is exactly the collision it was set to avoid."""
+    raw = ((env or os.environ).get(TUNNEL_OFFSET_ENV) or "").strip()
+    if not raw:
+        return 0
+    try:
+        off = int(raw)
+    except ValueError:
+        raise PodctlError("%s=%r is not a whole number" % (TUNNEL_OFFSET_ENV, raw))
+    if off < 0 or off > 1000:
+        raise PodctlError("%s=%d is out of range (0-1000)" % (TUNNEL_OFFSET_ENV, off))
+    return off
+
+
+def tunnel_locals(alias=None, env=None):
+    """The local port for each service on this machine: the remote port plus this deployment's offset, so two
+    machines never contend for one number. `alias` is accepted and ignored; it is kept so the call sites and
+    the suite read the same as before 2.11.0."""
+    off = tunnel_offset(env)
     return {name: remote + off for name, remote in TUNNEL_SERVICES}
 
 
