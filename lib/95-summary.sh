@@ -105,18 +105,26 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   base_summary
 }
 
-_base_use_testbed(){ # only from `test`: the repo's shared testbed beside the base (base/testbed, provisioned by base/testbed.sh); anchored on the base so a package three levels down and the base itself find the same tree
-  local tb
-  tb="$BASE_DIR/../testbed"
-  if [ -z "${BASE_NODE_SRC:-}" ] && [ -f "$BASE_DIR/../testbed.sh" ] && [ -f "$tb/main.py" ]; then
-    BASE_NODE_SRC="$(cd "$tb" && pwd -P)"; note "testbed: BASE_NODE_SRC=$BASE_NODE_SRC"
-    local port="${TESTBED_PORT:-}"
-    [ -z "$port" ] && [ -f "$BASE_DIR/../.testbed-server.port" ] && port="$(tr -d '[:space:]' < "$BASE_DIR/../.testbed-server.port")"   # 2.2.0: the running testbed says which port it took
-    port="${port:-8199}"
-    if [ -z "${BASE_SERVER:-}" ] && curl -sf --max-time 2 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
-      BASE_SERVER="127.0.0.1:$port"; note "testbed: BASE_SERVER=$BASE_SERVER"
+_base_use_testbed(){ # only from `test`: the shared ComfyUI testbed. Since 2.6.0 testbed.sh ships in this repository, so the
+                     # tree is <base>/testbed; a brand repository keeps the base as a submodule and has base/testbed beside
+                     # base/comfyui-base. Both are checked, in that order, and each root is taken whole — the port file is
+                     # read from the SAME root that supplied the tree, never from the other one. Anchored on the base either
+                     # way, so a package three levels down and the base itself find the same tree.
+  local root tb port
+  if [ -n "${BASE_NODE_SRC:-}" ]; then return 0; fi
+  for root in "$BASE_DIR" "$BASE_DIR/.."; do
+    tb="$root/testbed"
+    if [ -f "$root/testbed.sh" ] && [ -f "$tb/main.py" ]; then
+      BASE_NODE_SRC="$(cd "$tb" && pwd -P)"; note "testbed: BASE_NODE_SRC=$BASE_NODE_SRC"
+      port="${TESTBED_PORT:-}"
+      [ -z "$port" ] && [ -f "$root/.testbed-server.port" ] && port="$(tr -d '[:space:]' < "$root/.testbed-server.port")"   # 2.2.0: the running testbed says which port it took
+      port="${port:-8199}"
+      if [ -z "${BASE_SERVER:-}" ] && curl -sf --max-time 2 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
+        BASE_SERVER="127.0.0.1:$port"; note "testbed: BASE_SERVER=$BASE_SERVER"
+      fi
+      break
     fi
-  fi
+  done
   return 0
 }
 _base_warn_settle(){ # a --latest run's "untested" warning is true until the run's own suite proves the packs: green → a note

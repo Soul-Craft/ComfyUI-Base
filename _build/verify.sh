@@ -19,11 +19,14 @@
 # the zip check still runs over it.
 set -uo pipefail
 BASE="$(cd "$(dirname "$0")/.." && pwd)"; ROOT="$(cd "$BASE/../.." && pwd)"
-export BASE_NODE_SRC="${BASE_NODE_SRC:-$ROOT/base/testbed}"
+# The testbed sits either IN the base (since 2.6.0 testbed.sh ships here) or at base/testbed of a brand tree.
+# One root is chosen and used whole, so the port file always comes from the same place as the tree.
+if [ -f "$BASE/testbed.sh" ]; then TB_ROOT="$BASE"; else TB_ROOT="$ROOT/base"; fi
+export BASE_NODE_SRC="${BASE_NODE_SRC:-$TB_ROOT/testbed}"
 # BASE_SERVER only when nothing set it: the runner detects the testbed itself (lib/95-summary.sh), and an
 # unconditional export here overrode that detection. The testbed's port file wins over the 8199 default.
 if [ -z "${BASE_SERVER:-}" ]; then
-  if [ -f "$ROOT/base/.testbed-server.port" ]; then BASE_SERVER="127.0.0.1:$(tr -d '[:space:]' < "$ROOT/base/.testbed-server.port")"
+  if [ -f "$TB_ROOT/.testbed-server.port" ]; then BASE_SERVER="127.0.0.1:$(tr -d '[:space:]' < "$TB_ROOT/.testbed-server.port")"
   else BASE_SERVER="127.0.0.1:8199"; fi
   export BASE_SERVER
 fi

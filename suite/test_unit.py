@@ -1002,14 +1002,33 @@ def test_unit_list_packs_never_runs_a_script_that_does_not_source_the_base(tmp_p
 
 
 def test_unit_testbed_derives_its_packs_from_the_packages():
+    # 2.6.0: testbed.sh ships in this repository, so a standalone clone can run the comfyui tier instead of
+    # skipping it forever. A brand repository still has one beside the base; both locations are accepted.
     _repo_only("the repo's testbed.sh")
-    if not (BASE.parent / "testbed.sh").exists():
-        pytest.skip("no testbed.sh beside the base: this base is its own repository (2.2.0); the brand repositories carry one")
-    tb = (BASE.parent / "testbed.sh").read_text()
-    assert "list-packs" in tb and "rgthree/rgthree-comfy" not in tb and "cg-use-everywhere" not in tb   # the four base packs are never hand-listed
+    tbsh = next((q for q in (BASE / "testbed.sh", BASE.parent / "testbed.sh") if q.exists()), None)
+    if tbsh is None:
+        pytest.skip("no testbed.sh in or beside the base")
+    tb = tbsh.read_text()
+    assert "list-packs" in tb and "rgthree/rgthree-comfy" not in tb and "cg-use-everywhere" not in tb   # the base packs are never hand-listed
     assert "EXTRA=(" in tb                                                                        # packs of packages not yet converted
-    r = subprocess.run(["bash", str(BASE.parent / "testbed.sh"), "--status"], capture_output=True, text=True)
+    r = subprocess.run(["bash", str(tbsh), "--status"], capture_output=True, text=True)
     assert r.returncode == 0 and "BASE_NODE_SRC=" in r.stdout and "BASE_SERVER=" in r.stdout, r.stdout + r.stderr
+    # it must FIND the base from wherever it sits: without that, derive_packs falls through to an empty EXTRA
+    # and the testbed provisions a ComfyUI with no custom nodes at all, silently.
+    assert "no ComfyUI Base beside this script" not in (r.stdout + r.stderr), r.stdout + r.stderr
+
+
+def test_unit_the_testbed_names_no_brand():
+    """Nothing in the base knows a brand's name (handbook rule 0). testbed.sh used to carry three hard-coded
+    `../soulcraft/packages/...` vendored paths, which is both a brand name in a public repository and a list
+    that went stale every time a package moved. They are derived from the tree now, or absent."""
+    _repo_only("the repo's testbed.sh")
+    tbsh = next((q for q in (BASE / "testbed.sh", BASE.parent / "testbed.sh") if q.exists()), None)
+    if tbsh is None:
+        pytest.skip("no testbed.sh in or beside the base")
+    tb = tbsh.read_text().lower()
+    for brand in ("soulcraft", "eroscraft"):
+        assert brand not in tb, "%s is named in testbed.sh" % brand
 
 
 # ---------------------------------------------------------------- plan 2 / T1: tier markers by prefix; converted packages agree

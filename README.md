@@ -46,7 +46,11 @@ that project's repository and plugs in through the seams the base leaves for it 
 
 `bash base.sh test` runs the base's own suite (tiers: unit, install, comfyui, runpod, gpu, bare); from the extracted zip
 it runs the same way. `bash _build/verify.sh` does both, for the base and for every package of the brand repository
-around it. A test that needs the shared ComfyUI testbed skips by name when there is none beside the base.
+around it, and is what CI runs on every push.
+
+The `comfyui` tier needs a local ComfyUI to test against. `bash testbed.sh --server` provisions one — upstream at its
+newest release tag, plus the base's own pinned packs — and starts it on CPU, so a clone of this repository can run
+that tier on its own. It is several GB and gitignored. Tiers that need a GPU or a pod skip by name.
 
 ## Contributing
 

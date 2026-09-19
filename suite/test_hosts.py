@@ -248,6 +248,26 @@ def test_unit_the_testbed_port_file_picks_the_server(tmp_path):
     assert "S=127.0.0.1:8299" in r.stdout, r.stdout + r.stderr
 
 
+def test_unit_the_testbed_is_found_inside_the_base_too(tmp_path):
+    """2.6.0: testbed.sh ships in the ComfyUI Base repository, so the tree is <base>/testbed — not only
+    base/testbed beside base/comfyui-base, which is what a brand repository has. The sibling test above
+    covers the brand layout; this one covers a standalone checkout, because a clone of this repository
+    alone used to skip the comfyui tier forever."""
+    base = tmp_path / "comfyui-base"; base.mkdir(parents=True)
+    for f in ("base.sh", "VERSION"):
+        (base / f).write_text((BASE / f).read_text())
+    (base / "lib").mkdir(); [ (base / "lib" / q.name).write_text(q.read_text()) for q in (BASE / "lib").glob("*.sh") ]
+    (base / "py").mkdir()
+    # everything in the base itself, not one level up
+    (base / "testbed.sh").write_text("#!/bin/bash\n"); (base / "testbed").mkdir(); (base / "testbed" / "main.py").write_text("")
+    (base / ".testbed-server.port").write_text("8399\n")
+    bin_ = tmp_path / "bin"; bin_.mkdir(); (bin_ / "curl").write_text('#!/bin/bash\ncase "$*" in *8399*) exit 0;; esac; exit 1\n'); (bin_ / "curl").chmod(0o755)
+    env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"]), "BASE_NODE_SRC": "", "BASE_SERVER": ""}
+    r = subprocess.run(["bash", "-c", 'source "%s/base.sh"; BASE_NODE_SRC=""; BASE_SERVER=""; _base_use_testbed; echo "S=$BASE_SERVER"; echo "N=$BASE_NODE_SRC"' % base], capture_output=True, text=True, env=env)
+    assert "S=127.0.0.1:8399" in r.stdout, r.stdout + r.stderr
+    assert "N=%s" % (base / "testbed").resolve() in r.stdout, r.stdout + r.stderr
+
+
 def test_unit_a_shared_root_makes_a_separate_library_redundant(tmp_path):
     """2.5.2, measured on a live machine: with BASE_VOLUME_SHARED the whole root IS the store, so a BASE_LIBRARY
     pointing at the same store mounts it twice. The run then warns about "another ComfyUI tree" which is its own

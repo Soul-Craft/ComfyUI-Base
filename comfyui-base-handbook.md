@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.14.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.6.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -291,10 +291,18 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 Suites ship as `suite.py` + `pytest.ini` beside the script and load the base's plugin (`-p basetest`), which gives
 `load_package`, `active_loaders`, `manifest_covers_active_loaders`, `brand_families`, `fake_pod` (layouts `official`,
 `community`, `bare`, `volume`), `run_script`, `boot_stubs`, `boot_fake_pod`, `tree_hash`, `code_only` and the per-tier
-table. `bash "<name>-script.sh" test` auto-detects the repo testbed (`base/testbed`, `base/testbed.sh`) and its server on
-8199, or on the port a running testbed recorded in `base/.testbed-server.port` beside `testbed.sh` (2.2.0:
-`_base_use_testbed` and `verify.sh` both read it, so a brand whose testbed runs elsewhere needs no env var);
-`BASE_NODE_SRC` / `BASE_SERVER` override; the runner hands the suite `BASE_COMFY` and `BASE_VENV`.
+table. `bash "<name>-script.sh" test` auto-detects the testbed and its server on 8199, or on the port a running testbed
+recorded in `.testbed-server.port` beside `testbed.sh` (2.2.0: `_base_use_testbed` and `verify.sh` both read it, so a
+brand whose testbed runs elsewhere needs no env var); `BASE_NODE_SRC` / `BASE_SERVER` override; the runner hands the
+suite `BASE_COMFY` and `BASE_VENV`.
+
+Since 2.6.0 the testbed lives in **two possible places**, checked in this order: `<base>/testbed`, provisioned by the
+`testbed.sh` that ships in this repository, and `base/testbed` beside `base/comfyui-base` in a brand repository. A root
+is taken whole — the port file is read from the same root that supplied the tree, never from the other one. Before
+2.6.0 only the second existed, so a clone of this repository on its own could never run the `comfyui` tier; it skipped
+by name forever, which is a poor thing to hand someone who forked the repository to work on it. `bash testbed.sh
+--server` provisions an upstream ComfyUI at its newest release tag plus the base's own pinned packs (derived from
+`list-packs`, never hand-listed) and starts it on CPU. It is several GB and gitignored.
 
 ## 5. Pipeline (install)
 
@@ -407,6 +415,21 @@ The base ships no extension. A project's image adds its own stages this way (cop
 provisioning, a status page), in the project's own repository.
 
 ## 10. Record
+
+- 2.6.0: the testbed the base tests itself with now lives in the base. `testbed.sh` was carried by the brand
+  repositories, so `suite/test_unit.py` skipped the `comfyui` tier by name — "this base is its own repository
+  (2.2.0); the brand repositories carry one" — and a clone of THIS repository could never run it at all. That is a
+  poor thing to hand someone who forked the repository in order to work on it, and it is the whole tier that
+  proves a pack actually imports. `testbed.sh` ships here now; `_base_use_testbed` and `verify.sh` check
+  `<base>/testbed` first and `base/testbed` second, taking one root whole so the port file always comes from the
+  same place as the tree. Two things had to be fixed on the way in. `BASE_SH` was hard-coded to
+  `$HERE/comfyui-base/base.sh`, which from the repository root resolves to nothing: MEASURED, the script then
+  printed "no ComfyUI Base beside this script — only EXTRA packs are provisioned" and, since EXTRA has been empty
+  since 2026-09-04, would have provisioned a ComfyUI with no custom nodes at all, silently. And `VENDORED` was
+  three hard-coded `../soulcraft/packages/...` paths — a brand's name in a repository whose first design rule is
+  that nothing here knows one, and a list that had already gone stale. Both are derived now, and a test asserts no
+  brand is named. `testbed.sh` is deliberately NOT in `BASE_MEMBERS`: the zip is what goes to a pod, and a CPU
+  testbed has no business there.
 
 - 2.5.14: the suite runs without a RunPod credential. The three `test_podio_fetch_*` tests drive `PodIO.fetch`
   against a fake ssh and never reach the API, but `PodIO(None, …)` builds a `RunPodProvider`, whose constructor

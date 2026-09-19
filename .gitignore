@@ -15,5 +15,8 @@ __pycache__/
 .pytest_cache/
 # the Mac
 .DS_Store
+# the shared ComfyUI testbed: an upstream clone plus its packs and venv, provisioned by ./testbed.sh and
+# reproducible from it. Several GB, none of it ours.
+/testbed/
 # the local testbed server's pid, log and port files
 .testbed-server.*
