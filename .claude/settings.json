@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash _build/verify.sh:*)",
+      "Bash(bash base.sh test:*)",
+      "Bash(python3 _build/package.py --check:*)",
+      "Bash(pytest:*)"
+    ]
+  }
+}
