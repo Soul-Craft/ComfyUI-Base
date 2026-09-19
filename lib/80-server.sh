@@ -29,7 +29,7 @@ _base_comfy_pids(){ # pids of ComfyUI servers on this pod: /proc → the one mat
   return 0
 }
 _base_preview_effective(){ # what preview method is ACTUALLY in effect: the UI setting overrides the CLI flag per queue
-  local flag="" setting="" cfg="$COMFY/user/default/comfy.settings.json"
+  local flag="" setting="" cfg="$(_base_user_dir)/default/comfy.settings.json"
   if [ -n "$RUN_PID" ] && [ -r "/proc/$RUN_PID/cmdline" ]; then tr '\0' '\n' < "/proc/$RUN_PID/cmdline" 2>/dev/null | grep -qx -- '--preview-method' && flag=1 || true
   else flag="?"; fi
   if [ -r "$cfg" ]; then setting="$("$SYS_PY" -c 'import json,sys

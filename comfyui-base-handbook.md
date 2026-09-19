@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.7.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.8.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,17 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.8: and so are the SETTINGS, which is the same bug one path away. 2.5.7 moved `workflows/` to the
+  directory the server reads and scoped its guard to that path, so an identical split in
+  `comfy.settings.json` survived untouched. This package sets `pysssss.ImageFeed.Location=hidden` as hygiene,
+  with the comment "it covers App Mode's Run button", and wrote it into ComfyUI's own tree while the server read
+  the machine's. The setting never took effect, the image feed sat over the Run button, and every Playwright
+  click landed on a `DIV.pysssss-image-feed-menu`: no `POST /prompt` was ever made, so a whole GPU sweep
+  reported "did not queue" for every case with no reason attached. `force=True` does not help, because it skips
+  the actionability check and still dispatches at the point where the overlay is. Measured 2026-09-19 with
+  `document.elementFromPoint` on the Run button's own centre. `lib/80-server.sh` and `lib/70-hygiene.sh` now ask
+  `_base_user_dir`, and the static guard is widened from `workflows` to the whole of `$COMFY/user` so the next
+  instance cannot hide one path away again.
 - 2.5.7: the workflow is written where the SERVER actually reads it. 2.5.0 moved the server's
   `--user-directory` to `BASE_LOCAL_STATE` (`lib/70-hygiene.sh`), because two machines sharing one store cannot
   share one `user/`, and left every WRITER pointing at `$COMFY/user`. So on a shared-root machine the installer

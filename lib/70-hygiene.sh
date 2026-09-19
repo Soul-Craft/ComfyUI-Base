@@ -50,7 +50,7 @@ _base_args_remove(){ # <--flag> [why]
 }
 _base_manager_security(){ # security_level = normal; network_mode and everything else untouched
   local ini="" c
-  for c in "$COMFY/user/default/ComfyUI-Manager/config.ini" "$CN/ComfyUI-Manager/config.ini"; do if [ -f "$c" ]; then ini="$c"; break; fi; done
+  for c in "$(_base_user_dir)/default/ComfyUI-Manager/config.ini" "$COMFY/user/default/ComfyUI-Manager/config.ini" "$CN/ComfyUI-Manager/config.ini"; do if [ -f "$c" ]; then ini="$c"; break; fi; done
   if [ -z "$ini" ]; then note "ComfyUI-Manager config.ini not found yet (Manager writes it on first start) — security_level is set on the next run"
   elif grep -qE '^security_level[[:space:]]*=[[:space:]]*normal[[:space:]]*$' "$ini"; then ok "Manager security_level = normal ($ini)"
   elif [ "$BASE_DRY" = "1" ]; then would "set security_level = normal in $ini"

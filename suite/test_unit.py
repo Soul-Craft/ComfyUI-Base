@@ -2383,19 +2383,39 @@ def test_unit_the_workflow_is_written_where_the_server_actually_reads_it():
     assert bare.stdout.strip() == "/w/ComfyUI/user/default/workflows", bare.stdout + bare.stderr
 
 
-def test_unit_no_lib_file_hardcodes_the_workflows_directory():
-    """The companion to the test above, and the reason this one exists separately: the bug was FOUR
-    call sites agreeing with each other and disagreeing with a fifth. A house rule applies to every
-    instance of its pattern, never the one that happened to bite, so this fails on a new writer that
-    reaches for $COMFY/user/default/workflows instead of the accessor."""
+def test_unit_no_lib_file_hardcodes_comfyuis_own_user_directory():
+    """The companion to the test above, and the reason it exists separately: the bug was several
+    call sites agreeing with each other and disagreeing with one.
+
+    2.5.8 widened it from `workflows` to the WHOLE of $COMFY/user, because scoping it to the path
+    that had bitten let an identical bug sit one file away. `comfy.settings.json` was written to
+    ComfyUI's own tree while the server read the machine's, so this package's own hygiene fix,
+    `pysssss.ImageFeed.Location=hidden`, never took effect and the image feed sat on top of App
+    Mode's Run button. Every click landed on a DIV.pysssss-image-feed-menu, no POST /prompt was
+    ever made, and a whole sweep reported "did not queue" with no reason. Measured 2026-09-19.
+
+    A house rule applies to every instance of its pattern, never the one that happened to bite."""
     bad = []
     for p in LIB:
+        inside_accessor = False
         for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
-            # The writer pattern is specifically $COMFY/user/...: ComfyUI's OWN tree, which is the
-            # wrong tree on a shared-root machine. A bare relative "user/default/workflows" in the
-            # scaffold that lays out a fresh ComfyUI (20-comfyui.sh) is fine and must stay: that
-            # directory should exist whether or not this machine serves from it.
-            if "$COMFY/user/default/workflows" not in line or line.lstrip().startswith("#"):
+            # The accessor's own body is the one place $COMFY/user is the RIGHT answer: it is what
+            # a machine that is not on a shared root should use.
+            if line.startswith("_base_user_dir()"):
+                inside_accessor = True
+            elif inside_accessor and line.startswith("}"):
+                inside_accessor = False
+            if inside_accessor:
+                continue
+            # $COMFY/user is ComfyUI's OWN tree, which is the wrong tree on a shared-root machine.
+            # A bare relative "user/default/workflows" in the scaffold that lays out a fresh ComfyUI
+            # (20-comfyui.sh) is fine and must stay: it should exist whether or not this machine
+            # serves from it. A FALLBACK after the accessor is fine too, which is how 70-hygiene
+            # still finds a Manager config an older install left behind.
+            if "$COMFY/user" not in line or line.lstrip().startswith("#"):
+                continue
+            if "_base_user_dir" in line:            # the accessor first, $COMFY/user only as a fallback
                 continue
             bad.append(f"{p.name}:{n}: {line.strip()}")
-    assert not bad, "these write to a workflows directory the server may not read:\n" + "\n".join(bad)
+    assert not bad, ("these write into ComfyUI's own user/, which the server may not read:\n"
+                     + "\n".join(bad))
