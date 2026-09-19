@@ -30,7 +30,8 @@ jobs:
 
       # base_test reaches pytest through `uv run --no-project --python 3.12 --with pytest`; a fresh
       # clone has no venv, so without uv on PATH the suite reports "no pytest and no uv" and exits 1.
-      - uses: astral-sh/setup-uv@v10
+      # pinned exact: setup-uv publishes no floating major tag, so @v10 does not resolve
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
 
