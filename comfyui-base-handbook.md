@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.12.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.12.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -466,6 +466,26 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.12.1: a security review of 2.12.0, and it found two real things, both in the same eight lines. The Jupyter
+  token was interpolated into the ssh COMMAND, and sshd runs a non-login remote command as `bash -c '<cmd>'`, so
+  it landed in the machine's `/proc/<pid>/cmdline`, world-readable on Linux, and in `ps` on the Mac. The code
+  then wrote the file 0600, which protects the value at rest while having published it in the process table on
+  the way there. `lib/boot.sh` states the rule for this exact secret and `suite/test_unit.py` asserts it: the
+  token rides the environment, never argv. It goes on stdin now, and `ssh_run` grew an `input` parameter to make
+  that possible for any secret.
+  The same line also passed the drop-in body as printf's FORMAT string. MEASURED: a token of `ab%sc` was written
+  as `abc`, `100%done` as `1000one`, and `tok%` truncated the file. printf failing inside a pipeline leaves the
+  pipeline's status as tee's, so the `&&` chain carried on and `ensure` reported the token written while the
+  machine held a different one. There is no attacker here, the token is the operator's own, but the failure was
+  silent and that is worse than loud.
+  Also hardened while in there: a public address from the API is parsed with `ipaddress.ip_address()` before it
+  reaches the operator's `~/.ssh/config`, where a newline would have become an ssh directive. That needs the API
+  to lie, which is a high bar, but it is one line.
+  And the signing test stopped being circular before the review reached it: it recomputed the expected signature
+  with the same formula the code uses, which proves only that the code agrees with itself. Two golden vectors are
+  pinned as literals now, with an assertion that at least one of them contains a `-` or `_`, because standard and
+  url-safe base64 differ in exactly two characters and a signature containing neither cannot tell them apart.
 
 - 2.12.0: Crusoe has a driver. `hosts/crusoe/provider.py` was 144 lines in which every method raised, so of the
   four hosts it was the only one actually broken: the machine side has been complete for a while, but nothing on

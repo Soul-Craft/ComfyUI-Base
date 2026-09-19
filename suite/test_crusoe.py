@@ -221,19 +221,46 @@ def _cfg(tmp_path):
 
 # ---------------------------------------------------------------- the signature
 
+# Golden vectors. These constants were computed ONCE from Crusoe's own published Python
+# (crusoe-registry-token-rotator, rotate_token_api.py), whose formula client-go auth/v1/auth.go agrees with:
+#
+#   sig_payload = api_version + request_path + "\n" + query + "\n" + verb + f"\n{dt}\n"
+#   decoded     = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+#   signature   = base64.urlsafe_b64encode(hmac.new(decoded, sig_payload, sha256).digest()).rstrip("=")
+#
+# They are LITERALS on purpose. An assertion that recomputes the signature with the same formula the production
+# code uses proves only that the code agrees with itself: if the reading of Crusoe's algorithm were wrong, both
+# sides would be wrong identically and the test would still pass. Pinning the bytes means a later "simplification"
+# of sign() fails here. It still does not prove the bytes are what the live service wants - only a live 200 does
+# that, and nobody has one yet - but it does mean the value under test is not derived from the thing under test.
+SIGNING_VECTORS = (
+    ("/v1/capacities", "location=us-northcentral1-a", "GET", "2026-09-19T10:00:00Z",
+     "m0Hrwj16G11CbOrx6c7HdYC3hj3qjoxe8q6eYCcBKbU"),
+    ("/v1/projects/p-1/compute/vms/instances", "", "POST", "2026-01-02T03:04:05Z",
+     "pr0YqVv6O7tqwGOTENxbLB4_31NVVV5mAJRWZFDnBC8"),
+)
+
+
 def test_unit_crusoe_signs_exactly_as_crusoes_own_client_does():
-    """The one part of this host with no live 200 behind it. Checked against Crusoe's own published formula
-    (client-go auth/v1/auth.go and the Python in crusoe-registry-token-rotator, which agree): HMAC-SHA256 over
-    path, canonical query, verb and timestamp each followed by a newline, with the secret urlsafe-b64 DECODED and
-    the signature urlsafe-b64 encoded unpadded. The prose docs' worked example does not reproduce; the code does."""
+    """The one part of this host with no live 200 behind it, so the vectors are pinned rather than recomputed."""
     podctl = _load()
     mod = _crusoe(podctl)
-    path, query, verb, ts = "/v1/capacities", "location=us-northcentral1-a", "GET", "2026-09-19T10:00:00Z"
-    want = base64.urlsafe_b64encode(hmac.new(
-        base64.urlsafe_b64decode(SECRET + "=" * (-len(SECRET) % 4)),
-        ("%s\n%s\n%s\n%s\n" % (path, query, verb, ts)).encode(), hashlib.sha256).digest()).decode().rstrip("=")
-    assert mod.sign(SECRET, path, query, verb, ts) == want
-    assert "=" not in mod.sign(SECRET, path, query, verb, ts), "the signature is unpadded"
+    for path, query, verb, ts, want in SIGNING_VECTORS:
+        got = mod.sign(SECRET, path, query, verb, ts)
+        assert got == want, "%s %s: got %s, want %s" % (verb, path, got, want)
+        assert "=" not in got, "the signature is unpadded"
+    # At least one vector must exercise the url-safe alphabet. Standard and url-safe base64 differ only in two
+    # characters, so a signature that happens to contain neither cannot tell the encodings apart: vector 1 does
+    # not, and on its own it would accept a standard-b64 implementation. Vector 2 does. Asserted, not assumed,
+    # because that is a property of the bytes and a later edit could quietly lose it.
+    assert any(set(want) & set("-_") for *_, want in SIGNING_VECTORS), \
+        "no vector contains - or _, so none of them distinguishes url-safe base64 from standard"
+    # and the payload really is newline-separated in that order: changing any field changes the signature
+    base_args = SIGNING_VECTORS[0][:4]
+    for i in range(4):
+        args = list(base_args)
+        args[i] = args[i] + "x"
+        assert mod.sign(SECRET, *args) != SIGNING_VECTORS[0][4], "field %d does not affect the signature" % i
     # the query is canonical: sorted by name, urlencoded, empty when there is none
     assert mod.canonical_query({"product_name": "a100.8x", "location": "us-northcentral1-a"}) == \
         "location=us-northcentral1-a&product_name=a100.8x"
@@ -491,28 +518,56 @@ def test_unit_crusoe_ensure_refuses_a_stopped_machine_and_says_what_to_do(tmp_pa
         fake.close()
 
 
-def test_unit_crusoe_ensure_writes_the_jupyter_token_as_a_systemd_dropin(tmp_path, monkeypatch):
-    """JupyterLab starts only when JUPYTER_TOKEN reaches boot.sh, and boot.sh is a systemd unit here, so without a
-    drop-in `podctl jupyter` reports no token forever and reads as a broken command."""
+def test_unit_crusoe_the_jupyter_token_rides_stdin_and_never_argv(tmp_path, monkeypatch):
+    """Two defects found in review, both here. The token must not appear in the COMMAND: sshd runs a non-login
+    remote command as `bash -c '<cmd>'`, so anything in it lands in the machine's world-readable
+    /proc/<pid>/cmdline and in ps on this Mac, which is the rule lib/boot.sh states for this exact secret. And
+    the body must not become printf's FORMAT string: MEASURED, `ab%sc` was written as `abc` and `100%done` as
+    `1000one`, and because printf fails inside a pipeline the && chain carried on and ensure reported success
+    over a mangled file."""
     podctl = _load()
     fake = FakeCrusoe(instances=[_vm()])
     monkeypatch.setattr(podctl, "ssh_banner", lambda h, p, timeout=10: True)
     monkeypatch.setattr(podctl, "_ssh_hostname", lambda: "comfy-base")
-    cmds = []
-    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: (
-        cmds.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr="READY\n"))[1])
+    seen = []
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None, input=None: (
+        seen.append((cmd, input)), types.SimpleNamespace(returncode=0, stdout="", stderr="READY\n"))[1])
     try:
         prov = _prov(podctl, fake, tmp_path)
-        prov.ensure(VM_ID, pubkey=MAC_KEY, ssh_config=_cfg(tmp_path), log=lambda *_: None, jupyter_token="s3cret")
-        drop = [c for c in cmds if "jupyter.conf" in c]
-        assert len(drop) == 1, cmds
-        assert "JUPYTER_TOKEN=s3cret" in drop[0] and "daemon-reload" in drop[0] and "chmod 600" in drop[0]
-        # without a token nothing is written
-        cmds.clear()
+        mod = _crusoe(podctl)
+        for token in ("s3cret", "ab%sc", "100%done", "tok%", "a b'c\"d"):
+            seen.clear()
+            prov.ensure(VM_ID, pubkey=MAC_KEY, ssh_config=_cfg(tmp_path), log=lambda *_: None, jupyter_token=token)
+            drop = [(c, i) for c, i in seen if "jupyter.conf" in c]
+            assert len(drop) == 1, seen
+            cmd, body = drop[0]
+            assert token not in cmd, "the token reached argv: %r" % cmd
+            assert body == "[Service]\nEnvironment=JUPYTER_TOKEN=%s\n" % token, body
+            assert "printf" not in cmd, "printf would interpret the body as a format string"
+            assert "tee" in cmd and "chmod 600" in cmd and "daemon-reload" in cmd, cmd
+        # the pure form says the same, without an ensure around it
+        cmd, body = mod.jupyter_dropin("100%done")
+        assert "100%done" not in cmd and body.endswith("JUPYTER_TOKEN=100%done\n")
+        # without a token nothing is written at all
+        seen.clear()
         prov.ensure(VM_ID, pubkey=MAC_KEY, ssh_config=_cfg(tmp_path), log=lambda *_: None)
-        assert not [c for c in cmds if "jupyter.conf" in c]
+        assert not [c for c, _ in seen if "jupyter.conf" in c]
     finally:
         fake.close()
+
+
+def test_unit_crusoe_an_address_that_is_not_an_ip_is_refused(tmp_path):
+    """The address comes from the API and ends up in the Host block of the operator's ~/.ssh/config. A value
+    carrying a newline would put whatever followed it there as an ssh directive. That needs the API to be lying,
+    which is a high bar, but the check is one line and the blast radius is the operator's own ssh config."""
+    podctl = _load()
+    mod = _crusoe(podctl)
+    assert mod.inst_ip(_vm()) == "127.0.0.1"
+    assert mod.inst_ip({"network_interfaces": []}) == ""
+    for bad in ("127.0.0.1\n  ProxyCommand /bin/sh", "not-an-ip", "127.0.0.1 evil"):
+        with pytest.raises(podctl.PodctlError) as ei:
+            mod.inst_ip({"network_interfaces": [{"ips": [{"public_ipv4": {"address": bad}}]}]})
+        assert "not an ip" in str(ei.value)
 
 
 # ---------------------------------------------------------------- deploy

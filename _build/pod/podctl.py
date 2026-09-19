@@ -268,10 +268,16 @@ def tunnel_port(v):
     return "%d:%d" % (int(local), int(remote))
 
 
-def ssh_run(remote_cmd, env=None, timeout=None):
-    """One command on the pod, no forwards, no TTY. Returns the CompletedProcess."""
+def ssh_run(remote_cmd, env=None, timeout=None, input=None):
+    """One command on the pod, no forwards, no TTY. Returns the CompletedProcess.
+
+    `input` is fed to the remote command's stdin. That is the only way to hand a machine a SECRET: a value in
+    remote_cmd becomes argv, and sshd runs a non-login command as `bash -c '<cmd>'`, so it lands in the remote
+    /proc/<pid>/cmdline, which is world-readable on Linux, as well as in ps on this Mac. lib/boot.sh says the
+    same thing about JUPYTER_TOKEN: it rides the environment, never argv."""
     import subprocess
-    return subprocess.run(SSH_CMD + [SSH_ALIAS, remote_cmd], capture_output=True, text=True, env=env or os.environ, timeout=timeout)
+    return subprocess.run(SSH_CMD + [SSH_ALIAS, remote_cmd], capture_output=True, text=True,
+                          env=env or os.environ, timeout=timeout, input=input)
 
 
 def tunnel_argv(ports=None, host=None, port=None, key=None, user=None):

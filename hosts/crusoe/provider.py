@@ -301,12 +301,22 @@ def norm_status(raw):
 
 def inst_ip(inst):
     """The public ipv4, or "". network_interfaces[0].ips[0].public_ipv4.address, defensively: a machine that is
-    still building has the interface but not the address, and a private-only VM never gets one."""
+    still building has the interface but not the address, and a private-only VM never gets one.
+
+    The value is parsed before it is believed. It ends up in the Host block of the operator's ~/.ssh/config, and a
+    string carrying a newline would put whatever followed it there as an ssh directive. That needs the API to be
+    lying, which is a high bar, but the check is one line and the blast radius is the operator's ssh config."""
+    import ipaddress
     for nic in (inst or {}).get("network_interfaces") or []:
         for ip in (nic or {}).get("ips") or []:
             addr = ((ip or {}).get("public_ipv4") or {}).get("address")
-            if addr:
-                return str(addr)
+            if not addr:
+                continue
+            try:
+                return str(ipaddress.ip_address(str(addr).strip()))
+            except ValueError:
+                raise PodctlError("the API gave %r as a public address, which is not an ip: refusing to write it "
+                                  "into your ssh config" % (str(addr)[:60],))
     return ""
 
 
@@ -345,14 +355,27 @@ def remote_ensure_cmd(text):
             % (REMOTE_STARTUP, REMOTE_EOF, text.rstrip("\n"), REMOTE_EOF, REMOTE_STARTUP, REMOTE_STARTUP))
 
 
-def jupyter_dropin_cmd(token):
-    """JupyterLab starts only when JUPYTER_TOKEN reaches boot.sh, and on this host boot.sh is a systemd unit, so the
-    token has to be a drop-in. Without this `podctl jupyter` reports no token forever, which reads as a bug."""
-    body = "[Service]\nEnvironment=JUPYTER_TOKEN=%s\n" % token
-    return ("sudo mkdir -p /etc/systemd/system/comfy-base-boot.service.d && "
-            "printf %s | sudo tee /etc/systemd/system/comfy-base-boot.service.d/jupyter.conf >/dev/null && "
-            "sudo chmod 600 /etc/systemd/system/comfy-base-boot.service.d/jupyter.conf && "
-            "sudo systemctl daemon-reload" % shlex.quote(body))
+DROPIN = "/etc/systemd/system/comfy-base-boot.service.d/jupyter.conf"
+
+
+def jupyter_dropin(token):
+    """(command, stdin) for the drop-in that carries JUPYTER_TOKEN. JupyterLab starts only when that reaches
+    boot.sh, and on this host boot.sh is a systemd unit, so without the drop-in `podctl jupyter` reports no token
+    forever and reads as a broken command.
+
+    The token goes on STDIN and never into the command. Two reasons, both found in review:
+
+    1. A value in the command is argv. sshd runs a non-login remote command as `bash -c '<cmd>'`, so it lands in
+       the machine's /proc/<pid>/cmdline, world-readable on Linux, and in ps on this Mac. Writing the file 0600
+       while publishing its contents in the process table protects nothing. lib/boot.sh states the rule for this
+       exact secret: the token rides the environment, never argv.
+    2. `printf <body>` makes the body printf's FORMAT string, so a token containing % or a backslash escape is
+       silently rewritten: MEASURED, `ab%sc` became `abc` and `100%done` became `1000one`. printf failing inside
+       a pipeline leaves the pipeline's status as tee's, so the && chain continued and ensure reported success
+       over a mangled file - an operator would hold a token the machine does not have."""
+    cmd = ("sudo mkdir -p %s && umask 077 && sudo tee %s >/dev/null && sudo chmod 600 %s && sudo systemctl daemon-reload"
+           % (shlex.quote(str(pathlib.PurePosixPath(DROPIN).parent)), shlex.quote(DROPIN), shlex.quote(DROPIN)))
+    return cmd, "[Service]\nEnvironment=JUPYTER_TOKEN=%s\n" % token
 
 
 # ---------------------------------------------------------------- the provider
@@ -525,7 +548,8 @@ class CrusoeProvider(Provider):
         log("ensure: %s" % ready)
         tok = (kw.get("jupyter_token") or os.environ.get("JUPYTER_TOKEN") or "").strip()
         if tok:
-            j = _c().ssh_run(jupyter_dropin_cmd(tok), timeout=120)
+            cmd, body = jupyter_dropin(tok)
+            j = _c().ssh_run(cmd, timeout=120, input=body)
             log("ensure: jupyter token %s" % ("written to a systemd drop-in" if j.returncode == 0 else "NOT written (rc %s)" % j.returncode))
         return "reachable: %s:%d (hostname %s)" % (host, SSH_PORT, _c()._ssh_hostname())
 
