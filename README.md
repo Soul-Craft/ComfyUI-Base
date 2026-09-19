@@ -54,18 +54,27 @@ that tier on its own. It is several GB and gitignored. Tiers that need a GPU or 
 
 ## Comfy MCP
 
-Every machine the base installs comes up drivable by an agent. `comfy-mcp` (the official Comfy-Org MCP server)
-goes into the run's venv, and the driver writes the client configuration:
+Every machine the base installs comes up drivable by an agent: `comfy-mcp` (the official Comfy-Org MCP server)
+goes into the run's venv, and the driver points a client at it.
+
+**For a ComfyUI on your own machine, use Comfy-Org's own tooling** — `comfy skills install`, or the Claude Code
+marketplace (`/plugin marketplace add Comfy-Org/comfy-skills`). They call that repository the single source of
+truth for the installer and the MCP server, it writes at user scope for Claude Code, Cursor and `AGENTS.md`,
+and it is theirs to keep current. This repository does not compete with it and ships no `.mcp.json`.
+
+**For a machine this base provisioned, use the driver.** That case is the one upstream's tooling does not
+cover: its local flow assumes ComfyUI is on your machine, and its cloud flow assumes Comfy Cloud, while this
+is a GPU you rented and installed with the base.
 
 ```bash
-podctl --provider runpod mcp <machine>              # comfy-mcp runs ON the machine, over ssh: every tool
+podctl --provider runpod mcp <machine>               # comfy-mcp runs ON the machine, over ssh: every tool
 podctl --provider runpod mcp <machine> --over tunnel # it runs here, through `podctl tunnel`: the run tools only
 ```
 
-The ssh transport is the default because `install_node`, `search_models`, `get_logs` and `fetch_outputs` need
-the ComfyUI tree, and the tree is on the machine. `BASE_MCP=0` skips the install. comfy-cli's telemetry is
-disabled in the stage, in the boot environment and in its config file — handbook §9.1 says why that is three
-places and not one.
+It writes a `.mcp.json` beside you (gitignored: it names one machine and your paths). The ssh transport is the
+default because `install_node`, `search_models`, `get_logs` and `fetch_outputs` need the ComfyUI tree, and the
+tree is on the machine. `BASE_MCP=0` skips the install. comfy-cli's telemetry is disabled in the stage, in the
+boot environment and in its config file — handbook §9.1 says why that is three places and not one.
 
 ## Contributing
 

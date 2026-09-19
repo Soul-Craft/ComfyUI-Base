@@ -15,6 +15,10 @@ __pycache__/
 .pytest_cache/
 # the Mac
 .DS_Store
+# the MCP client configuration `podctl mcp <machine>` writes: it names ONE machine and one operator's paths,
+# so it is per-checkout, never committed. Upstream's own `comfy skills install` handles a LOCAL ComfyUI and
+# writes at user scope; this file is only for a machine the base provisioned.
+.mcp.json
 # the shared ComfyUI testbed: an upstream clone plus its packs and venv, provisioned by ./testbed.sh and
 # reproducible from it. Several GB, none of it ours.
 /testbed/

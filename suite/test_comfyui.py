@@ -1,10 +1,20 @@
-"""comfyui tier: needs the shared testbed (../testbed beside the base, provisioned by ../testbed.sh) and,
-for the live checks, its server on 127.0.0.1:8199. Everything here skips cleanly when neither is present."""
+"""comfyui tier: needs the shared testbed and, for the live checks, its server on 127.0.0.1:8199. Since 2.6.0 the
+tree is <base>/testbed, provisioned by the testbed.sh that ships here; a brand repository has base/testbed beside
+base/comfyui-base instead. Both are looked for, in that order, the same way lib/95-summary.sh does it - the runner
+normally hands BASE_NODE_SRC down and this fallback is for a bare `pytest suite/`. Everything skips cleanly when
+neither is present."""
 import json, os, pathlib, re, subprocess, urllib.request, pytest
 from pathlib import Path
 pytestmark = pytest.mark.comfyui
 BASE = pathlib.Path(__file__).resolve().parents[1]
-NODE_SRC = os.environ.get("BASE_NODE_SRC") or (str(BASE.parent / "testbed") if (BASE.parent / "testbed" / "main.py").exists() else "")
+def _find_testbed():
+    for root in (BASE, BASE.parent):                      # in the base since 2.6.0, else beside it (a brand tree)
+        if (root / "testbed" / "main.py").exists():
+            return str(root / "testbed")
+    return ""
+
+
+NODE_SRC = os.environ.get("BASE_NODE_SRC") or _find_testbed()
 SERVER = os.environ.get("BASE_SERVER") or "127.0.0.1:%s" % os.environ.get("TESTBED_PORT", "8199")
 
 
@@ -16,7 +26,7 @@ def _server_up():
 
 
 def test_comfyui_loader_map_knows_every_core_loader_class_in_the_tree():
-    if not NODE_SRC: pytest.skip("no testbed at ../testbed")
+    if not NODE_SRC: pytest.skip("no testbed in or beside the base (bash testbed.sh --server)")
     if not (pathlib.Path(NODE_SRC) / "nodes.py").exists(): pytest.skip("%s is not a full ComfyUI tree (a fake pod's): no nodes.py to read" % NODE_SRC)   # 2.0.16
     cats = {ln.split("|")[0] for ln in re.findall(r'"([A-Za-z0-9_ ()]+\|[A-Za-z0-9_]+)"', (BASE / "lib" / "60-sync.sh").read_text())}
     core = (pathlib.Path(NODE_SRC) / "nodes.py").read_text()

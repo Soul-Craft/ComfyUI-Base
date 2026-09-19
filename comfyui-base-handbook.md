@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.9.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.10.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -435,6 +435,16 @@ installed there and ssh is the default. The ssh transport passes `ClearAllForwar
 holds them prints warnings onto the very stdio channel MCP is speaking. The tunnel transport takes the alias's
 own local port (`tunnel_locals`), so two machines never point at one tunnel.
 
+**What this repository does NOT ship.** No `.mcp.json` is committed. Comfy-Org's `comfy skills install` writes
+the client configuration for Claude Code, Cursor and `AGENTS.md` at user scope, and their `Comfy-Org/comfy-skills`
+marketplace calls itself the single source of truth for the installer and the MCP server; comfy-mcp itself had two
+releases in its first two months. A second, committed source of truth for a thing that young, owned by someone
+else, would drift within weeks and would prompt every person who clones this repository to enable a server that
+cannot work until they have a tunnel up. So the local case belongs to upstream, and what stays here is the case
+upstream does not cover: a machine the base provisioned on a rented GPU, which is neither "ComfyUI on your
+machine" nor Comfy Cloud. `podctl mcp` writes that file, and `.gitignore` keeps it out of the tree because it
+names one machine and one operator's paths.
+
 **`COMFY_BIN`.** comfy-mcp is a wrapper: its discovery and lifecycle tools shell out to comfy-cli, which it
 finds through `COMFY_BIN` or `PATH`. An MCP client is usually launched by a GUI, whose `PATH` is not your
 shell's, so `PATH` is the thing not to rely on. `podctl mcp` therefore names the binary: over ssh it is the
@@ -452,6 +462,23 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.10.0: the MCP client configuration stops being this repository's to own. 2.7.0 committed a `.mcp.json` at
+  the root, which Claude Code and Cursor read automatically: every person who cloned the repository was
+  prompted to enable a `comfy` server that could not work until they had comfy-mcp installed and a tunnel up.
+  Researched rather than guessed, and the answer was upstream's: `comfy skills install` writes six skills
+  across Claude Code, Cursor and `AGENTS.md` at user scope, with install / uninstall / status / validate, and
+  `Comfy-Org/comfy-skills` describes itself as the single source of truth for the installer and the MCP
+  server. comfy-mcp shipped 0.9.0 and 0.10.0 within two months. Competing with that would have drifted within
+  weeks. The local case is upstream's now and the README says so; what stays is the case their tooling does
+  not cover, because its local flow assumes ComfyUI is on your machine and its cloud flow assumes Comfy Cloud:
+  a machine the base provisioned on a rented GPU. `podctl mcp` still writes the file, and it is gitignored,
+  because it names one machine and one operator's paths. Also, two more places still resolved the testbed at
+  the pre-2.6.0 path only: `suite/test_comfyui.py`, whose fallback made the whole tier skip under a bare
+  `pytest suite/` in a standalone clone, and `gate()` in podctl. Both look in the base first and beside it
+  second now, as `_base_use_testbed` does. That is the third instance of the same 2.6.0 oversight; the moral
+  is that moving a file one level up means auditing every path expressed relative to it, not just the ones a
+  test happens to cover.
 
 - 2.9.2: the testbed finds a consumer repository's packages again. 2.6.0 moved `testbed.sh` into the base,
   which changed `$HERE` by one level and silently broke the glob that locates the packages:

@@ -536,7 +536,10 @@ class PodIO:
             if not script.exists():
                 raise PodctlError("%s: the zip has no %s to run" % (it["name"], script.name))
             env = dict(self.env)
-            env.setdefault("BASE_NODE_SRC", str(base_dir.parent / "testbed"))
+            # the testbed is in the base since 2.6.0, or beside it in a brand tree; first one that exists
+            _tb = next((d for d in (base_dir / "testbed", base_dir.parent / "testbed") if (d / "main.py").exists()),
+                       base_dir.parent / "testbed")
+            env.setdefault("BASE_NODE_SRC", str(_tb))
             env.setdefault("BASE_SERVER", env.get("BASE_SERVER", "127.0.0.1:8199"))
             if it["kind"] != "base":
                 env["COMFY_BASE"] = str(base_dir)
