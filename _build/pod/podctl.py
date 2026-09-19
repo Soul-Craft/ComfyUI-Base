@@ -94,14 +94,15 @@ RUNPOD_BLOCK = _block_for(SSH_ALIAS, SSH_USER, KEY_PATH)
 
 def set_provider(prov, env=None):
     """Bind the run to one host: the alias, user, key and volume root every generic function reads from here on."""
-    global PROVIDER, SSH_ALIAS, SSH_USER, KEY_PATH, VOLUME_ROOT, LEASE_PATH, RUNPOD_BLOCK
+    global PROVIDER, SSH_ALIAS, SSH_USER, KEY_PATH, VOLUME_ROOT, LEASE_PATH, LEGACY_LEASE_PATH, RUNPOD_BLOCK
     env = os.environ if env is None else env
     PROVIDER = prov
     SSH_ALIAS = (env.get("PODCTL_HOST") or "").strip() or prov.ssh_alias
     SSH_USER = prov.ssh_user
     KEY_PATH = str(prov.key_path)
     VOLUME_ROOT = prov.volume_root.rstrip("/") or "/"
-    LEASE_PATH = VOLUME_ROOT + "/comfy-base/state/gpu.lease"
+    LEASE_PATH = (env.get("BASE_LOCAL_STATE", "").strip() or LOCAL_STATE).rstrip("/") + "/gpu.lease"
+    LEGACY_LEASE_PATH = VOLUME_ROOT + "/comfy-base/state/gpu.lease"
     RUNPOD_BLOCK = _block_for(SSH_ALIAS, SSH_USER, KEY_PATH)
     return prov
 
@@ -705,7 +706,22 @@ def cmd_upload(prov, args):
 #
 # It is ADVISORY and it EXPIRES. A crashed session must never lock the pod out, so an expired lease is not a
 # blocker and never needs cleaning up; `--force-lease` overrides a live one when a human has decided.
-LEASE_PATH = "/workspace/comfy-base/state/gpu.lease"
+#
+# 2.5.5: the lease lives under BASE_LOCAL_STATE, NOT on the volume. It was written to
+# $BASE_VOLUME/comfy-base/state/gpu.lease, which is per-machine only while the volume is. Under the shared root
+# (2.5.0) /workspace IS one store that every machine mounts, so that single file became a GLOBAL MUTEX: three
+# machines, three GPUs, one lease, and lease_blocks refusing whoever asked second. That is the exact opposite of
+# the shape's whole claim, which is that installs serialise on the mkdir lock and RUNNING does not, so several
+# GPUs can render at once. The rule it broke, and the one to apply to anything added here: anything about the
+# MACHINE is per machine, anything about the WORK is shared. A lease is about a GPU, so it is the machine's.
+#
+# Deliberately NOT moved with it, having checked every VOLUME_ROOT-derived path rather than the one that bit:
+# pkgs_dir() and upload --to are about the WORK and stay shared; state/logs/ is about the machine but the SHELL
+# side writes there too (lib/10-discover.sh:5, lib/boot.sh), so moving only the driver's half would split every
+# install's logs across two places, which is worse than one interleaved directory and wants a two-sided change.
+LOCAL_STATE = "/var/lib/comfy-base-machine"      # lib/00-env.sh's BASE_LOCAL_STATE default
+LEASE_PATH = LOCAL_STATE + "/gpu.lease"
+LEGACY_LEASE_PATH = "/workspace/comfy-base/state/gpu.lease"
 
 
 def lease_session_id(env=None):
@@ -784,12 +800,35 @@ def lease_blocks(lease, me, now=None):
 
 
 def lease_read(timeout=30):
-    """The lease on the pod, or None. A pod that cannot be reached reads as free: this is advisory."""
+    """The lease on the pod, or None. A pod that cannot be reached reads as free: this is advisory.
+
+    Reads the machine's own lease. A pre-2.5.5 lease on the shared volume is reported by
+    lease_legacy_note() rather than obeyed: obeying it would reinstate the global mutex this release
+    exists to remove, and it may belong to a different machine entirely."""
     try:
         r = ssh_run("cat %s 2>/dev/null || true" % LEASE_PATH, timeout=timeout)
     except Exception:                                        # pragma: no cover - defensive
         return None
     return lease_parse(r.stdout if r.returncode == 0 else "")
+
+
+def lease_legacy_note(timeout=30):
+    """One line if a live pre-2.5.5 lease is still sitting on the shared volume, else "".
+
+    Not a blocker. It is information: during the changeover a session on the old code may hold it,
+    and a human deciding whether to wait should be told rather than left to wonder why a machine
+    that reads as free has someone working on it."""
+    try:
+        r = ssh_run("cat %s 2>/dev/null || true" % LEGACY_LEASE_PATH, timeout=timeout)
+    except Exception:                                        # pragma: no cover - defensive
+        return ""
+    old = lease_parse(r.stdout if r.returncode == 0 else "")
+    if not old or lease_expired(old):
+        return ""
+    return ("note    a pre-2.5.5 lease is still on the SHARED volume, held by %s until %s%s. It is not obeyed "
+            "(it may be another machine's); %s is this machine's." % (
+                old.get("holder", "?"), old.get("expires", "?"),
+                (" for %s" % old["purpose"]) if old.get("purpose") else "", LEASE_PATH))
 
 
 def lease_minutes_keeping(current, holder, minutes, now=None):
@@ -854,6 +893,9 @@ def cmd_lease(api, args):
         return 0 if ok else 3
     cur = lease_read()
     if not args.take:
+        note = lease_legacy_note()
+        if note:
+            print(note)
         if not cur:
             print("lease   free")
         else:

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.4.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.5.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -403,6 +403,21 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.5: the GPU lease is the MACHINE's, so it moved off the volume to `BASE_LOCAL_STATE`. It was written to
+  `$BASE_VOLUME/comfy-base/state/gpu.lease`, which is per machine only while the volume is. Under the shared root
+  (2.5.0) `/workspace` IS one store that every machine mounts, so that one file became a global mutex: three
+  machines, three GPUs, one lease, and `lease_blocks` refusing whoever asked second. That is the exact inverse of
+  the shape's own claim, which is that installs serialise on the mkdir lock and RUNNING does not, precisely so
+  several GPUs can render at once. A pre-2.5.5 lease still on the volume is REPORTED by `podctl lease` and not
+  obeyed, because obeying it would reinstate the mutex and it may belong to another machine entirely.
+  The rule, and the one to apply to anything added here: anything about the MACHINE is per machine, anything
+  about the WORK is shared. Deliberately not moved with it, after checking every `VOLUME_ROOT`-derived path
+  rather than the one that bit: `pkgs_dir()` and `upload --to` are the work's; `state/logs/` is the machine's but
+  the SHELL side writes there too (`lib/10-discover.sh:5`, `lib/boot.sh`), so moving only the driver's half would
+  split an install's logs across two directories, which is worse than one interleaved directory and wants a
+  two-sided change. `state/host.env` is the machine's too and is worse than stale: it PROPAGATES, because a
+  machine that ensures correctly has `recall_library` read another machine's `BASE_LIBRARY` back out of the
+  shared file and mount the store twice. Measured on two machines 2026-09-18; it is owed its own release.
 - 2.5.4: a dry run is a report, not a gate, where a report is all it can honestly be. `--check` failed any
   `LOCAL` model row whose file was not on disk, although a `LOCAL` row is placed by the package's own
   `pkg_pre_models`, which does nothing under `BASE_DRY`. So the file was absent BY DESIGN at check time and its

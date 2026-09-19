@@ -171,7 +171,15 @@ def test_unit_driver_binds_alias_user_key_and_volume_from_the_provider(monkeypat
     prov = podctl.RunPodProvider(api=object())
     monkeypatch.delenv("PODCTL_HOST", raising=False)
     podctl.set_provider(prov, env={})
-    assert (podctl.SSH_ALIAS, podctl.SSH_USER, podctl.VOLUME_ROOT, podctl.LEASE_PATH) == ("runpod", "root", "/workspace", "/workspace/comfy-base/state/gpu.lease")
+    assert (podctl.SSH_ALIAS, podctl.SSH_USER, podctl.VOLUME_ROOT) == ("runpod", "root", "/workspace")
+    # 2.5.5: the lease is the MACHINE's, so it is under BASE_LOCAL_STATE and NOT derived from the volume.
+    # On the shared root the volume is one store every machine mounts, and a lease there is a global mutex.
+    assert podctl.LEASE_PATH == "/var/lib/comfy-base-machine/gpu.lease"
+    assert podctl.LEGACY_LEASE_PATH == "/workspace/comfy-base/state/gpu.lease"   # read for a note, never obeyed
+    assert "/workspace" not in podctl.LEASE_PATH, "a lease on the volume is shared by every machine that mounts it"
+    podctl.set_provider(prov, env={"BASE_LOCAL_STATE": "/var/lib/elsewhere"})
+    assert podctl.LEASE_PATH == "/var/lib/elsewhere/gpu.lease"
+    podctl.set_provider(prov, env={})
     assert podctl.pkgs_dir() == "/workspace/packages" and prov.host_env() == "BASE_HOST=runpod\nBASE_VOLUME=/workspace\n"
     podctl.set_provider(prov, env={"PODCTL_HOST": "runpod-abc"})
     assert podctl.SSH_ALIAS == "runpod-abc"                                                # a session's own block still wins
