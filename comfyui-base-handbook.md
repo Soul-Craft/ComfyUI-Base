@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.9.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.9.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -452,6 +452,18 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.9.2: the testbed finds a consumer repository's packages again. 2.6.0 moved `testbed.sh` into the base,
+  which changed `$HERE` by one level and silently broke the glob that locates the packages:
+  `$HERE/../*/packages/*/` from `<repo>/base/comfyui-base` resolves to `<repo>/base/*/packages/*/` and matches
+  nothing. MEASURED on a reconstructed consumer layout: zero matches, so the testbed would have provisioned the
+  base's own packs and none of the package's, and the `comfyui` tier would have run against a tree missing the
+  very packs it exists to exercise - green, and meaningless. Exactly the failure `BASE_SH` was fixed for in
+  2.6.0; its sibling went unnoticed because a standalone base has no packages either way, and that is the only
+  shape the suite could see. The root is searched for now, one level up then two, and a candidate counts only
+  when it holds a `<name>/<name>-script.sh` - two levels up from a standalone checkout is an unrelated
+  directory. `--status` also prints what it derived and where from, because silent derivation is how this
+  shipped. Proven on all three layouts: base-as-submodule, testbed.sh-beside-the-base, and standalone.
 
 - 2.9.1: the forwarded ports say why they are forwarded. `TUNNEL_SERVICES` carries 9199 and 11434 next to
   ComfyUI's 8188 and JupyterLab's 8888, and the comment beside them explained only the per-alias offset (a

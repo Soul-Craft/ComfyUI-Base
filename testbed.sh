@@ -72,9 +72,32 @@ EXTRA=(
 # standalone base checkout the glob matches nothing and no links are made, which is correct: there are no
 # packages to vendor. Absolute paths, so the link loop does not re-anchor them.
 VENDORED=()
+
+# Where the packages are. testbed.sh sits IN the base (this repository, since 2.6.0) or beside it (a brand
+# repository before that), and a brand's packages are at <repo>/<brand>/packages/<name>/ either way — so the
+# repository root is one level up or two, depending on which. Two levels up from a STANDALONE base checkout is
+# whatever directory happens to contain it, which could hold an unrelated sibling, so a candidate only counts
+# when it actually holds a package: a <name>/ whose <name>-script.sh exists. A standalone base finds none, and
+# that is correct — it has no packages, and list-packs still supplies the base's own rows.
+REPO_ROOT=""
+_find_repo_root(){
+  local root d name
+  for root in "$HERE/../.." "$HERE/.."; do
+    [ -d "$root" ] || continue
+    for d in "$root"/*/packages/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "${d%/}")"
+      if [ -f "$d/$name-script.sh" ]; then REPO_ROOT="$(cd "$root" && pwd)"; return 0; fi
+    done
+  done
+  return 0
+}
+_find_repo_root
+
 derive_vendored(){
   local d
-  for d in "$HERE"/../*/packages/*/*/; do
+  [ -n "$REPO_ROOT" ] || return 0
+  for d in "$REPO_ROOT"/*/packages/*/*/; do
     [ -d "$d" ] || continue
     case "$(basename "$d")" in _*) continue;; esac      # _build/ and friends are not node packs
     [ -f "$d/__init__.py" ] || continue
@@ -91,7 +114,7 @@ derive_packs() {
   if [ -f "$BASE_SH" ]; then
     while IFS='|' read -r dir url sha; do
       if [ -n "$dir" ] && ! _has_pack "$dir"; then PACKS+=("$dir|$url|$sha"); fi
-    done < <(bash "$BASE_SH" list-packs "$HERE"/../*/packages/*/ 2>/dev/null || true)
+    done < <(bash "$BASE_SH" list-packs ${REPO_ROOT:+"$REPO_ROOT"/*/packages/*/} 2>/dev/null || true)
   else
     warn "no ComfyUI Base beside this script — only EXTRA packs are provisioned"
   fi
@@ -214,6 +237,9 @@ status() {
   [ -x "$VENV/bin/python" ] && ok "venv $($VENV/bin/python -V 2>&1)" || note "no venv"
   if curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then ok "server answering on $PORT"; else note "server not running"; fi
   [ -f "$PORTF" ] && note "port file: $PORTF ($(tr -d '[:space:]' < "$PORTF"))"
+  # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
+  # a testbed that quietly provisioned the base's packs and none of a consumer repository's.
+  note "packs: ${#PACKS[@]} derived${REPO_ROOT:+ · packages under $REPO_ROOT}${REPO_ROOT:+ · ${#VENDORED[@]} vendored}"
   echo; note "BASE_NODE_SRC=\"$COMFY\"   BASE_SERVER=127.0.0.1:$PORT"
 }
 

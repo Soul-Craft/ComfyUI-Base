@@ -1,6 +1,6 @@
 """unit tier: source contracts on the base library. Every test reads the library's text or runs a
 function against a throwaway tree; nothing here needs the pod, the network, or a ComfyUI checkout."""
-import os, re, json, subprocess, pathlib, sys, pytest
+import os, re, json, shutil, subprocess, pathlib, sys, pytest
 pytestmark = pytest.mark.unit
 BASE = pathlib.Path(__file__).resolve().parents[1]
 LIB = sorted((BASE / "lib").glob("*.sh"))
@@ -2627,3 +2627,42 @@ def test_unit_sageattention_takes_a_commit_as_well_as_a_branch():
     assert "fetch -q --depth 1 origin" in body, "a commit is fetched by object name, not --branch"
     assert '--branch "$ref"' in body, "a branch or a tag still takes the clone fast path"
     assert "SAGE_REF:-main" in body, "the default stays main deliberately"
+
+
+def test_unit_the_testbed_finds_a_consumer_repositorys_packages(tmp_path):
+    """2.6.0 moved testbed.sh INTO the base, which changed $HERE by one level and silently broke the glob that
+    finds a consumer repository's packages: `$HERE/../*/packages/*/` from <repo>/base/comfyui-base resolves to
+    <repo>/base/*/packages/*/ and matches nothing. The testbed would then provision the base's own packs and
+    none of the package's, and the comfyui tier would run against a tree missing the very packs it exists to
+    exercise - green, and meaningless. The root is searched for now, and a candidate only counts when it holds
+    a <name>/<name>-script.sh, because two levels up from a standalone base is an unrelated directory."""
+    _repo_only("the repo's testbed.sh")
+    tbsh = next((q for q in (BASE / "testbed.sh", BASE.parent / "testbed.sh") if q.exists()), None)
+    if tbsh is None:
+        pytest.skip("no testbed.sh in or beside the base")
+    base = tmp_path / "base" / "comfyui-base"
+    (base / "lib").mkdir(parents=True)
+    for f in ("base.sh", "VERSION", "pytest.ini"):
+        (base / f).write_text((BASE / f).read_text())
+    for q in (BASE / "lib").glob("*.sh"):
+        (base / "lib" / q.name).write_text(q.read_text())
+    (base / "py").mkdir()
+    (base / "testbed.sh").write_text(tbsh.read_text())
+    pkg = tmp_path / "brand" / "packages" / "pkg-x"
+    pkg.mkdir(parents=True)
+    (pkg / "pkg-x-script.sh").write_text('PKG_ID="pkg-x"\n')
+
+    r = subprocess.run(["bash", str(base / "testbed.sh"), "--status"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "packages under %s" % tmp_path.resolve() in r.stdout, r.stdout + r.stderr
+    assert "no ComfyUI Base beside this script" not in (r.stdout + r.stderr), r.stdout
+
+    # And a standalone base, which has no packages, must NOT claim a root. It is placed two levels deep in an
+    # otherwise empty tree: a copy beside `brand/` would legitimately find it one level up, which is the same
+    # thing a checkout sitting next to a brand tree does, and is not what this asserts.
+    solo = tmp_path / "iso" / "deep" / "solo"
+    solo.parent.mkdir(parents=True)
+    shutil.copytree(base, solo)
+    r2 = subprocess.run(["bash", str(solo / "testbed.sh"), "--status"], capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "packages under" not in r2.stdout, r2.stdout
