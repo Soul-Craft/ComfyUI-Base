@@ -1230,3 +1230,52 @@ def test_unit_each_workflow_gets_its_own_local_port():
             for a in ("verda-krea2", "verda-cc", "verda-h3")}
     assert len(set(seen.values())) == 3, seen
     assert m._block_for("an-unknown-alias", "root", "/k").count("LocalForward 8188 localhost:8188") == 1
+
+
+# ---------------------------------------------------------------- 2.7.0: the .mcp.json podctl writes
+
+def test_unit_mcp_over_ssh_runs_the_server_on_the_machine():
+    """The ssh transport is the default because it is the only one where install_node, search_models, get_logs
+    and fetch_outputs work: those tools need the tree, and the tree is on the machine."""
+    podctl = _load()
+    srv = podctl.mcp_server("runpod", "ssh", bin_path="/workspace/ComfyUI/.venv-cu130/bin/comfy-mcp")
+    assert srv["command"] == "ssh"
+    a = srv["args"]
+    # not cosmetic: the Host block ssh-config writes carries four LocalForward lines, and a second session
+    # binding them while `podctl tunnel` holds them prints warnings onto the stdio channel MCP speaks.
+    assert "ClearAllForwardings=yes" in a, a
+    assert a[-2] == "runpod", a
+    assert a[-1].endswith("exec /workspace/ComfyUI/.venv-cu130/bin/comfy-mcp"), a[-1]
+    # the remote command carries the environment: an MCP client's "env" is local, and would never reach the pod
+    assert "DO_NOT_TRACK=1" in a[-1] and "COMFY_NO_TELEMETRY=1" in a[-1], a[-1]
+
+
+def test_unit_mcp_over_the_tunnel_takes_the_alias_own_port():
+    """With one GPU per workflow every machine serves 8188, so the local side is offset per alias — otherwise
+    a second machine's config would point at the first machine's tunnel."""
+    podctl = _load()
+    base = podctl.mcp_server("verda", "tunnel")
+    assert base["command"] == "comfy-mcp"
+    assert base["env"]["COMFYUI_URL"] == "http://127.0.0.1:8188", base
+    assert base["env"]["DO_NOT_TRACK"] == "1" and base["env"]["COMFY_NO_TELEMETRY"] == "1"
+    for alias, want in (("verda-cc", 8189), ("verda-h3", 8190)):
+        got = podctl.mcp_server(alias, "tunnel")["env"]["COMFYUI_URL"]
+        assert got == "http://127.0.0.1:%d" % want, (alias, got)
+        assert got != base["env"]["COMFYUI_URL"]
+
+
+def test_unit_mcp_keeps_every_other_server_in_the_file():
+    """A .mcp.json is often not only ours — clobbering a client's other servers would be a rude way to arrive."""
+    podctl = _load()
+    existing = {"mcpServers": {"something-else": {"command": "other"}}, "unrelatedKey": 1}
+    out = podctl.mcp_merge(existing, "comfy-runpod", podctl.mcp_server("runpod", "tunnel"))
+    assert out["mcpServers"]["something-else"] == {"command": "other"}
+    assert out["unrelatedKey"] == 1
+    assert "comfy-runpod" in out["mcpServers"]
+    assert existing["mcpServers"] == {"something-else": {"command": "other"}}, "the input must not be mutated"
+
+
+def test_unit_mcp_refuses_a_transport_it_does_not_have():
+    podctl = _load()
+    with pytest.raises(podctl.PodctlError, match="unknown mcp transport"):
+        podctl.mcp_server("runpod", "carrier-pigeon")

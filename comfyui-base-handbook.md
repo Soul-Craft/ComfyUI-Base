@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.6.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.7.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -414,7 +414,51 @@ extensions" when neither place has one.
 The base ships no extension. A project's image adds its own stages this way (copying its seed onto an empty volume,
 provisioning, a status page), in the project's own repository.
 
+## 9.1 Comfy MCP (the agent's way in)
+
+`comfy-mcp` is a stdio MCP server wrapping `comfy-cli`. Since 2.7.0 the base installs it into the run's venv
+(`lib/45-mcp.sh`), beside ComfyUI itself, and `podctl mcp <machine>` writes the client configuration.
+`BASE_MCP=0` skips the install; the stage never fails a run.
+
+There are two transports and the difference is not cosmetic:
+
+| | where comfy-mcp runs | what works |
+|---|---|---|
+| `--over ssh` (default) | on the machine | everything: `install_node`, `search_models`, `get_logs`, `fetch_outputs`, `launch_comfyui`, and the run tools |
+| `--over tunnel` | on your Mac, reaching `COMFYUI_URL` through `podctl tunnel` | the run tools only |
+
+The lifecycle and discovery tools need the tree, and the tree is on the machine — which is why the server is
+installed there and ssh is the default. The ssh transport passes `ClearAllForwardings=yes`: the `Host` block
+`podctl ssh-config` writes carries four `LocalForward` lines, and a second session binding them while a tunnel
+holds them prints warnings onto the very stdio channel MCP is speaking. The tunnel transport takes the alias's
+own local port (`tunnel_locals`), so two machines never point at one tunnel.
+
+**Telemetry.** `comfy-cli` depends on `mixpanel` and `posthog`, and rule 9 says the outbound hosts are an
+allowlist and nothing is uploaded. That wheel is not our source, so the allowlist test cannot see it. Three
+things are done instead, in order of how much they can be relied on: `DO_NOT_TRACK` and `COMFY_NO_TELEMETRY`
+are exported before anything from the wheel runs — comfy-cli honours the `DO_NOT_TRACK` convention by never
+importing its telemetry extension at all, so this is the code path not loading rather than a request to be
+quiet; the same two go into the boot environment, because a machine that reboots must come back as quiet as it
+was installed; and `comfy tracking disable` writes the config file (`~/.config/comfy-cli/config.ini` on Linux)
+for any invocation that somehow arrives without the environment. The suite asserts the first two.
+
 ## 10. Record
+
+- 2.7.0: the machine is drivable by an agent. `lib/45-mcp.sh` installs `comfy-cli` and `comfy-mcp` into the
+  run's venv and binds comfy-cli to the discovered tree; `podctl mcp <machine>` writes the `.mcp.json`, over
+  ssh by default and over the tunnel on request. The transport matters more than it looks: comfy-mcp's
+  lifecycle and discovery tools only work where the tree is, so a tunnel-only client can run a workflow and
+  little else, which is rarely what anyone wanted. §9.1 has the table. Telemetry was the one real obstacle —
+  comfy-cli depends on mixpanel and posthog, rule 9 says nothing is uploaded, and a wheel's behaviour is
+  invisible to the outbound-host test because it is not our source; both kill switches are exported in the
+  stage and in the boot environment, `comfy tracking disable` writes the config too, and the suite asserts it
+  so it cannot regress quietly. MEASURED 2026-09-19, the stage run against a real venv: comfy-cli 1.20.0 and
+  comfy-mcp 0.10.0 installed, the workspace bound, and torch 2.14.0 / torchvision 0.29.0 / torchaudio 2.11.0
+  unchanged afterwards — none of comfy-cli's 29 dependencies is torch, torchvision, torchaudio or numpy, and
+  the constraints file is passed anyway. That run also settled how to install: `$PY -m pip` works on a pod
+  because 30-venv.sh seeds the venv, but a venv built without `--seed` has no pip at all, and uv built the
+  venv in the first place — so the stage uses uv and stops depending on a detail it does not control.
+  `BASE_MCP=0` skips the whole stage, which never fails a run.
 
 - 2.6.0: the testbed the base tests itself with now lives in the base. `testbed.sh` was carried by the brand
   repositories, so `suite/test_unit.py` skipped the `comfyui` tier by name — "this base is its own repository

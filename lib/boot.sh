@@ -62,6 +62,7 @@ boot_host(){ # 2.2.0: which host this is and where it may listen. RunPod's own v
     BASE_LIBRARY=""
   fi
   export BASE_HOST BASE_LISTEN BASE_LIBRARY
+  export DO_NOT_TRACK=1 COMFY_NO_TELEMETRY=1   # comfy-cli ships mixpanel and posthog; rule 9 says nothing is uploaded
   echo "boot: host $BASE_HOST · listen $BASE_LISTEN · volume $BOOT_VOLUME · library ${BASE_LIBRARY:-none}"
 }
 boot_extensions(){ # 2.2.0: a project's own boot stages, ext/*.sh, sourced in name order. Looked for on the volume first, then beside

@@ -37,6 +37,9 @@
 #                        servers writing one user/ tread on each other; and an install takes a lock, because two
 #                        machines writing one venv corrupts it. RUNNING takes no lock: running only reads, which is
 #                        what makes several GPUs on one store safe.
+# BASE_MCP               2.7.0: 1 (the default) installs Comfy MCP into the run's venv, so an agent can drive this
+#                        machine — `podctl mcp <machine>` writes the client configuration. 0 skips it entirely.
+#                        comfy-cli's telemetry is disabled either way (lib/45-mcp.sh explains how, and why it has to be).
 # BASE_LOCAL_STATE       2.5.0: the per-machine root (default /var/lib/comfy-base-machine) for exactly those things.
 # BASE_LIBRARY           2.4.0: the SHARED library's mount point, or empty. One store several machines mount at once
 #                        (on Verda an NVMe_Shared volume over NFS, mounted by hosts/verda/startup.sh): the model
@@ -118,7 +121,7 @@ MODEL_OK_GB=0; MODEL_MOVED_GB=0; MODEL_DL_GB=0; MODEL_FAIL_GB=0
 DEL_FILES=(); DEL_BYTES=0; UNKNOWN_FILES=(); UNCLAIMED_FILES=()
 BASE_TEST_RESULT="not run"; BASE_TEST_RC=0; BASE_SMOKE_RESULT="not run"; BASE_IMPORT_RESULT="not run"
 BASE_COMBO_RESULT="not run"; BASE_SYNC_RESULT="not run"; BASE_RESTART_RESULT="not run"
-BASE_BOOT_RESULT="not run"; BASE_TOOLS_RESULT="not run"
+BASE_BOOT_RESULT="not run"; BASE_TOOLS_RESULT="not run"; BASE_MCP_RESULT="not run"
 BASE_VENV_RESULT="not run"; BASE_TORCH_INFO="?"; BASE_VENV_BACKUP=""
 BASE_BLOCK_RESTART=0; BASE_RESTART_NEEDED=0; BASE_RESTART_WHY=()
 # A package's own reasons to restart. base_restart() REBUILDS BASE_RESTART_WHY from the

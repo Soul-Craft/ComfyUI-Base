@@ -1080,6 +1080,80 @@ def cmd_tunnel(prov, args):
     return subprocess.call(argv)
 
 
+# ---------------------------------------------------------------- Comfy MCP: the agent's way in
+# comfy-mcp is a stdio server. Two transports, and the difference is not cosmetic:
+#
+#   ssh     the server runs ON the machine, so every tool works — install_node, search_models, get_logs,
+#           fetch_outputs, launch_comfyui. The client speaks MCP down an ssh pipe.
+#   tunnel  the server runs on this Mac and reaches ComfyUI over COMFYUI_URL through `podctl tunnel`. The
+#           run tools work; the ones that need the tree do not, because the tree is on the other machine.
+#
+# ssh is the default because the smaller set is rarely what anyone wanted. ClearAllForwardings is not
+# optional: the Host block ssh-config writes carries four LocalForward lines, and a second session binding
+# them while `podctl tunnel` holds them prints warnings onto the stdio channel MCP is trying to speak.
+MCP_ENV = {"DO_NOT_TRACK": "1", "COMFY_NO_TELEMETRY": "1"}   # comfy-cli ships mixpanel and posthog; rule 9 says nothing is uploaded
+MCP_VENV_DIRNAME = ".venv-cu130"
+
+
+def mcp_default_bin(volume_root=None):
+    """Where lib/45-mcp.sh puts comfy-mcp: the run's venv, beside ComfyUI on the volume. A machine whose tree
+    is somewhere else is what --bin is for; `mcp` resolves the real path over ssh when the pod answers."""
+    root = (volume_root if volume_root is not None else VOLUME_ROOT).rstrip("/")
+    return "%s/ComfyUI/%s/bin/comfy-mcp" % (root, MCP_VENV_DIRNAME)
+
+
+def mcp_server(alias, mode="ssh", bin_path=None, port=None):
+    """One `mcpServers` entry, as a client reads it. Pure: the suite builds it without a pod."""
+    if mode == "ssh":
+        remote = " ".join("%s=%s" % (k, v) for k, v in sorted(MCP_ENV.items())) + " exec " + (bin_path or mcp_default_bin())
+        return {"command": "ssh",
+                "args": ["-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes", alias, remote]}
+    if mode == "tunnel":
+        local = port if port is not None else tunnel_locals(alias)["comfy"]
+        env = dict(MCP_ENV); env["COMFYUI_URL"] = "http://127.0.0.1:%d" % int(local)
+        return {"command": "comfy-mcp", "env": env}
+    raise PodctlError("unknown mcp transport %r (ssh | tunnel)" % mode)
+
+
+def mcp_merge(existing, name, server):
+    """Add or replace one server, keeping every other one. A .mcp.json is often not only ours."""
+    out = dict(existing or {})
+    servers = dict(out.get("mcpServers") or {})
+    servers[name] = server
+    out["mcpServers"] = servers
+    return out
+
+
+def cmd_mcp(prov, args):
+    import json
+    alias = SSH_ALIAS
+    name = "comfy-%s" % alias
+    bin_path = getattr(args, "bin", None)
+    if args.over == "ssh" and not bin_path:
+        # ask the machine where its comfy-mcp actually is; the computed default is only a fallback
+        r = ssh_run("ls -1 %s/*/%s/bin/comfy-mcp %s 2>/dev/null | head -1" % (_sq(VOLUME_ROOT), MCP_VENV_DIRNAME, _sq(mcp_default_bin())))
+        found = (r.stdout or "").strip().splitlines()
+        bin_path = found[0].strip() if r.returncode == 0 and found else None
+        if not bin_path:
+            bin_path = mcp_default_bin()
+            print("mcp     could not ask %s where comfy-mcp is; using %s (override with --bin)" % (alias, bin_path), file=sys.stderr)
+    cfg = mcp_merge({}, name, mcp_server(alias, args.over, bin_path=bin_path))
+    if args.print_only:
+        print(json.dumps(cfg, indent=2))
+        return 0
+    dest = pathlib.Path(args.out)
+    if dest.exists():
+        try:
+            cfg = mcp_merge(json.loads(dest.read_text(encoding="utf-8")), name, mcp_server(alias, args.over, bin_path=bin_path))
+        except ValueError as e:
+            raise PodctlError("%s is not valid JSON (%s) — move it aside or use --print" % (dest, e))
+    dest.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print("mcp     wrote %s  (server %s, over %s)" % (dest, name, args.over))
+    if args.over == "tunnel":
+        print("mcp     needs `podctl tunnel %s` running; ComfyUI is on local port %d" % (args.pod, tunnel_locals(alias)["comfy"]))
+    return 0
+
+
 def cmd_jupyter(prov, args):
     """The URL, with the token already in it, ready to paste into a browser.
 
@@ -1217,6 +1291,14 @@ def build_parser():
     p.add_argument("pod"); p.add_argument("--port", type=tunnel_port, action=_FreshAppend, default=list(TUNNEL_PORTS),
                    help="repeatable; default 8188 and 8888. LOCAL:REMOTE shifts the local side, e.g. --port 8190:8188 "
                         "reaches a second machine's ComfyUI on 8190 while the first keeps 8188")
+    p = sub.add_parser("mcp", help="write the .mcp.json that points an MCP client at this machine's ComfyUI (Comfy MCP)")
+    p.add_argument("pod")
+    p.add_argument("--over", choices=("ssh", "tunnel"), default="ssh",
+                   help="ssh (default): comfy-mcp runs ON the machine, so every tool works. tunnel: it runs here and "
+                        "reaches ComfyUI through `podctl tunnel` — the run tools only")
+    p.add_argument("--bin", default=None, help="the machine's comfy-mcp path (default: asked over ssh, else the venv beside ComfyUI)")
+    p.add_argument("--out", default=".mcp.json", help="where to write it (default: .mcp.json here)")
+    p.add_argument("--print", dest="print_only", action="store_true", help="print the JSON instead of writing it")
     for sp in sub.choices.values():                                  # --provider after the verb too (a hook that reads argv sees both forms)
         sp.add_argument("--provider", dest="provider_after", default=None, choices=list(_hosts.NAMES), help=argparse.SUPPRESS)
     return ap
@@ -1233,7 +1315,7 @@ def main(argv=None):
             print("note    host %s is EXPERIMENTAL: written from first-party docs, not yet proven on a live account (hosts/%s/README.md)" % (prov.name, prov.name), file=sys.stderr)
         rc = {"status": cmd_status, "pods": cmd_pods, "image": cmd_image, "ensure": cmd_ensure, "ssh-config": cmd_ssh_config,
          "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy, "upload": cmd_upload, "tunnel": cmd_tunnel, "jupyter": cmd_jupyter, "install": cmd_install,
-         "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune}[args.cmd](prov, args)
+         "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune, "mcp": cmd_mcp}[args.cmd](prov, args)
         if isinstance(rc, int):
             return rc
     except PodctlError as e:

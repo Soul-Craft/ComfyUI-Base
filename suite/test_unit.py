@@ -2583,3 +2583,34 @@ def test_unit_no_lib_file_hardcodes_comfyuis_own_user_directory():
             bad.append(f"{p.name}:{n}: {line.strip()}")
     assert not bad, ("these write into ComfyUI's own user/, which the server may not read:\n"
                      + "\n".join(bad))
+
+
+# ---------------------------------------------------------------- 2.7.0: Comfy MCP
+
+def test_unit_comfy_mcp_never_phones_home():
+    """comfy-cli depends on mixpanel and posthog. Rule 9 says the outbound hosts are an allowlist and nothing
+    is uploaded, and the wheel's telemetry is not something the allowlist test can see, because it is not our
+    source. The environment is the mechanism: comfy-cli's tracking module honours the DO_NOT_TRACK convention
+    by never importing the telemetry extension at all. So both switches must be set where the stage runs AND
+    in the boot environment — otherwise a machine that reboots comes back chattier than it was installed."""
+    stage = (BASE / "lib" / "45-mcp.sh").read_text()
+    assert "export DO_NOT_TRACK=1 COMFY_NO_TELEMETRY=1" in stage, "the stage must kill telemetry before the wheel runs"
+    assert "tracking disable" in stage, "the config file is the belt to the environment's braces"
+    boot = (BASE / "lib" / "boot.sh").read_text()
+    assert "DO_NOT_TRACK=1" in boot and "COMFY_NO_TELEMETRY=1" in boot, "a rebooted machine must come back quiet"
+
+
+def test_unit_the_mcp_stage_is_optional_and_never_fails_a_run():
+    stage = (BASE / "lib" / "45-mcp.sh").read_text()
+    assert "${BASE_MCP:-1}" in stage, "BASE_MCP=0 must skip the stage entirely"
+    body = "\n".join(l for l in stage.splitlines() if not l.strip().startswith("#"))
+    assert "return 1" not in body, "base_mcp must never fail an install: every exit is return 0"
+
+
+def test_unit_the_mcp_stage_runs_after_the_packs_and_before_the_import_check():
+    """The venv and the packs have to exist; the models do not, and MCP needs none of them."""
+    src = (BASE / "lib" / "95-summary.sh").read_text()
+    run = src[src.index("base_run(){"):]
+    run = run[:run.index("\n}")]
+    assert "base_mcp" in run, "base_mcp is never called"
+    assert run.index("base_packs pip") < run.index("base_mcp") < run.index("base_import_check"), run

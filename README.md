@@ -52,6 +52,21 @@ The `comfyui` tier needs a local ComfyUI to test against. `bash testbed.sh --ser
 newest release tag, plus the base's own pinned packs — and starts it on CPU, so a clone of this repository can run
 that tier on its own. It is several GB and gitignored. Tiers that need a GPU or a pod skip by name.
 
+## Comfy MCP
+
+Every machine the base installs comes up drivable by an agent. `comfy-mcp` (the official Comfy-Org MCP server)
+goes into the run's venv, and the driver writes the client configuration:
+
+```bash
+podctl --provider runpod mcp <machine>              # comfy-mcp runs ON the machine, over ssh: every tool
+podctl --provider runpod mcp <machine> --over tunnel # it runs here, through `podctl tunnel`: the run tools only
+```
+
+The ssh transport is the default because `install_node`, `search_models`, `get_logs` and `fetch_outputs` need
+the ComfyUI tree, and the tree is on the machine. `BASE_MCP=0` skips the install. comfy-cli's telemetry is
+disabled in the stage, in the boot environment and in its config file — handbook §9.1 says why that is three
+places and not one.
+
 ## Contributing
 
 `CONTRIBUTING.md` has the gate, the house rules the suite enforces and the release flow. The short version: one

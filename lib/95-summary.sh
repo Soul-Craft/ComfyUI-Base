@@ -76,6 +76,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   base_cuda_toolchain || true          # before the hook that builds, so a broken toolkit is named (and fixed) up front
   _base_hook pkg_post_venv
   base_packs pip || true
+  base_mcp || true                     # the venv and the packs exist; models do not yet, and MCP needs none
   if [ "${BASE_SEED:-0}" = "1" ]; then
     # 2.1.0: the template image's seed build (dockerize.py): the toolchain and the packs, never a model, a server or a suite
     hdr "SEED · BASE_SEED=1: no models, no prune, no restart, no smoke, no suite — the image carries the toolchain, the volume gets the models at boot"

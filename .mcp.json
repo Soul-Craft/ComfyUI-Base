@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "comfy": {
+      "command": "comfy-mcp",
+      "env": {
+        "COMFYUI_URL": "http://127.0.0.1:8188",
+        "DO_NOT_TRACK": "1",
+        "COMFY_NO_TELEMETRY": "1"
+      }
+    }
+  }
+}
