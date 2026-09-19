@@ -727,8 +727,8 @@ def test_unit_podctl_deploy_clones_the_pod_onto_its_own_volume(tmp_path):
     src = {"id": "old1", "name": "ermine", "imageName": "example/comfyui-template:v15", "gpuCount": 1, "containerDiskInGb": 500,
            "networkVolumeId": "fakevol001", "volumeMountPath": "/workspace", "ports": ["8188/http", "8888/http", "22/tcp"],
            "env": {"HF_TOKEN": "hf_secretvalue", "download_example": "true"}, "dockerStartCmd": ["bash", "-c", "exec /workspace/comfy-base/boot.sh"],
-           "machineId": "chtjnmf8f129", "machine": {"gpuTypeId": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "secureCloud": True, "dataCenterId": "EUR-IS-1"},
-           "networkVolume": {"id": "fakevol001", "dataCenterId": "EUR-IS-1", "size": 600}, "templateId": "faketmpl02"}
+           "machineId": "fakemachine01", "machine": {"gpuTypeId": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "secureCloud": True, "dataCenterId": "FAKE-DC-1"},
+           "networkVolume": {"id": "fakevol001", "dataCenterId": "FAKE-DC-1", "size": 600}, "templateId": "faketmpl02"}
 
     class _Api:
         def __init__(self, machine="other-machine"):
@@ -745,14 +745,14 @@ def test_unit_podctl_deploy_clones_the_pod_onto_its_own_volume(tmp_path):
     assert pod_id == "new1"
     _, body = api.posts[0]
     assert body["imageName"] == src["imageName"] and body["gpuTypeIds"] == ["NVIDIA RTX PRO 6000 Blackwell Server Edition"] and body["gpuCount"] == 1
-    assert body["networkVolumeId"] == "fakevol001" and body["dataCenterIds"] == ["EUR-IS-1"] and body["volumeMountPath"] == "/workspace"
+    assert body["networkVolumeId"] == "fakevol001" and body["dataCenterIds"] == ["FAKE-DC-1"] and body["volumeMountPath"] == "/workspace"
     assert body["containerDiskInGb"] == 500 and body["ports"] == src["ports"] and body["env"] == src["env"] and body["dockerStartCmd"] == src["dockerStartCmd"]
     assert body["cloudType"] == "SECURE" and "templateId" not in body and body["name"] == "ermine-2"
     assert "10.0.0.9" in cfg.read_text() and "40022" in cfg.read_text(), "Host runpod must point at the NEW pod"
     out = "\n".join(said)
     assert "deployed new1" in out and "ssh answers on 10.0.0.9:40022" in out and "hf_secretvalue" not in out, out
     # the same machine again is said out loud (the GPU verdict decides); a --gpu override and --name are honoured
-    api2 = _Api(machine="chtjnmf8f129"); said2 = []
+    api2 = _Api(machine="fakemachine01"); said2 = []
     podctl.deploy(api2, "old1", name="fresh", gpu="NVIDIA H200", wait=False, say=said2.append)
     assert "SAME machine" in "\n".join(said2) and api2.posts[0][1]["name"] == "fresh" and api2.posts[0][1]["gpuTypeIds"] == ["NVIDIA H200"]
     # a pod without a network volume has nothing a clone could share

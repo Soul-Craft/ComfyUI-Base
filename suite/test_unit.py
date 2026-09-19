@@ -2614,3 +2614,16 @@ def test_unit_the_mcp_stage_runs_after_the_packs_and_before_the_import_check():
     run = run[:run.index("\n}")]
     assert "base_mcp" in run, "base_mcp is never called"
     assert run.index("base_packs pip") < run.index("base_mcp") < run.index("base_import_check"), run
+
+
+def test_unit_sageattention_takes_a_commit_as_well_as_a_branch():
+    """SAGE_REF has been documented as the way to pin SageAttention, but `git clone --depth 1 --branch <sha>`
+    refuses a commit ("Remote branch <sha> not found in upstream origin"), so passing one failed at the clone
+    for as long as the knob existed. A commit is fetched by object name now. The DEFAULT stays main on
+    purpose: the wheel cache is keyed on the resolved upstream commit precisely so tracking upstream costs
+    nothing, and a version-keyed cache would be the stale pin this repo refuses."""
+    body = (BASE / "lib" / "40-packs.sh").read_text()
+    assert "[0-9a-f]{40}" in body, "a 40-hex SAGE_REF must be recognised as a commit"
+    assert "fetch -q --depth 1 origin" in body, "a commit is fetched by object name, not --branch"
+    assert '--branch "$ref"' in body, "a branch or a tag still takes the clone fast path"
+    assert "SAGE_REF:-main" in body, "the default stays main deliberately"

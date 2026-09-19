@@ -316,7 +316,11 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
     # of which change the artefact) the cache can only ever skip rebuilding byte-identical source. ls-remote resolves
     # the ref in about a second, so a hit costs no clone at all. A 10-20 minute build becomes a ~20 second install.
     local cache="$BASE_STATE/wheels" sha key hit pytag tv
-    sha="$(git ls-remote https://github.com/thu-ml/SageAttention "${SAGE_REF:-main}" 2>/dev/null | awk 'NR==1{print substr($1,1,12)}')"
+    local ref="${SAGE_REF:-main}"
+    # a 40-hex SAGE_REF is a commit, and ls-remote lists REFS: it resolves nothing, which would key the cache on
+    # "unresolved" and rebuild every time. A commit needs no resolving, so it is its own answer.
+    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then sha="${ref:0:12}"
+    else sha="$(git ls-remote https://github.com/thu-ml/SageAttention "$ref" 2>/dev/null | awk 'NR==1{print substr($1,1,12)}')"; fi
     pytag="$("$PY" -c 'import sys; print("cp%d%d" % sys.version_info[:2])' 2>/dev/null)"
     tv="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null)"
     key="sageattention-${sha:-unresolved}-${pytag:-cp}-torch${tv:-0}-${SAGE_ARCHS:+archs-}$(printf '%s' "${SAGE_ARCHS:-${BASE_GPU_SM:-sm}}" | tr ';.' '_-')"
@@ -334,8 +338,21 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
     # torch 2.14's headers demand C++20 and upstream's setup.py hardcodes -std=c++17: every kernel failed at the first
     # include on the pod (2.0.25). Clone the ref, patch the flag, build from the checkout — pip sees the patched tree.
     local src="$BASE_STATE/sageattention-src"; rm -rf "$src"
-    if ! git clone -q --depth 1 --branch "${SAGE_REF:-main}" https://github.com/thu-ml/SageAttention "$src" 2>&1 | tail -2; then
-      err "could not clone SageAttention (${SAGE_REF:-main})"; BASE_FAILED+=("SageAttention: clone failed"); return 0
+    # `--branch` takes a branch or a tag and refuses a commit ("Remote branch <sha> not found in upstream
+    # origin"), so SAGE_REF=<sha> failed here for as long as the knob has existed. A commit is fetched by object
+    # name instead. The DEFAULT stays main on purpose: the cache is keyed on the resolved commit precisely so
+    # that tracking upstream costs nothing, and a version-keyed cache would be the stale pin this repo refuses.
+    local got=0
+    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+      if git init -q "$src" 2>/dev/null \
+         && git -C "$src" remote add origin https://github.com/thu-ml/SageAttention 2>/dev/null \
+         && git -C "$src" fetch -q --depth 1 origin "$ref" 2>&1 | tail -2 \
+         && git -C "$src" checkout -q FETCH_HEAD 2>/dev/null; then got=1; fi
+    elif git clone -q --depth 1 --branch "$ref" https://github.com/thu-ml/SageAttention "$src" 2>&1 | tail -2; then
+      got=1
+    fi
+    if [ "$got" != "1" ]; then
+      err "could not clone SageAttention ($ref)"; BASE_FAILED+=("SageAttention: clone failed"); return 0
     fi
     sed -i.bak 's/-std=c++17/-std=c++20/g' "$src/setup.py" && rm -f "$src/setup.py.bak"
     note "SageAttention $(git -C "$src" rev-parse --short HEAD 2>/dev/null) — setup.py patched: -std=c++17 → -std=c++20 (torch ≥ 2.14 headers)"

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.8.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.9.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -450,6 +450,18 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.9.0: SAGE_REF can finally do what it was documented to do. It is described as the way to pin
+  SageAttention, but the clone used `--depth 1 --branch "$SAGE_REF"`, and `--branch` takes a branch or a tag
+  and refuses a commit: MEASURED, `git clone --depth 1 --branch <40-hex>` answers "Remote branch <sha> not
+  found in upstream origin", so passing a commit failed at the clone for as long as the knob has existed. A
+  commit is fetched by object name now, and it also short-circuits the `ls-remote` that resolves the cache
+  key, which lists refs and would have resolved a commit to nothing. The DEFAULT stays `main`, deliberately:
+  the wheel cache is keyed on the resolved upstream commit so that tracking upstream costs nothing, and a
+  version-keyed cache would be exactly the stale pin the comment above that key refuses. Reproducibility is
+  now available to anyone who wants it without making everyone else carry a pin. Also: the RunPod fixture in
+  `suite/test_podctl.py` had a real-looking `machineId` and `dataCenterId` among its obviously-fake
+  `fakevol001` and `faketmpl02`; both are fake now.
 
 - 2.8.1: the MCP configuration names the `comfy` binary. comfy-mcp is a wrapper whose discovery and lifecycle
   tools shell out to comfy-cli, found through `COMFY_BIN` or `PATH`, and an MCP client is usually launched by a
