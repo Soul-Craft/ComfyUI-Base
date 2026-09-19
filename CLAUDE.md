@@ -7,9 +7,9 @@ package contract, §8 tests). This file is only the working agreement.
 
 ## Who consumes it
 
-SoulCraft-Workflows and ErosCraft keep this repository as a git submodule at `base/comfyui-base`, each pinned
-to its own commit, so the two can sit on different versions at the same time; `git submodule status
-base/comfyui-base` in the consumer says which. Nothing here knows a brand's name: what is brand-specific lives
+A consumer repository keeps this one as a git submodule at `base/comfyui-base`, pinned to its own commit, so
+several consumers can sit on different versions at the same time; `git submodule status base/comfyui-base` in
+the consumer says which. Nothing here knows a brand's name: what is brand-specific lives
 in the brand repository and plugs in through `hosts/`, `ext/*.sh`, `brand.toml`, `LOADER_CATS`. Keep it that way.
 
 ## Layout

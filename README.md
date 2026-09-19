@@ -2,9 +2,22 @@
 
 [![verify](https://github.com/Soul-Craft/ComfyUI-Base/actions/workflows/verify.yml/badge.svg)](https://github.com/Soul-Craft/ComfyUI-Base/actions/workflows/verify.yml)
 
-The shared toolchain for ComfyUI workflow packages on a rented or owned NVIDIA GPU: one installer that finds the
-machine's ComfyUI, pins its node packs to commits, downloads every model row a package declares, owns the launch line
-and the boot, and runs each package's own test suite from the zip it ships. MIT, maintained by SoulCraft.
+A current ComfyUI on any NVIDIA GPU you can get hold of, rented or owned: one installer that finds the machine's
+ComfyUI, pins its node packs to commits, owns the launch line and the boot, and brings the machine up the same way
+on RunPod, Verda, Crusoe Cloud or a box under your desk. MIT, maintained by SoulCraft.
+
+## Two ways to use it
+
+**Just the base.** `comfyui-base-script.sh` on its own installs ComfyUI at its newest release tag plus six node
+packs pinned to commits, among them **ComfyUI-Manager** and **ComfyUI-advanced-model-manager**. It ships no model
+weights: bring your own, or add them with the managers it just installed. For most people that is the whole of
+it, a current ComfyUI you did not have to assemble, on a GPU you rented an hour ago. Run whatever workflow you
+like on it: your own, Comfy's templates, something from CivitAI or Hugging Face.
+
+**The base plus a package.** A package is the optional layer on top: a thin `<name>-script.sh` that declares the
+node packs, the models and the tokens one workflow needs, so that workflow comes back byte for byte on a machine
+that has never seen it. The package contract is handbook §4. Nothing in the base knows a brand's name, so anyone
+can publish packages for it from their own repository.
 
 ## What it is
 
@@ -21,7 +34,7 @@ and the boot, and runs each package's own test suite from the zip it ships. MIT,
 
 ## Quick start
 
-On a fresh machine, step one is the base, step two is a package:
+On a fresh machine, step one is the base. Step two is only for those who want a package:
 
 ```bash
 python3 -m zipfile -e comfyui-base.zip . && bash comfyui-base/comfyui-base-script.sh

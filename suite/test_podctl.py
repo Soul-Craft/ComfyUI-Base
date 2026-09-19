@@ -940,7 +940,7 @@ def test_unit_podctl_gates_on_the_mac_before_it_uploads(tmp_path):
         zf.writestr("Fake Package-script.sh", script.read_text())
 
     class IO(podctl.PodIO):
-        # gate() defaults BASE_NODE_SRC to <base>/../testbed, which exists in the ErosCraft layout (base/comfyui-base
+        # gate() defaults BASE_NODE_SRC to <base>/../testbed, which exists in a consumer repository's layout (base/comfyui-base
         # beside base/testbed) and does NOT in a bare clone of this repository, where the parent is wherever the
         # person put it. The gate is right to refuse a path that is not there; the TEST was reading the machine it
         # ran on. Name both paths so this asserts the gate's behaviour and not the checkout's location.

@@ -625,7 +625,7 @@ def test_unit_prune_skips_the_duplicate_sweep_on_a_shared_store(tmp_path):
 def test_unit_prune_warns_once_about_a_superseded_pattern_it_ignores(tmp_path):
     """SUPERSEDED matches basenames ONLY, ever: a pattern with a slash would widen the sweep across a store three
     machines share, and a trained LoRA is an output, not a row. The constraint stays; the SILENCE was the defect.
-    A package inheriting such a row (video-creator-minimax-h3 has one) got no signal that its entry did nothing.
+    A package inheriting such a row got no signal that its entry did nothing.
     The warning is hoisted out of the per-file loop, so it fires once per pattern and not once per indexed file."""
     c = _pod(tmp_path); d = c / "models" / "diffusion_models" / "Example"; d.mkdir(parents=True)
     for n in ("one.safetensors", "two.safetensors", "three.safetensors"): (d / n).write_bytes(b"1")
@@ -1018,17 +1018,27 @@ def test_unit_testbed_derives_its_packs_from_the_packages():
     assert "no ComfyUI Base beside this script" not in (r.stdout + r.stderr), r.stdout + r.stderr
 
 
-def test_unit_the_testbed_names_no_brand():
+def test_unit_the_testbed_finds_packages_without_naming_one():
     """Nothing in the base knows a brand's name (handbook rule 0). testbed.sh used to carry three hard-coded
-    `../soulcraft/packages/...` vendored paths, which is both a brand name in a public repository and a list
-    that went stale every time a package moved. They are derived from the tree now, or absent."""
+    `../<brand>/packages/...` vendored paths: a brand's name in a public repository, and a list that went stale
+    every time a package moved. They are derived from the tree now.
+
+    This asserts the INVARIANT rather than a list of forbidden names. A name list would have to cite the very
+    organisations the rule exists to keep out, and would go stale as consumers change; the property is that every
+    `packages/` glob is anchored on a VARIABLE and never on a literal directory name, which is exactly what the
+    original leak violated and what catches any future one."""
     _repo_only("the repo's testbed.sh")
     tbsh = next((q for q in (BASE / "testbed.sh", BASE.parent / "testbed.sh") if q.exists()), None)
     if tbsh is None:
         pytest.skip("no testbed.sh in or beside the base")
-    tb = tbsh.read_text().lower()
-    for brand in ("soulcraft", "eroscraft"):
-        assert brand not in tb, "%s is named in testbed.sh" % brand
+    bad = []
+    for n, line in enumerate(tbsh.read_text().splitlines(), 1):
+        code = line.split("#", 1)[0]
+        for m in re.finditer(r"(\S*)/packages/", code):
+            before = m.group(1)
+            if before and "$" not in before and not before.startswith(("*", '"*')):
+                bad.append((n, line.strip()))
+    assert not bad, "a packages/ glob anchored on a literal directory, not a variable: %r" % (bad,)
 
 
 # ---------------------------------------------------------------- plan 2 / T1: tier markers by prefix; converted packages agree

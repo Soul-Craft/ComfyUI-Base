@@ -642,6 +642,8 @@ def assemble(wf, ctx, mem, owned, strip_titles, strip_blocks):
         """Build a group and, recursively, every group nested inside it."""
         used.add(title)
         def key(i):                                                   # a 📖 note for a text field sorts just before its field
+            # note_for is the property; h3_for is a legacy alias kept so graphs authored before the rename
+            # still lay out the same way. Not a brand: the base reads it, never writes it.
             pr = wf_nodes[i].get("properties") or {}; f = pr.get("note_for", pr.get("h3_for"))
             return ((rank.get(f, 0), _idkey(f), 0, _idkey(i)) if f in wf_nodes
                     else (rank.get(i, 0), _idkey(i), 1, _idkey(i)))

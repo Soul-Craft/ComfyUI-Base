@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.11.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.11.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -463,6 +463,20 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 2.11.1: the repository names no brand but its own maintainer. The runtime was already clean and a foreign
+  brand already built and gated green, but `CLAUDE.md` named two consumer repositories, three Record entries
+  named a foreign brand, two machine aliases and a workflow product, and two test comments named a consumer's
+  layout and a package. None of it was load-bearing and all of it told a reader this was somebody's private
+  tool. Only the attribution survives, in `LICENSE` and the README. The brand-guard test changed shape too: it
+  used to forbid a list of two organisation names, which meant citing the very organisations the rule exists to
+  keep out, and would have gone stale as consumers change. It asserts the invariant now - every `packages/` glob
+  in `testbed.sh` is anchored on a variable, never on a literal directory - which is what the original leak
+  violated, catches any future one, and names nobody. Verified against the 2.6.0 leak verbatim and a synthetic
+  new brand: both caught; variable-anchored globs and comments: clean.
+  The README also says what this is for someone who will never write a package: ComfyUI at its newest release
+  tag plus six pinned packs including ComfyUI-Manager, no model weights, bring any workflow. That is what most
+  people want from it, and the front page led with the package contract instead.
+
 - 2.11.0: the driver stops knowing one brand's machines. `TUNNEL_LOCAL` was a hard-coded map of three
   `verda-*` aliases belonging to the repository's own maintainer, and `tunnel_locals` read a machine's port
   offset out of it. Everybody else's fleet fell through to 0, so their second machine silently shared 8188
@@ -470,11 +484,11 @@ for any invocation that somehow arrives without the environment. The suite asser
   never do. The offset is a fact about somebody's fleet, not about the base or the host, so it comes from
   `$PODCTL_TUNNEL_OFFSET` now, beside the `PODCTL_HOST` that already names the alias, and defaults to 0 so a
   single machine needs nothing. A value that is not a whole number in 0-1000 is refused rather than read as 0,
-  because 0 is exactly the collision it was set to avoid. Found by building a foreign brand ("Colorado AI",
-  shipping to a different host) from scratch and checking what the base still assumed: everything else passed,
-  including the runtime in `lib/` and `py/`, which carries no brand name at all.
-  **Migration:** a fleet that relied on the old map must now export the offset per machine. What was
-  `verda-cc` is `PODCTL_TUNNEL_OFFSET=1`, `verda-h3` is `2`; everything else was already 0.
+  because 0 is exactly the collision it was set to avoid. Found by building a foreign brand from scratch, with
+  its own `brand.toml` shipping to a different host, and checking what the base still assumed: everything else
+  passed, including the runtime in `lib/` and `py/`, which carries no brand name at all.
+  **Migration:** a fleet that relied on the old map must now export the offset per machine. The alias that was
+  the second machine takes `PODCTL_TUNNEL_OFFSET=1`, the third `2`; everything else was already 0.
 
 - 2.10.1: the front page stops calling a proven host experimental. 2.5.3 promoted Verda after live runs on
   2026-09-17 and 2026-09-18: it set `experimental = False`, rewrote `hosts/verda/README.md` around what those
@@ -581,7 +595,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   `$HERE/comfyui-base/base.sh`, which from the repository root resolves to nothing: MEASURED, the script then
   printed "no ComfyUI Base beside this script — only EXTRA packs are provisioned" and, since EXTRA has been empty
   since 2026-09-04, would have provisioned a ComfyUI with no custom nodes at all, silently. And `VENDORED` was
-  three hard-coded `../soulcraft/packages/...` paths — a brand's name in a repository whose first design rule is
+  three hard-coded `../<brand>/packages/...` paths — a brand's name in a repository whose first design rule is
   that nothing here knows one, and a list that had already gone stale. Both are derived now, and a test asserts no
   brand is named. `testbed.sh` is deliberately NOT in `BASE_MEMBERS`: the zip is what goes to a pod, and a CPU
   testbed has no business there.
@@ -693,7 +707,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   branches, the file one and the folder-snapshot one, now report the row as unjudgeable **when the package
   declares `pkg_pre_models`**, and are unchanged otherwise: with no such hook a missing file really is missing
   and saying so before the run is the useful answer. A real run still fails either way. Measured on
-  video-creator-minimax-h3, whose engine is CivitAI only and has no Hub mirror. Four cases in one test hold it,
+  a package whose engine is CivitAI only and has no Hub mirror. Four cases in one test hold it,
   including the positive control that a `LOCAL` file which IS present still reports ok, so the guard cannot
   quietly widen to every row. Also: a `SUPERSEDED` entry the sweep can never match (a path, or a dotfile) is
   still skipped, because that sweep matches basenames only and a path pattern would widen it across a store
