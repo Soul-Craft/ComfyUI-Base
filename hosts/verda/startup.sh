@@ -81,6 +81,10 @@ ensure_packages() {
   local need=() out
   command -v mount.nfs >/dev/null 2>&1 || need+=(nfs-common)
   python3 -c 'import ensurepip' >/dev/null 2>&1 || need+=(python3-venv)
+  # ffmpeg: the image ships none, and VideoHelperSuite's bundled binary has no nvenc encoders, so a video
+  # package's h264_nvenc format fails at the last node after the whole sample is paid for. Ubuntu's build has
+  # h264_nvenc; lib/85-launch.sh finds it and sets VHS_FORCE_FFMPEG_PATH.
+  command -v ffmpeg >/dev/null 2>&1 || need+=(ffmpeg)
   if [ "${#need[@]}" = "0" ]; then
     PACKAGES=present
     return 0

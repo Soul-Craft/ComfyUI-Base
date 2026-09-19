@@ -21,6 +21,18 @@ _base_hf_home(){ # packs that fetch their own weights at first queue (RMBG, Flor
   # ~/.cache/huggingface, which is container disk on the pod — re-downloaded after every stop. On the volume it persists.
   if [ -n "$BASE_PERSIST_ROOT" ]; then echo "$BASE_PERSIST_ROOT/huggingface"; fi
 }
+_base_ffmpeg_path(){ # a system ffmpeg WITH NVENC, for the packs that encode video
+  # VideoHelperSuite prefers its own bundled imageio_ffmpeg binary, and that build carries NO nvenc encoders at
+  # all. A package whose video format asks for h264_nvenc therefore dies at the very last node, after the whole
+  # sample has been computed and paid for: "Unknown encoder 'h264_nvenc'". Measured on a GPU 2026-09-19, on a
+  # render that had already cleared its policy gate and produced frames.
+  # VHS honours VHS_FORCE_FFMPEG_PATH, so the fix is to find a real ffmpeg and name it. Only when it HAS nvenc:
+  # forcing a system build without it would trade one silent wrong encoder for another.
+  local f; f="$(command -v ffmpeg 2>/dev/null || true)"
+  [ -n "$f" ] || return 0
+  "$f" -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc || return 0
+  echo "$f"
+}
 _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHINE must exist before it runs
   # The args file lives on the SHARED store, so --user-directory and --temp-directory reach every machine, while
   # the directories they name are per machine and were created only by the install that wrote them. A machine
@@ -32,11 +44,11 @@ _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHIN
   done
 }
 _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints what would actually run
-  local extra pv hf
+  local extra pv hf ff
   extra="$(_base_args_extra | tr '\n' ' ')"; extra="${extra% }"
-  pv="$(_base_preview_flags)"; hf="$(_base_hf_home)"
+  pv="$(_base_preview_flags)"; hf="$(_base_hf_home)"; ff="$(_base_ffmpeg_path)"
   # `env HF_HOME=…`, not a bare assignment: the line is printed after `nohup`, and nohup would execute the assignment (2.0.11)
-  printf '%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "$PY" "${BASE_LISTEN:-0.0.0.0}" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
+  printf '%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "$PY" "${BASE_LISTEN:-0.0.0.0}" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
 }
 _base_start_comfy(){
   local extra=() line i _w pv=()
@@ -50,7 +62,9 @@ _base_start_comfy(){
   local hf; hf="$(_base_hf_home)"; [ -n "$hf" ] && mkdir -p "$hf" 2>/dev/null || true
   # HF_HOME is EXPORTED in the subshell: an expansion that yields `HF_HOME=/x` in command position is a command name to
   # bash, not an assignment — the pod's restart died on "HF_HOME=/workspace/huggingface: No such file or directory" (2.0.10)
+  local ff; ff="$(_base_ffmpeg_path)"; [ -n "$ff" ] && echo "  ffmpeg with nvenc: $ff (VHS_FORCE_FFMPEG_PATH)" || true
   (cd "$COMFY" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
+     if [ -n "$ff" ]; then export VHS_FORCE_FFMPEG_PATH="$ff"; fi
      nohup "$PY" main.py --listen "${BASE_LISTEN:-0.0.0.0}" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window

@@ -1143,6 +1143,38 @@ def test_unit_a_missing_local_snapshot_fails_the_run_by_name_and_check_only_repo
     assert not (c / "models" / "LLM").exists()
 
 
+def test_unit_the_launch_line_names_a_system_ffmpeg_only_when_it_has_nvenc(tmp_path):
+    """VideoHelperSuite prefers its own bundled ffmpeg, and that build has NO nvenc encoders, so a package whose
+    video format asks for h264_nvenc dies at the LAST node, after the sample is computed and paid for. Measured on
+    a GPU 2026-09-19. VHS honours VHS_FORCE_FFMPEG_PATH, so the launch line names a real ffmpeg when one is there.
+
+    Only when it HAS nvenc: forcing a system build without it trades one silently wrong encoder for another, and
+    the bundled one at least works for the stock formats. Both halves are here so neither can drift.
+
+    The "no ffmpeg anywhere" case is not tested: isolating it needs a PATH with no ffmpeg on it, and a PATH that
+    short cannot find `bash` either, so the test would measure its own harness. `[ -n "$f" ] || return 0` is the
+    whole of that branch.
+    """
+    bindir = tmp_path / "bin"; bindir.mkdir()
+    path = "%s:/usr/bin:/bin:/usr/sbin:/sbin" % bindir
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "PATH": path}
+
+    def _ffmpeg(nvenc):
+        f = bindir / "ffmpeg"
+        f.write_text("#!/bin/sh\necho '%s'\n" % ("V....D h264_nvenc NVIDIA NVENC H.264 encoder"
+                                                  if nvenc else "V....D libx264 libx264 H.264"))
+        f.chmod(0o755)
+
+    _ffmpeg(True)
+    r = _bash('base_env_setup; base_discover quiet; _base_ffmpeg_path', env=env)
+    assert str(bindir / "ffmpeg") in r.stdout, "an ffmpeg WITH nvenc must be named: " + r.stdout + r.stderr
+
+    _ffmpeg(False)
+    r = _bash('base_env_setup; base_discover quiet; _base_ffmpeg_path; echo END', env=env)
+    assert str(bindir / "ffmpeg") not in r.stdout, "an ffmpeg WITHOUT nvenc must NOT be forced: " + r.stdout
+    assert "END" in r.stdout, "and it must not fail the run either: " + r.stdout + r.stderr
+
+
 def test_unit_pip_extra_is_installed_every_run_not_only_on_a_rebuild():
     """A venv the base built for another package (or before any package) has never seen this package's PIP_EXTRA."""
     body = code_only(_src(BASE / "lib" / "40-packs.sh"))

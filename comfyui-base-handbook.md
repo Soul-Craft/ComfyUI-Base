@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.8.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.9.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,14 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.9: a video package's last node no longer dies on the encoder it asked for. VideoHelperSuite prefers its
+  own bundled imageio_ffmpeg binary, and that build carries NO nvenc encoders, so a format asking for
+  `h264_nvenc` failed at `VHS_VideoCombine` with "Unknown encoder" AFTER the whole sample had been computed and
+  paid for. Measured on a GPU on 2026-09-19, on a render that had already cleared its policy gate and produced
+  frames. The Verda host now installs `ffmpeg` beside `nfs-common` and `python3-venv`, and the launch line sets
+  `VHS_FORCE_FFMPEG_PATH` when a system ffmpeg is present AND has `h264_nvenc`. The nvenc condition is the point:
+  forcing a system build without it would trade one silently wrong encoder for another, and the bundled one at
+  least works for the stock formats. Two tests, one per half.
 - 2.5.8: and so are the SETTINGS, which is the same bug one path away. 2.5.7 moved `workflows/` to the
   directory the server reads and scoped its guard to that path, so an identical split in
   `comfy.settings.json` survived untouched. This package sets `pysssss.ImageFeed.Location=hidden` as hygiene,
