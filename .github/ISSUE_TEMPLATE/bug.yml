@@ -1,0 +1,49 @@
+name: Bug
+description: Something the base did wrong on a machine you ran it on.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The base spans four hosts with very different behaviour, so the facts below are what make a
+        report actionable. `bash base.sh status` prints most of them.
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options: [RunPod, Verda, Crusoe Cloud, an owned NVIDIA box, other]
+    validations: {required: true}
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: RTX Pro 6000 Blackwell
+    validations: {required: true}
+  - type: input
+    id: driver
+    attributes:
+      label: NVIDIA driver version
+      description: The base needs >= 580 — CUDA 13 wheels are the only stable sm_120 wheels.
+      placeholder: "580.65.06"
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: Base version
+      description: The contents of VERSION, or `bash base.sh version`.
+    validations: {required: true}
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `bash base.sh status`
+      render: shell
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes:
+      label: The command you ran
+      render: shell

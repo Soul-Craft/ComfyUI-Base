@@ -1,0 +1,38 @@
+# The gate, on every push and pull request. Same command a maintainer runs before committing:
+#   1. comfyui-base.zip matches the working tree   (package.py --check)
+#   2. the suite, from the repository
+#   3. the suite, from the EXTRACTED ZIP           — what a pod actually runs
+#
+# No GPU here, and no provisioned testbed, so the gpu/runpod/comfyui tiers skip themselves by name.
+# What remains is every check that does not need hardware, which is the point: a fork gets the real
+# gate without renting a machine.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      # base_test reaches pytest through `uv run --no-project --python 3.12 --with pytest`; a fresh
+      # clone has no venv, so without uv on PATH the suite reports "no pytest and no uv" and exits 1.
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: verify
+        run: bash _build/verify.sh
