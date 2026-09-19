@@ -25,7 +25,7 @@ can publish packages for it from their own repository.
   Four settings say what differs between hosts: `BASE_HOST`, `BASE_VOLUME`, `BASE_VOLUME_KIND`, `BASE_LISTEN`
   (`lib/00-env.sh` documents them; the handbook §1 explains them).
 - **The hosts** (`hosts/`) are the per-host subsets: RunPod and Verda (both proven on live accounts), Crusoe Cloud
-  (interface only, so far) and an owned box (`hosts/local`). `hosts/README.md` is the matrix.
+  (implemented, awaiting its first live run) and an owned box (`hosts/local`). `hosts/README.md` is the matrix.
 - **The driver** (`_build/pod/podctl.py`) runs on your Mac: `podctl --provider <host> pods | status | ensure | install |
   stop | start | restart | deploy | upload | lease | tunnel`. Everything it does over ssh is the same on every host;
   the provider answers where the machine is and how it boots.
@@ -101,7 +101,7 @@ pull request. You need `uv` on PATH.
 |---|---|
 | RunPod | proven on live pods |
 | Verda | proven on a live account, 2026-09-17 and 2026-09-18 (`hosts/verda/README.md` records what the runs answered) |
-| Crusoe Cloud | interface only: every call mapped in `hosts/crusoe/provider.py`, nothing implemented yet |
+| Crusoe Cloud | implemented and tested against a fake API, not yet run on a live account (`hosts/crusoe/README.md` says what a first run should report) |
 | an owned NVIDIA box | a recipe with a quickstart (`hosts/local/README.md`, RTX Pro 6000 / Blackwell), not yet reported end to end |
 
-The Crusoe provider and a report from an owned box are the open items; issues and pull requests welcome.
+A live Crusoe run and a report from an owned box are the open items; issues and pull requests welcome.

@@ -1,9 +1,18 @@
-# hosts/crusoe : Crusoe Cloud (interface only, not implemented)
+# hosts/crusoe : Crusoe Cloud
 
-**Status: interface only.** `provider.py` is a stub: the driver's provider selection and a brand.toml `host = "crusoe"`
-work today, and every command fails with one line naming the REST call or CLI command that will implement it. The
-stub's docstring is the whole command map (signed requests, the VM, disk and firewall endpoints, the state vocabulary,
-the CLI fallback). Nothing on this page has run on a live Crusoe account yet; contributions welcome.
+**Status: implemented, not yet run on a live account.** `provider.py` is a signed REST client with the whole
+Provider interface behind it, and `suite/test_crusoe.py` drives all of it against a fake Crusoe API that verifies
+every signature. What has NOT happened is a single call to the real thing.
+
+That distinction matters, because it is exactly where the Verda host sat before 2.5.3, and its first live run
+corrected three things the documentation had implied: the ssh user, whether the startup script re-runs on a
+redeploy, and how long an address takes to appear. Expect this host to have three of its own.
+
+**If you are the first to run it**, the useful things to report are: whether the signature is accepted (it is
+built from Crusoe's own published client, but no live 200 has confirmed it), what `GET /organizations/projects`
+answers for a single-project key, the exact state strings the API uses (the normaliser treats anything it does not
+know as transitional), how long a started VM takes to show a public ip, and whether the disk attaches before the
+startup script's 15 minute wait expires. Open a host report; the issue template asks for these.
 
 ## The shape of it
 

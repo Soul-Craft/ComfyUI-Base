@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.11.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.12.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -113,7 +113,7 @@ host's provider (Mac-side, loaded by `podctl`), its startup script and its READM
 |---|---|---|---|---|---|
 | `runpod` | a container behind RunPod REST v1, sshd on a mapped port | `/workspace`, a network volume (`mount`) | the start command `podctl ensure` wraps around `boot.sh` | `0.0.0.0` (RunPod's HTTP proxy needs it) | proven |
 | `verda` | a VM behind Verda's (DataCrunch's) REST API, `root@<ip>:22`; an OS volume that IS the image next time | `/workspace`, a block volume `startup.sh` formats once and mounts | `comfy-base-boot.service` | `127.0.0.1`, reached through `podctl tunnel` | proven (live account, 2026-09-17 and 2026-09-18) |
-| `crusoe` | a VM with an every-boot startup script and a default-deny firewall, `ubuntu@<ip>:22` | `/workspace` (`mount`) | `comfy-base-boot.service` | `127.0.0.1`, through the tunnel | interface only |
+| `crusoe` | a VM with an every-boot startup script and a default-deny firewall, `ubuntu@<ip>:22` | `/workspace` (`mount`) | `comfy-base-boot.service` | `127.0.0.1`, through the tunnel | implemented, not yet run on a live account |
 | `local` | an owned NVIDIA box, no API | a directory of your choosing (`BASE_VOLUME_KIND=dir`) | `comfy-base-boot.service`, installed by hand | `127.0.0.1` | a recipe |
 
 **The four knobs** the core reads (`lib/00-env.sh`; `_base_host_resolve` settles them once every lib is loaded):
@@ -201,12 +201,16 @@ and the recipe in full, is `hosts/verda/README.md`; the shape:
 The first live pass must settle the ssh user, whether the startup script re-runs on a redeploy, and when `ip`
 populates (the README's numbered list); the EXPERIMENTAL notice comes off only when all three are known.
 
-### 1.3 Crusoe (interface only)
+### 1.3 Crusoe (implemented, not yet run live)
 
 A VM with an every-boot startup script and a default-deny firewall, `ubuntu` as the login user, `/workspace` as a
-mounted block volume and the base's systemd unit as the boot. `hosts/crusoe/provider.py` is the interface with every
-call mapped in its docstring and no body yet, so `podctl --provider crusoe` refuses with the reason; the recipe is
-`hosts/crusoe/README.md`. Contributions welcome.
+mounted block volume and the base's systemd unit as the boot. `hosts/crusoe/provider.py` is a signed REST client
+carrying the whole Provider interface, and `suite/test_crusoe.py` drives it against a fake API that verifies every
+signature; no call has reached the real service yet, so the driver still says EXPERIMENTAL. Three things differ
+from Verda and shape the code: `stop` is a real stop (a stopped VM bills its disks only), the public ip is dynamic
+and changes on every start, and the startup script is a create-time field that cannot be changed through the API,
+so `ensure` ships the current one over ssh. The recipe, and what a first live run should report, is
+`hosts/crusoe/README.md`.
 
 ### 1.4 local (a recipe)
 
@@ -462,6 +466,29 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.12.0: Crusoe has a driver. `hosts/crusoe/provider.py` was 144 lines in which every method raised, so of the
+  four hosts it was the only one actually broken: the machine side has been complete for a while, but nothing on
+  a Mac could find, reach or move a VM. It is a signed REST client now with the whole Provider interface behind
+  it. The signing was the part worth getting right and the part with no live 200 to check against: the prose
+  docs' own worked example does not reproduce under any reading, so it is built from two of Crusoe's own
+  implementations instead, which do agree (client-go auth/v1/auth.go and the Python in
+  crusoe-registry-token-rotator), and the suite asserts it against that formula rather than against a constant.
+  The fake API verifies every signature, so a provider that stops signing fails here rather than in production.
+  Three things are not Verda and shape the code. `stop` is a real stop, because a stopped Crusoe VM keeps its
+  disks and its id and bills the disks only, where a shut-down Verda instance still bills the GPU and is
+  therefore deleted. The public ip is dynamic, so every lifecycle call rewrites the Host block rather than only
+  the first. And the startup script is a create-time field that cannot be changed through the API and runs on
+  every boot, so `ensure` ships the current `hosts/crusoe/startup.sh` over ssh and re-runs it, which is the only
+  way to move an existing machine forward. `deploy` detaches the disk before creating the clone and passes it in
+  the create body rather than attaching afterwards, because a VM that boots without its disk sends the startup
+  script into a 15 minute wait for one. `ensure` also writes the JUPYTER_TOKEN systemd drop-in, without which
+  `podctl jupyter` reports no token on this host forever and reads as a broken command.
+  Two defects in the stub went with it: `record_volume` took no `env` keyword while `PodIO.upload` passes one,
+  which was a TypeError escaping the PodctlError handler as a traceback rather than a diagnosis; and a lifecycle
+  call that answered FAILED immediately was polled 120 times anyway instead of failing at once.
+  `experimental` stays True. Implementing the methods does not earn its removal, a live account does, and this
+  is exactly where Verda sat before its first live run corrected three things the documentation implied.
 
 - 2.11.1: the repository names no brand but its own maintainer. The runtime was already clean and a foreign
   brand already built and gated green, but `CLAUDE.md` named two consumer repositories, three Record entries

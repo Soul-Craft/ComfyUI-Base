@@ -51,8 +51,9 @@ own block in `~/.ssh/config`.
 
 - `hosts/runpod/README.md`: the RunPod recipe as it works today (the API key, `PUBLIC_KEY`, the proxy, the commands).
 - `hosts/verda/README.md`: Verda, and what the live runs of 2026-09-17 and 2026-09-18 answered.
-- `hosts/crusoe/README.md`: Crusoe, the person's recipe; `hosts/crusoe/provider.py` is the stub whose docstring is the
-  full REST command map; `hosts/crusoe/startup.sh` is the VM's every-boot startup script.
+- `hosts/crusoe/README.md`: Crusoe, the recipe and what a first live run should report; `hosts/crusoe/provider.py`
+  is a signed REST client with the whole interface behind it, exercised against a fake API but not yet against a
+  live account; `hosts/crusoe/startup.sh` is the VM's every-boot startup script.
 - `hosts/local/README.md`: an owned NVIDIA box; `hosts/local/install-local.sh` is the one-command install.
 
 The handbook (`comfyui-base-handbook.md`) carries the rest: the install sequence, the lease, the pins, the state files.

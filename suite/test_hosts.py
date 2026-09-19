@@ -206,7 +206,7 @@ def test_unit_the_shipped_tree_carries_every_host_and_the_manifest_covers_them()
         pytest.skip("repo tooling")
     for host in ("runpod", "verda", "crusoe", "local"):
         assert (BASE / "hosts" / host / "README.md").exists(), host
-    for f in ("hosts/__init__.py", "hosts/runpod/provider.py", "hosts/verda/provider.py", "hosts/verda/startup.sh", "hosts/crusoe/startup.sh", "hosts/local/install-local.sh"):
+    for f in ("hosts/__init__.py", "hosts/runpod/provider.py", "hosts/verda/provider.py", "hosts/verda/startup.sh", "hosts/crusoe/provider.py", "hosts/crusoe/startup.sh", "hosts/local/install-local.sh"):
         assert (BASE / f).exists(), f
     r = subprocess.run(["python3", str(BASE / "_build" / "package.py"), "--base", "--check"], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
