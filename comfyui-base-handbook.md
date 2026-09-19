@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.9.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.9.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -149,7 +149,9 @@ the local zip is checked current, the volume size is recorded for the disk gate,
 package) and is polled until `STEP RC=`, the pod's `state/logs` are copied to `<item>/_build/podruns/<date>/pod-logs/`,
 the summary block is printed, and a green run saves the printed pin rows into the local script and rebuilds its zip
 ("latest, then tested, then saved"). A red run stops with the console's path: the log is the deliverable, the fix loop
-starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888) for the canvas tools and
+starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888, and 9199 and 11434 beside them:
+the base runs no metrics exporter and no inference server, but a package may run one on the machine and reach
+it on loopback, which is the shape a package takes when its point is that nothing leaves the box) for the canvas tools and
 the browser. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
 (`<Display Name>/` with a `<Display Name> Script.sh`, and `ComfyUI Base/`) and their workflow copies in ComfyUI's
 browser; `--yes` removes exactly those, after the re-install has put the `<name>/` folders beside them. `--pkg` takes
@@ -450,6 +452,15 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.9.1: the forwarded ports say why they are forwarded. `TUNNEL_SERVICES` carries 9199 and 11434 next to
+  ComfyUI's 8188 and JupyterLab's 8888, and the comment beside them explained only the per-alias offset (a
+  collision measured on two live machines), never why those two ports were in the list at all. Read cold they
+  look like leftovers, and this session came close to deleting 11434 as one. They are not: the base runs no
+  metrics exporter and no inference server, but a PACKAGE may run one on the machine and talk to it on
+  loopback, which is the shape a package takes when its whole point is that nothing leaves the box. Removing
+  the forward would break such a package silently, from the Mac side, with nothing in the log to say why.
+  Documented in both places, so the next reader does not have to rediscover it.
 
 - 2.9.0: SAGE_REF can finally do what it was documented to do. It is described as the way to pin
   SageAttention, but the clone used `--depth 1 --branch "$SAGE_REF"`, and `--branch` takes a branch or a tag

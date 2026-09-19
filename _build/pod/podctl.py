@@ -90,6 +90,11 @@ VOLUME_ROOT = "/workspace"                              # the persistent root on
 # forward down with it, so a product could not be opened even though its own port was free. Measured on two live
 # machines. An unknown alias keeps the original numbers, so a single-machine setup is unchanged.
 TUNNEL_LOCAL = {"verda": 0, "runpod": 0, "verda-krea2": 0, "verda-cc": 1, "verda-h3": 2}
+# 11434 is Ollama's. The base installs no inference server and never will: the port is forwarded because a
+# PACKAGE may run one on the machine and talk to it on loopback, which is the shape a package uses when its
+# whole point is that nothing leaves the box. Forwarding it costs nothing when no package does, and its
+# absence would be silent and confusing. It is not a leftover; do not remove it without checking the
+# packages of the repository around the base.
 TUNNEL_SERVICES = [("comfy", 8188), ("jupyter", 8888), ("metrics", 9199), ("ollama", 11434)]
 SSH_BLOCK = ("Host {alias}\n  HostName {host}\n  Port {port}\n  User {user}\n  IdentityFile {key}\n  StrictHostKeyChecking accept-new\n"
              "  LocalForward {comfy} localhost:8188\n  LocalForward {jupyter} localhost:8888\n"
