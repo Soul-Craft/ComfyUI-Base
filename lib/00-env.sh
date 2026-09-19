@@ -59,6 +59,17 @@ BASE_FAKE_NO_VOLUME="${BASE_FAKE_NO_VOLUME:-0}"    # fake: /workspace is not a m
 BASE_LIBRARY="${BASE_LIBRARY:-}"                   # 2.4.0: the shared library's mount point (empty: no shared library)
 BASE_VOLUME_SHARED="${BASE_VOLUME_SHARED:-0}"      # 2.5.0: 1 when BASE_VOLUME itself is network storage SEVERAL machines mount
 BASE_LOCAL_STATE="${BASE_LOCAL_STATE:-/var/lib/comfy-base-machine}"   # 2.5.0: the per-machine root, never on the shared volume
+_base_user_dir(){ # the user/ the SERVER will actually read, which is NOT always ComfyUI's own
+  # 2.5.6. 2.5.0 moved the server's --user-directory to BASE_LOCAL_STATE (lib/70-hygiene.sh) because two
+  # machines cannot share one user/, and left every WRITER pointing at $COMFY/user. So the installer put the
+  # workflow in ComfyUI's tree, the server read the machine's, and GET /api/userdata?dir=workflows answered []:
+  # no package could be opened from the server's own list, which is exactly what an App Mode pass requires
+  # (root CLAUDE.md §1 phase 3). Measured on three machines 2026-09-18. One accessor, so the halves cannot
+  # disagree again.
+  if [ "${BASE_VOLUME_SHARED:-0}" = "1" ]; then printf '%s\n' "$BASE_LOCAL_STATE/user"
+  else printf '%s\n' "$COMFY/user"; fi
+}
+_base_workflows_dir(){ printf '%s\n' "$(_base_user_dir)/default/workflows"; }
 BASE_LOCK_WAIT="${BASE_LOCK_WAIT:-1800}"           # 2.5.0: seconds to wait for another machine's install lock (0: do not wait)
 BASE_LOCK_STALE="${BASE_LOCK_STALE:-7200}"         # 2.5.0: an install lock older than this was left by a dead run
 BASE_NO_NET="${BASE_NO_NET:-0}"

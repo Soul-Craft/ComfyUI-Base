@@ -2361,3 +2361,41 @@ def test_unit_the_library_link_ignores_everything_comfyui_itself_ships(tmp_path)
     (c2 / "models" / "vae" / "real.safetensors").write_text("x")
     r2 = _bash(f'COMFY="{c2}"; BASE_LIBRARY="{lib}"; EXTRA_YAML="{c2}/extra_model_paths.yaml"; _base_library_link')
     assert not (c2 / "models").is_symlink() and "real.safetensors" in r2.stdout, r2.stdout
+
+
+def test_unit_the_workflow_is_written_where_the_server_actually_reads_it():
+    """2.5.6. 2.5.0 moved the SERVER's --user-directory to BASE_LOCAL_STATE, because two machines
+    sharing one store cannot share one user/, and left every WRITER pointing at $COMFY/user.
+
+    So on a shared-root machine the installer put each workflow in ComfyUI's own tree while the
+    server read the machine's, and `GET /api/userdata?dir=workflows` answered `[]`. No package
+    could be opened from the server's own workflow list by name, which is precisely what an App
+    Mode pass is required to do (root CLAUDE.md §1 phase 3). Measured on three machines on
+    2026-09-18, one per brand, each with two workflows sitting in a directory nothing served.
+
+    One accessor now answers it, so the two halves cannot drift apart again."""
+    shared = _bash('COMFY=/w/ComfyUI BASE_LOCAL_STATE=/var/lib/m BASE_VOLUME_SHARED=1 _base_workflows_dir')
+    assert shared.stdout.strip() == "/var/lib/m/user/default/workflows", shared.stdout + shared.stderr
+    own = _bash('COMFY=/w/ComfyUI BASE_LOCAL_STATE=/var/lib/m BASE_VOLUME_SHARED=0 _base_workflows_dir')
+    assert own.stdout.strip() == "/w/ComfyUI/user/default/workflows", own.stdout + own.stderr
+    # unset, not just 0: a non-shared machine never sets it at all
+    bare = _bash('COMFY=/w/ComfyUI BASE_LOCAL_STATE=/var/lib/m; unset BASE_VOLUME_SHARED; _base_workflows_dir')
+    assert bare.stdout.strip() == "/w/ComfyUI/user/default/workflows", bare.stdout + bare.stderr
+
+
+def test_unit_no_lib_file_hardcodes_the_workflows_directory():
+    """The companion to the test above, and the reason this one exists separately: the bug was FOUR
+    call sites agreeing with each other and disagreeing with a fifth. A house rule applies to every
+    instance of its pattern, never the one that happened to bite, so this fails on a new writer that
+    reaches for $COMFY/user/default/workflows instead of the accessor."""
+    bad = []
+    for p in LIB:
+        for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            # The writer pattern is specifically $COMFY/user/...: ComfyUI's OWN tree, which is the
+            # wrong tree on a shared-root machine. A bare relative "user/default/workflows" in the
+            # scaffold that lays out a fresh ComfyUI (20-comfyui.sh) is fine and must stay: that
+            # directory should exist whether or not this machine serves from it.
+            if "$COMFY/user/default/workflows" not in line or line.lstrip().startswith("#"):
+                continue
+            bad.append(f"{p.name}:{n}: {line.strip()}")
+    assert not bad, "these write to a workflows directory the server may not read:\n" + "\n".join(bad)

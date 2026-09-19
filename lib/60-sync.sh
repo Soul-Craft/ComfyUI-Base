@@ -18,7 +18,7 @@ base_sync(){ # sets BASE_SYNC_RESULT; fails the run when an ACTIVE loader resolv
   local wf="${PKG_DIR:-.}/${WF_NAME:-}" copy rows cats out line dry=() rc=0
   if [ -z "${WF_NAME:-}" ]; then BASE_SYNC_RESULT="no workflow"; note "this package ships no workflow — nothing to sync"; return 0; fi
   if [ ! -f "$wf" ]; then BASE_SYNC_RESULT="workflow missing"; err "$wf not found"; BASE_FAILED+=("workflow $WF_NAME missing beside the script"); return 0; fi
-  copy="$COMFY/user/default/workflows/$WF_NAME"
+  copy="$(_base_workflows_dir)/$WF_NAME"; mkdir -p "$(dirname "$copy")" 2>/dev/null || true
   _base_tmp; rows="$BASE_TMPD/rows.tsv"; cats="$BASE_TMPD/cats.tsv"
   _base_model_rows 2>/dev/null | awk -F'|' '{print $1"\t"$2"\t"$3"\t"$4}' > "$rows" || true
   printf '%s\n' "${BASE_LOADER_CATS[@]}" ${LOADER_CATS[@]+"${LOADER_CATS[@]}"} | tr '|' '\t' > "$cats"

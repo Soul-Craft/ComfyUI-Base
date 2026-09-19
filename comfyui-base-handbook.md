@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.6.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.7.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,16 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.7: the workflow is written where the SERVER actually reads it. 2.5.0 moved the server's
+  `--user-directory` to `BASE_LOCAL_STATE` (`lib/70-hygiene.sh`), because two machines sharing one store cannot
+  share one `user/`, and left every WRITER pointing at `$COMFY/user`. So on a shared-root machine the installer
+  put each package's workflow in ComfyUI's own tree, the server read the machine's, and
+  `GET /api/userdata?dir=workflows` answered `[]`. No package could be opened from the server's own workflow
+  list by name, which is exactly what an App Mode pass is required to do. Measured on three machines on
+  2026-09-18, one per brand, each holding workflows in a directory nothing served. `_base_user_dir` and
+  `_base_workflows_dir` now answer it once and `lib/60-sync.sh`, `lib/80-server.sh` and `lib/90-ledger.sh` all
+  ask, so the halves cannot drift apart again; `lib/20-comfyui.sh`'s scaffold still lays out ComfyUI's own
+  `user/default/workflows`, which should exist whether or not this machine serves from it.
 - 2.5.6: the terminal a customer needs, and four things that had to be right before it could exist. JupyterLab
   now GENERATES a token where `BASE_LISTEN` is loopback, so the machine is not dark until somebody invents a
   credential; on a public bind with no credential 2.1.0's refusal is unchanged, because a generated token there is

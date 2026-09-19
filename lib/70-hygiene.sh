@@ -193,7 +193,7 @@ base_hygiene(){
   if [ "$BASE_VOLUME_SHARED" = "1" ]; then
     _base_args_ensure --user-directory "$BASE_LOCAL_STATE/user"
     _base_args_ensure --temp-directory "$BASE_LOCAL_STATE/temp"
-    if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LOCAL_STATE/user" "$BASE_LOCAL_STATE/temp" 2>/dev/null || true; fi
+    if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LOCAL_STATE/user/default/workflows" "$BASE_LOCAL_STATE/temp" 2>/dev/null || true; fi
   fi
   _base_library_link
   for row in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do

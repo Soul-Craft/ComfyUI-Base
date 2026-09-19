@@ -12,7 +12,7 @@ base_ledger_write(){ # after the install stages, before the summary; never under
   if [ -x "${PY:-}" ]; then py="$("$PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo -)"; fi
   case "$BASE_TORCH_INFO" in *torch\ *) torch="$(printf '%s' "$BASE_TORCH_INFO" | sed -nE 's/.*torch ([^ ·]+).*/\1/p' | head -1)";; esac
   [ -z "$torch" ] && torch="-"
-  if [ -n "${WF_NAME:-}" ]; then wfpath="$COMFY/user/default/workflows/$WF_NAME"; fi
+  if [ -n "${WF_NAME:-}" ]; then wfpath="$(_base_workflows_dir)/$WF_NAME"; fi
   if [ -n "${PKG_SCRIPT:-}" ] && [ -f "$PKG_SCRIPT" ]; then script="$PKG_SCRIPT"; fi
   hooks="$(declare -F | awk '$3 ~ /^pkg_/ {print $3}' | tr '\n' ',' | sed 's/,$//')"; [ -n "$hooks" ] || hooks="-"
   ts="$(_base_ts)"

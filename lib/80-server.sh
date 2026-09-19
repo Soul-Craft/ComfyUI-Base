@@ -156,7 +156,7 @@ base_combos(){ # stored dropdown values → live /object_info; repairs renames (
   if [ "$BASE_DRY" = "1" ] || [ "$BASE_NO_NET" = "1" ]; then note "skipped"; BASE_COMBO_RESULT="skipped"; return 0; fi
   if [ -z "${WF_NAME:-}" ] || [ ! -f "${PKG_DIR:-.}/$WF_NAME" ]; then note "skipped — no workflow"; BASE_COMBO_RESULT="skipped (no workflow)"; return 0; fi
   if ! curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then note "skipped — no server to ask"; BASE_COMBO_RESULT="skipped (no server)"; return 0; fi
-  local pristine="$PKG_DIR/$WF_NAME" copy="$COMFY/user/default/workflows/$WF_NAME" t out pre ts f b n_fix=0 n_bad=0 flags=()
+  local pristine="$PKG_DIR/$WF_NAME" copy="$(_base_workflows_dir)/$WF_NAME" t out pre ts f b n_fix=0 n_bad=0 flags=()
   # with a restart pending the server is the old code: report, never rewrite
   [ "$BASE_RESTART_NEEDED" = "1" ] && flags=(--check-only)
   for t in "$pristine" "$copy"; do
