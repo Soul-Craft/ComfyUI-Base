@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.10.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.11.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,16 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.11: a file reached by two paths is not a duplicate of itself. `base_prune` offered 63.52 GB of LIVE models
+  for deletion on a three-machine store, measured 2026-09-19: the store was mounted at two points and
+  `ComfyUI/models` symlinked into the second, so every file was indexed under two path strings, while the
+  predicate is basename plus size and the identity check compared strings that `cd && pwd -P` had only collapsed
+  SYMLINKS in. `rm -f` unlinks the one directory entry, so the model would have gone from both paths. Now a `-ef`
+  test (dev:ino) against the destination and between candidates, so a second mountpoint or a hardlink can never
+  reach the deletion list or inflate "reclaimable"; and under `BASE_VOLUME_SHARED` the duplicate sweep is skipped
+  outright, because a run that cannot see the other machines' ledgers cannot decide what is surplus on a store
+  they share. `BASE_YES=1` removes the prompt rather than answering it, which is what made this a silent
+  unattended deletion in a baked image rather than a footgun.
 - 2.5.10: the Mac gate works again. 2.5.7's `test_unit_each_workflow_gets_its_own_local_port` loaded
   `_build/pod/podctl.py` with its own inline import instead of the `_load()` helper beside it, and that helper
   is where the "not a repo checkout" skip lives. The shipped zip contains no `_build/`, so the test raised

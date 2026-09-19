@@ -509,6 +509,47 @@ def test_unit_prune_offers_only_unclaimed_duplicates_and_needs_the_prompt(tmp_pa
     assert not dup.exists() and not sup.exists() and other.exists() and (dest / "a.safetensors").exists(), r.stdout + r.stderr
 
 
+def test_unit_prune_never_offers_one_file_reached_by_two_paths(tmp_path):
+    """MEASURED on a live three-machine store, 2026-09-19: the sweep offered 63.52 GB of LIVE models for
+    deletion (Krea 2 RAW, Turbo, the text encoder, the VAE and an adapter). The store was mounted at two
+    points and `ComfyUI/models` symlinked into the second, so every file was indexed under two different
+    path strings. The predicate is basename plus size, the identity check compared two path STRINGS, and
+    the ledger interlock is scoped to paths under $M, so nothing between the arithmetic and `rm -f` could
+    catch it. `rm -f` then unlinks the ONLY directory entry and the file is gone from both paths.
+
+    A hardlink is the same defect reachable without mounting anything: one inode, two names, and
+    unlinking either reclaims nothing. That is what this asserts, because a test may not mount."""
+    import os
+    c = _pod(tmp_path); dest = c / "models" / "diffusion_models" / "Example" / "Turbo"; dest.mkdir(parents=True)
+    keeper = dest / "a.safetensors"; keeper.write_bytes(b"\0" * 1048576)
+    second = tmp_path / "second-mount"; second.mkdir()
+    link = second / "a.safetensors"; os.link(keeper, link)
+    assert link.stat().st_ino == keeper.stat().st_ino, "the fixture must be one inode under two names"
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path)}
+    r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; base_prune; echo DEL=${{#DEL_FILES[@]}}', env=env)
+    assert "DEL=0" in r.stdout, "one file under two names was offered for deletion: " + r.stdout + r.stderr
+    # BASE_YES removes the prompt rather than answering it, so an unattended install must still not delete it
+    r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; base_prune', env={**env, "BASE_YES": "1"})
+    assert keeper.exists() and link.exists(), "an unattended install deleted a live model: " + r.stdout + r.stderr
+
+
+def test_unit_prune_skips_the_duplicate_sweep_on_a_shared_store(tmp_path):
+    """"Reclaimable" is not a property one machine can determine on a store several mount: this run sees
+    none of the other machines' ledgers, and a file it calls surplus may be the only copy another is
+    rendering from. The sweep is skipped, and says why."""
+    c = _pod(tmp_path); dest = c / "models" / "diffusion_models" / "Example" / "Turbo"; dest.mkdir(parents=True)
+    (dest / "a.safetensors").write_bytes(b"\0" * 1048576)
+    dup = tmp_path / "dup" / "a.safetensors"; dup.parent.mkdir(); dup.write_bytes(b"\0" * 1048576)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path)}
+    r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; base_prune; echo DEL=${{#DEL_FILES[@]}}', env=env)
+    assert "DEL=1" in r.stdout, "a real duplicate on a private volume is still offered: " + r.stdout + r.stderr
+    r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; base_prune; echo DEL=${{#DEL_FILES[@]}}',
+              env={**env, "BASE_VOLUME_SHARED": "1"})
+    assert "DEL=0" in r.stdout, "the sweep ran on a shared store: " + r.stdout + r.stderr
+    assert "shared store" in r.stdout, "it must say why it skipped: " + r.stdout
+    assert dup.exists(), "the sweep touched a file on a shared store"
+
+
 def test_unit_prune_warns_once_about_a_superseded_pattern_it_ignores(tmp_path):
     """SUPERSEDED matches basenames ONLY, ever: a pattern with a slash would widen the sweep across a store three
     machines share, and a trained LoRA is an output, not a row. The constraint stays; the SILENCE was the defect.

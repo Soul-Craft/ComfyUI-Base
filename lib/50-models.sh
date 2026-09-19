@@ -105,7 +105,9 @@ _base_dirscan(){ # ONE filesystem walk for every directory question the run asks
   for nm in "${pats[@]}"; do
     if [ "${#expr[@]}" -eq 0 ]; then expr=( -name "$nm" ); else expr+=( -o -name "$nm" ); fi
   done
-  # bounded: a hung network mount must not stall the run. `cd && pwd -P` collapses symlinks and bind mounts.
+  # bounded: a hung network mount must not stall the run. `cd && pwd -P` collapses SYMLINKS. It does NOT
+  # collapse a second mount of the same export: two mountpoints give one inode two different path strings,
+  # and this walk indexes both. That is why the duplicate sweep compares dev:ino and not paths alone.
   if _base_timeout "${BASE_SCAN_SECS:-240}" \
     find "${roots[@]}" ${BASE_PRUNE_DIRS[@]+"${BASE_PRUNE_DIRS[@]}"} -prune -o -type d \( "${expr[@]}" \) -print 2>/dev/null \
     | while IFS= read -r p; do if [ -d "$p" ]; then (cd "$p" 2>/dev/null && pwd -P) || true; fi; done \
@@ -483,6 +485,15 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
   done
   if [ "${#UNCLAIMED_FILES[@]}" -gt 0 ]; then note "unclaimed ${#UNCLAIMED_FILES[@]} model file(s) no package declares — left where they are: ${UNCLAIMED_FILES[*]}"; fi
   # ---- duplicates: same basename (or alternate) + same size as the copy in the library, not claimed by another package
+  #
+  # NOT on a shared store. "Reclaimable" is not a property one machine can determine there: several machines
+  # mount the same root, this run can see none of their ledgers, and a file this machine calls surplus may be
+  # the only copy another is mid-render on. MEASURED 2026-09-19 on a three-machine store: the sweep offered
+  # 63.52 GB of LIVE models for deletion (Krea 2 RAW, Turbo, the text encoder, the VAE and an adapter), because
+  # the store was mounted at two points and each file was therefore indexed under two different paths.
+  if [ "$BASE_VOLUME_SHARED" = "1" ]; then
+    note "shared store: the duplicate sweep is skipped (other machines mount this root and their copies are not this run's to judge)"
+  else
   while IFS='|' read -r cat fam purp file url bytes mnote alts; do
     [ -n "$cat" ] || continue
     [[ "$file" == */ ]] && continue
@@ -493,11 +504,24 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
       if [ -z "$path" ] || [ ! -f "$path" ] || [ -L "$path" ]; then continue; fi
       case "$path" in *.partial) continue;; esac
       if [ "$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")" = "$real" ]; then continue; fi
+      # The same file reached by another route is not a duplicate of itself. `-ef` compares dev:ino, which
+      # catches a hardlink and a second mountpoint alike; the path comparison above catches only symlinks.
+      # Deleting either name of one inode reclaims NOTHING, so such a path must never reach DEL_FILES.
+      if [ "$path" -ef "$dest" ]; then continue; fi
       if [ "$size" != "$dsz" ]; then note "same name, different size (kept): $path ($(_base_bytes_to_gb "$size") GB vs $(_base_bytes_to_gb "$dsz") GB in the library)"; continue; fi
       case "$path" in "$M"/*) if _base_ledger_claims "${path#"$M"/}"; then note "duplicate of $rel at $path is claimed by another installed package — kept"; continue; fi;; esac
+      # Two candidates that share an inode with EACH OTHER (rather than with dest) would both be listed and
+      # both counted, so the prompt would overstate what is reclaimable even though the second unlink is a
+      # no-op. Count a given inode once.
+      _dup_seen=0
+      for _d in ${DEL_FILES[@]+"${DEL_FILES[@]}"}; do
+        if [ "$path" -ef "$_d" ]; then _dup_seen=1; break; fi
+      done
+      [ "$_dup_seen" = 1 ] && continue
       echo -e "${YEL}  ≡ duplicate of $rel: $path ($(_base_bytes_to_gb "$size") GB)${NC}"; DEL_FILES+=("$path"); DEL_BYTES=$((DEL_BYTES + size))
     done < <(_base_idx_find "$(basename "$file")" $alts)
   done <<< "$rows"
+  fi
   # ---- superseded: only inside this package's own family folders (and its declared legacy dirs), only by basename
   local fdirs; fdirs="$(_base_family_dirs)"
   # A pattern the sweep below can never match is skipped by design (basenames only, ever: a path pattern would
