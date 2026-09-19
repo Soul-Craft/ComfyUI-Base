@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.11.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.12.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -408,6 +408,14 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.12: the deletion is staged and reversible. Every guard before it is an INFERENCE about identity, and 2.5.11
+  fixed one that was wrong only after it had offered 63.52 GB of live models; an inference can be wrong again in a
+  shape nobody has met, and the consequence is a model that exists nowhere while the ledger still calls it
+  installed. So `base_prune` now RENAMES each candidate aside in its own directory (atomic, never across a
+  filesystem), re-stats every destination the MODELS table declares, and removes nothing unless all of them are
+  still present at their declared size. If one vanished or changed size, every rename is undone, the step fails and
+  says which model it was. It needs to know nothing about mounts, inodes or symlinks to be safe, because it checks
+  the thing that actually matters rather than inferring it.
 - 2.5.11: a file reached by two paths is not a duplicate of itself. `base_prune` offered 63.52 GB of LIVE models
   for deletion on a three-machine store, measured 2026-09-19: the store was mounted at two points and
   `ComfyUI/models` symlinked into the second, so every file was indexed under two path strings, while the

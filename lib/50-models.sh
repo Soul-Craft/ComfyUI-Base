@@ -13,6 +13,9 @@
 #   alts      = space-separated legacy basenames the index may adopt for this file
 
 BASE_MODEL_EXTS='*.safetensors *.pth *.pt *.pkl *.gguf *.ckpt *.bin *.onnx *.partial'
+# What a staged deletion is renamed to while its destinations are re-checked. A run killed mid-stage leaves
+# these behind, and `rescue` is what puts them back; they are never indexed as models.
+BASE_PRUNE_SUFFIX='.comfy-base-pending'
 # one prune set for every filesystem-wide walk: kernel/virtual trees, package caches, and the places that hold
 # *.pth files which are path configs rather than weights
 # lost+found is pruned from BOTH walks: every ext4 volume has one, it is mode 700 owned by nobody, and a
@@ -451,6 +454,56 @@ _base_family_dirs(){ # → the library dirs this package's rows write into (cate
   done <<< "$rows"
   for d in ${LEGACY_DIRS[@]+"${LEGACY_DIRS[@]}"}; do case "$seen" in *" $d "*) ;; *) seen="$seen$d "; echo "$d";; esac; done
 }
+# ---------------------------------------------------------------- the deletion, staged and reversible (2.5.12)
+# Every guard before this point is an INFERENCE about identity: is this path the same file as that one. 2.5.11
+# fixed the inference that was wrong (path strings, where dev:ino was needed) and 63.52 GB of live models had
+# already been offered before anyone noticed. An inference can be wrong again in a shape nobody has met, and the
+# consequence is a model that no longer exists anywhere, on a store several machines mount, with the ledger still
+# recording it installed and base_models already past.
+#
+# So the delete stops being a one-way step. Each candidate is RENAMED ASIDE in its own directory, which is atomic
+# and never crosses a filesystem; every destination the package declares is then re-stat'd; and only when all of
+# them are still present at their declared size is anything actually removed. If any destination vanished or
+# changed size, every rename is undone and the run says so. It needs to know nothing about mounts, inodes or
+# symlinks to be safe: it checks the thing that actually matters, which is whether the models are still there.
+_base_prune_commit(){ # <rows> — stage, verify, then commit or roll back
+  local rows="$1" f staged=() sdirs=() bad="" row cat fam purp file url bytes mnote alts rel dest sz
+  # ---- stage: rename aside, atomically, beside the original
+  for f in ${DEL_FILES[@]+"${DEL_FILES[@]}"}; do
+    if [ -f "$f" ] && [ ! -L "$f" ]; then
+      if mv -- "$f" "$f$BASE_PRUNE_SUFFIX" 2>/dev/null; then staged+=("$f"); else warn "could not set aside $f — left alone"; fi
+    fi
+  done
+  for f in ${DEL_DIRS[@]+"${DEL_DIRS[@]}"}; do
+    if [ -d "$f" ]; then
+      if mv -- "$f" "$f$BASE_PRUNE_SUFFIX" 2>/dev/null; then sdirs+=("$f"); else warn "could not set aside $f/ — left alone"; fi
+    fi
+  done
+  # ---- verify: every declared destination still present, at its declared size
+  while IFS='|' read -r cat fam purp file url bytes mnote alts; do
+    [ -n "$cat" ] || continue
+    [[ "$file" == */ ]] && continue
+    rel="$(_base_dest_rel "$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts")"; dest="$(_base_dest_path "$rel")"
+    if [ ! -f "$dest" ]; then bad="$rel is GONE"; break; fi
+    sz="$(_base_fsize "$dest")"
+    if [ -n "$bytes" ] && [ "$bytes" != "0" ] && [ "$sz" != "$bytes" ]; then bad="$rel changed size ($sz, expected $bytes)"; break; fi
+  done <<< "$rows"
+  # ---- commit, or put everything back
+  if [ -n "$bad" ]; then
+    for f in ${staged[@]+"${staged[@]}"}; do mv -- "$f$BASE_PRUNE_SUFFIX" "$f" 2>/dev/null || true; done
+    for f in ${sdirs[@]+"${sdirs[@]}"}; do mv -- "$f$BASE_PRUNE_SUFFIX" "$f" 2>/dev/null || true; done
+    err "deletion ROLLED BACK, nothing was removed: $bad"
+    err "  a file this sweep called surplus was the only copy of a model the package declares."
+    BASE_FAILED+=("prune rolled back: $bad")
+    return 1
+  fi
+  for f in ${staged[@]+"${staged[@]}"}; do rm -f -- "$f$BASE_PRUNE_SUFFIX" && echo "  ✂ deleted $f"; done
+  for f in ${sdirs[@]+"${sdirs[@]}"}; do rm -rf -- "$f$BASE_PRUNE_SUFFIX" && echo "  ✂ deleted $f/"; done
+  ok "$(_base_bytes_to_gb "$DEL_BYTES") GB reclaimed (every declared model re-checked first)"
+  DEL_FILES=(); DEL_DIRS=()
+  return 0
+}
+
 base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (default No); a file another package claims is never offered
   hdr "OLD LAYOUT · DUPLICATES · SUPERSEDED"
   [ -n "$IDX" ] && [ -f "$IDX" ] || _base_build_index
@@ -560,9 +613,7 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
   else
     echo
     if _base_confirm "Delete these ${#DEL_FILES[@]} files and ${#DEL_DIRS[@]} directories ($(_base_bytes_to_gb "$DEL_BYTES") GB reclaimable)? [y/N] "; then
-      for f in ${DEL_FILES[@]+"${DEL_FILES[@]}"}; do if [ -f "$f" ] && [ ! -L "$f" ]; then rm -f "$f" && echo "  ✂ deleted $f"; fi; done
-      for f in ${DEL_DIRS[@]+"${DEL_DIRS[@]}"}; do if [ -d "$f" ]; then rm -rf "$f" && echo "  ✂ deleted $f/"; fi; done
-      ok "$(_base_bytes_to_gb "$DEL_BYTES") GB reclaimed"; DEL_FILES=(); DEL_DIRS=()
+      _base_prune_commit "$rows"
     else note "kept — nothing deleted"; fi
   fi
   if [ "$BASE_DRY" != "1" ]; then

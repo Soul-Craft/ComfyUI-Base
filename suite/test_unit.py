@@ -533,6 +533,44 @@ def test_unit_prune_never_offers_one_file_reached_by_two_paths(tmp_path):
     assert keeper.exists() and link.exists(), "an unattended install deleted a live model: " + r.stdout + r.stderr
 
 
+def test_unit_prune_rolls_back_when_a_declared_model_would_disappear(tmp_path):
+    """Every guard before the delete is an INFERENCE about identity, and 2.5.11 fixed one that was wrong after it
+    had already offered 63.52 GB of live models. An inference can be wrong again in a shape nobody has met, so the
+    delete itself is staged: rename aside, re-stat every destination the package declares, and only then remove.
+
+    This drives the case the inference is supposed to prevent, by handing the sweep a candidate that IS the
+    declared destination reached by a second name. If the guards were ever bypassed, staging catches it: the
+    destination goes missing at verify time, every rename is undone, and the run fails rather than reporting a
+    tidy-up it did not do."""
+    import os
+    c = _pod(tmp_path); dest = c / "models" / "diffusion_models" / "Example" / "Turbo"; dest.mkdir(parents=True)
+    keeper = dest / "a.safetensors"; keeper.write_bytes(b"\0" * 1048576)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path), "BASE_YES": "1"}
+    # DEL_FILES is forced to the keeper itself: the guards would never put it there, and that is the point.
+    r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; '
+              f'rows="$(_base_model_rows)"; DEL_FILES=("{keeper}"); DEL_BYTES=1048576; '
+              f'_base_prune_commit "$rows"; echo RC=$?', env=env)
+    assert "RC=1" in r.stdout, "a vanishing destination must fail the step: " + r.stdout + r.stderr
+    assert "ROLLED BACK" in r.stdout or "ROLLED BACK" in r.stderr, r.stdout + r.stderr
+    assert keeper.exists() and keeper.stat().st_size == 1048576, \
+        "the model was not put back: " + r.stdout + r.stderr
+    assert not (dest / "a.safetensors.comfy-base-pending").exists(), "a staged file was left behind"
+
+
+def test_unit_prune_commits_when_every_declared_model_survives(tmp_path):
+    """The other half: a genuine duplicate on a private volume is still removed, and the declared destination is
+    untouched. Staging must not turn the feature off, only make it reversible."""
+    c = _pod(tmp_path); dest = c / "models" / "diffusion_models" / "Example" / "Turbo"; dest.mkdir(parents=True)
+    keeper = dest / "a.safetensors"; keeper.write_bytes(b"\0" * 1048576)
+    dup = tmp_path / "dup" / "a.safetensors"; dup.parent.mkdir(); dup.write_bytes(b"\0" * 1048576)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path), "BASE_YES": "1"}
+    r = _bash(f'MODELS=("{ROW_A}"); base_env_setup; base_discover quiet; base_models; base_prune; echo RC=$?', env=env)
+    assert not dup.exists(), "a real duplicate is still removed: " + r.stdout + r.stderr
+    assert keeper.exists() and keeper.stat().st_size == 1048576, "the declared model was touched: " + r.stdout
+    assert "re-checked first" in r.stdout, "the commit must say it verified: " + r.stdout
+    assert not list(tmp_path.rglob("*.comfy-base-pending")), "a staged file was left behind"
+
+
 def test_unit_prune_skips_the_duplicate_sweep_on_a_shared_store(tmp_path):
     """"Reclaimable" is not a property one machine can determine on a store several mount: this run sees
     none of the other machines' ledgers, and a file it calls surplus may be the only copy another is
