@@ -153,6 +153,16 @@ find_data_disk() {
       log "refusing to choose: $n unmounted data disks ($(echo $list)) and not exactly one labelled $LABEL; set COMFY_DATA_DISK=/dev/vdX and run --ensure"
       return 1
     fi
+    # 2.5.6: a machine with NO data volume is the normal case now, and on one the old code sat here for ten
+    # minutes waiting for a disk nobody attached, because the registered startup script recalls its workspace from
+    # an fstab a fresh OS volume does not have. Waiting is right when a disk is ATTACHED and slow to appear; it is
+    # pointless when the instance has none at all. So: give it DISK_PROBE seconds to show up, and if nothing has
+    # EVER appeared by then, say what to do and finish rather than block the boot.
+    if [ "$waited" -ge "${DISK_PROBE:-30}" ] && [ -z "$(candidates)" ]; then
+      log "no data disk on this machine after ${waited}s. If it should have one, attach it and run --ensure."
+      log "  If it is meant to use the shared store instead, run: podctl ensure <id> --workspace-shared"
+      return 1
+    fi
     if [ "$waited" -ge "$DISK_WAIT" ]; then
       log "no data disk appeared within ${DISK_WAIT}s (no unmounted /dev/vd[b-z]): attach a volume in the console and run --ensure"
       return 1
@@ -188,6 +198,14 @@ mount_workspace_share() {
     fi
     printf '%s\n' "$line" >>/etc/fstab
     log "fstab: $line"
+  fi
+  # the OS volume carries fstab across a full delete and recreate, so a machine converted from the 2.4.0 library
+  # shape keeps mounting the store a SECOND time at /mnt/comfy-library forever unless the line is removed here.
+  if awk -v m="$LIB_MOUNT" '$1 !~ /^#/ && $2 == m { found = 1 } END { exit !found }' /etc/fstab 2>/dev/null; then
+    cp /etc/fstab /etc/fstab.comfy-base.bak
+    awk -v m="$LIB_MOUNT" '$1 !~ /^#/ && $2 == m { next } { print }' /etc/fstab.comfy-base.bak >/etc/fstab
+    log "removed the separate-library fstab line for $LIB_MOUNT (the workspace IS the store now)"
+    umount "$LIB_MOUNT" 2>/dev/null && log "unmounted the second copy at $LIB_MOUNT"
   fi
   systemctl daemon-reload 2>/dev/null
   if findmnt -n "$MOUNT" >/dev/null 2>&1; then
@@ -279,7 +297,19 @@ mount_data_disk() {
 recall_library() {
   # A plain `--ensure` must keep the library the machine already had: the endpoint was recorded in host.env
   # by the run that set it up. An explicit --no-library is the only way to drop one.
+  #
+  # 2.5.6, and this is a FEEDBACK LOOP rather than a stale field. host.env lives on the workspace, so once the
+  # workspace IS the shared store that file is shared: this function then read ANOTHER machine's
+  # COMFY_LIBRARY_SRC back out of it, mounted the store a second time at /mnt/comfy-library, and wrote that back
+  # over the host.env the same run had just written correctly. Both live machines showed the double mount despite
+  # being built completely differently, which is what gave it away. A shared workspace and a separate library are
+  # ALTERNATIVES, exactly as lib/00-env.sh has said since 2.5.2; the script now agrees with the base.
   local f="$BOOT_HOME/state/host.env"
+  if [ -n "$WORKSPACE_SRC" ]; then
+    [ -z "$LIBRARY" ] || log "the whole workspace is the shared store, so the separate library $LIBRARY is ignored"
+    LIBRARY=""
+    return 0
+  fi
   [ -z "$LIBRARY" ] || return 0
   [ "$NO_LIBRARY" = "1" ] && return 0
   [ -f "$f" ] || return 0

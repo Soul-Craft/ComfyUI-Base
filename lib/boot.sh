@@ -82,12 +82,49 @@ boot_extensions(){ # 2.2.0: a project's own boot stages, ext/*.sh, sourced in na
 boot_jupyter(){ # JupyterLab from the base's tools venv; the token rides the environment (never argv); no token, no JupyterLab
   # 2.1.0: the tokenless start is gone. It was survivable while every pod set JUPYTER_TOKEN by hand; a pod from a public
   # template sets nothing, and an unauthenticated JupyterLab on a *.proxy.runpod.net URL is root on the box. A pod that wants a terminal sets JUPYTER_TOKEN (or JUPYTER_PASSWORD) and stops/starts.
-  local jl="$BOOT_HOME/tools/bin/jupyter-lab" tok="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}"
+  local jl="$BOOT_HOME/tools/bin/jupyter-lab" tok="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}" made=""
+  local listen="${BASE_LISTEN:-127.0.0.1}"
   if [ ! -x "$jl" ]; then echo "boot: no JupyterLab in $BOOT_HOME/tools (the base install builds it) — port 8888 stays dark"; return 0; fi
-  if [ -z "$tok" ]; then echo "boot: JupyterLab not started — no JUPYTER_TOKEN or JUPYTER_PASSWORD on the pod (set one to enable it; never tokenless)"; return 0; fi
+  # read the saved one FIRST, so this does not depend on boot_tokens having run: a second boot must reuse the
+  # token, never append a new line. My own test caught it doing exactly that.
+  local tf="$BOOT_HOME/state/tokens.env"
+  if [ -z "$tok" ] && [ -f "$tf" ]; then tok="$(sed -n 's/^JUPYTER_TOKEN=//p' "$tf" | tail -1)"; fi
+  if [ -z "$tok" ]; then
+    # 2.5.6: with no credential, GENERATE one rather than leave the terminal dark — but ONLY where the server binds
+    # loopback and is therefore reachable through an ssh tunnel and nothing else. That is every host but RunPod.
+    # On a public bind 2.1.0's refusal stands unchanged: a generated token is still a service listening on a
+    # *.proxy.runpod.net URL that nobody asked to start, and the operator has somewhere to read the token only if
+    # they already have the box. Fail closed, the house default.
+    case "$listen" in
+      127.0.0.1|localhost|::1|'')
+        tok="$( (openssl rand -hex 32 2>/dev/null) || (head -c32 /dev/urandom | od -An -tx1 | tr -d " \n") )"
+        if [ -z "$tok" ]; then echo "boot: JupyterLab not started — no token could be generated and none was set (never tokenless)"; return 0; fi
+        mkdir -p "$BOOT_HOME/state"; ( umask 077; printf 'JUPYTER_TOKEN=%s\n' "$tok" >> "$tf" )
+        chmod 600 "$tf" 2>/dev/null || true
+        export JUPYTER_TOKEN="$tok"; made=" (token generated, saved to state/tokens.env)"
+        ;;
+      *)
+        echo "boot: JupyterLab not started — no JUPYTER_TOKEN or JUPYTER_PASSWORD, and this host binds $listen, which is"
+        echo "boot:   reachable from outside. JupyterLab is never tokenless: set one and restart, or bind loopback and"
+        echo "boot:   reach it through an ssh tunnel, which generates a token for you."
+        return 0
+        ;;
+    esac
+  fi
   mkdir -p "$BOOT_HOME/state/logs"
   JUPYTER_TOKEN="$tok" nohup "$jl" --ip "${BASE_LISTEN:-127.0.0.1}" --port 8888 --allow-root --no-browser --ServerApp.allow_origin='*' --notebook-dir "${BOOT_VOLUME:-$(dirname "$BOOT_HOME")}" >> "$BOOT_HOME/state/logs/jupyter.log" 2>&1 &
-  echo "boot: JupyterLab starting on 8888 (auth: token from ${JUPYTER_TOKEN:+JUPYTER_TOKEN}${JUPYTER_TOKEN:-JUPYTER_PASSWORD})"
+  echo "boot: JupyterLab starting on 8888$made"
+  # The token is NEVER echoed here. This log is a file on the volume, and with a shared store that volume is mounted
+  # by every machine and readable by every session on it; the suite has forbidden logging an operator-supplied token
+  # since 2.1.0 and a generated one is the same secret. What goes in the log is how to GET it.
+  # It is never reachable from the internet either: the server binds $BASE_LISTEN, and on every host but RunPod that
+  # is loopback, which is what Verda's own documentation instructs ("Keep it private. Use SSH port-forwarding. Do
+  # not open port 8888 to the internet"). hostname -I reads the machine's own NIC: nothing is asked of the network.
+  local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  echo "boot: to use the terminal and upload files, from YOUR OWN computer run:"
+  echo "boot:     podctl jupyter <this machine>     # prints the URL with the token already in it"
+  echo "boot:   or by hand:  ssh -L 8888:127.0.0.1:8888 root@${ip:-THE-MACHINE-IP}"
+  echo "boot:     then open http://127.0.0.1:8888/lab and paste the token from state/tokens.env (owner-only)"
   return 0
 }
 boot_tokens(){ # 2.1.0: the tokens an earlier install saved (state/tokens.env, 0600) join the pod's own; the Hub browser

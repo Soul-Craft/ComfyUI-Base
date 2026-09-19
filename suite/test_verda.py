@@ -860,3 +860,28 @@ def test_unit_workspace_share_refuses_to_claim_a_mount_it_did_not_make():
     assert "NOT the share" in body and "REBOOT to complete the switch" in body, body[:400]
     # the success branch must be the ONLY one that returns 0 from an existing mount
     assert 'if [ "$src" = "$WORKSPACE_SRC" ]; then' in body, body[:400]
+
+
+def test_unit_a_shared_workspace_ignores_a_separate_library_and_clears_its_mount():
+    """2.5.6, MEASURED as a FEEDBACK LOOP rather than a stale field. host.env lives on the workspace, so once the
+    workspace IS the store that file is shared: recall_library read ANOTHER machine's COMFY_LIBRARY_SRC back out
+    of it, mounted the store a second time at /mnt/comfy-library, and overwrote the host.env the same run had just
+    written. Both live machines showed the double mount despite being built differently, which is what gave it
+    away. A shared workspace and a separate library are ALTERNATIVES, as lib/00-env.sh has said since 2.5.2."""
+    s = STARTUP.read_bytes().decode("ascii")
+    body = s[s.index("recall_library()"):s.index("\nmount_library()")]
+    assert 'if [ -n "$WORKSPACE_SRC" ]; then' in body and 'LIBRARY=""' in body, body[:500]
+    # and the stale fstab line must be REMOVED, since the OS volume carries it across a delete and recreate
+    ws = s[s.index("mount_workspace_share()"):s.index("\nmount_data_disk()")]
+    assert "removed the separate-library fstab line" in ws and "umount" in ws, ws[:600]
+
+
+def test_unit_a_machine_with_no_data_volume_does_not_block_for_ten_minutes():
+    """2.5.6: a machine with no data volume is the normal case now. The old code waited DISK_WAIT=600 for a disk
+    nobody had attached, because the registered startup script recalls its workspace from an fstab that a fresh OS
+    volume does not have. Waiting is right when a disk is attached and slow; pointless when there is none at all."""
+    s = STARTUP.read_bytes().decode("ascii")
+    body = s[s.index("find_data_disk()"):s.index("\nmount_workspace_share()")]
+    assert 'DISK_PROBE:-30' in body and '-z "$(candidates)"' in body, body[:600]
+    assert "--workspace-shared" in body, "it must name the fix rather than only the symptom"
+    assert "$DISK_WAIT" in body, "a disk that IS attached and slow must still get the full wait"

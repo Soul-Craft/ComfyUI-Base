@@ -940,7 +940,11 @@ def test_unit_podctl_gates_on_the_mac_before_it_uploads(tmp_path):
         zf.writestr("Fake Package-script.sh", script.read_text())
 
     class IO(podctl.PodIO):
-        def __init__(self): self.env = dict(os.environ); self.said = []
+        # gate() defaults BASE_NODE_SRC to <base>/../testbed, which exists in the ErosCraft layout (base/comfyui-base
+        # beside base/testbed) and does NOT in a bare clone of this repository, where the parent is wherever the
+        # person put it. The gate is right to refuse a path that is not there; the TEST was reading the machine it
+        # ran on. Name both paths so this asserts the gate's behaviour and not the checkout's location.
+        def __init__(self): self.env = dict(os.environ, BASE_NODE_SRC=str(tmp_path), COMFY_BASE=str(tmp_path)); self.said = []
         def say(self, m): self.said.append(m)
     io = IO()
 
@@ -1180,3 +1184,33 @@ def test_unit_podctl_prune_lists_only_old_layout_folders_and_removes_them_with_y
     a = podctl.build_parser().parse_args(["prune", "abc123", "--yes"])
     assert a.cmd == "prune" and a.pod == "abc123" and a.yes
     assert not podctl.build_parser().parse_args(["prune", "abc123"]).yes
+
+
+def test_unit_each_workflow_gets_its_own_local_port():
+    """2.5.6: with one GPU per workflow every machine serves ComfyUI on 8188, so identical LocalForward lines mean
+    only whichever ssh ran first gets the port. The rest fail, and because ExitOnForwardFailure is set the whole
+    session dies and takes its OWN forward with it, which is why a second product could not be opened at all even
+    though its port was free. Measured on two live machines."""
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location("podctl", pathlib.Path(__file__).resolve().parents[1] / "_build" / "pod" / "podctl.py")
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+    # a plain port is unchanged, both sides the same and still an int
+    assert m.tunnel_port("8188") == 8188 and m.tunnel_port(8188) == 8188
+    argv = m.tunnel_argv([8188], host="h", port=22, key="/k", user="root")
+    assert "8188:127.0.0.1:8188" in argv
+    # LOCAL:REMOTE shifts only the local side, which is what lets a second machine be reached at all
+    assert m.tunnel_port("8190:8188") == "8190:8188"
+    argv = m.tunnel_argv(["8190:8188"], host="h", port=22, key="/k", user="root")
+    assert "8190:127.0.0.1:8188" in argv and "8188:127.0.0.1:8188" not in argv
+    # a malformed pair is refused here, where the message can say so, not by ssh
+    for bad in ("8190:", ":8188", "a:8188", "8190:b"):
+        try:
+            m.tunnel_port(bad); raise AssertionError("accepted %r" % bad)
+        except ValueError:
+            pass
+    # and each alias's written block claims its own local port, so two machines do not both bind 8188
+    seen = {a: [l for l in m._block_for(a, "root", "/k").splitlines() if "localhost:8188" in l][0].split()[1]
+            for a in ("verda-krea2", "verda-cc", "verda-h3")}
+    assert len(set(seen.values())) == 3, seen
+    assert m._block_for("an-unknown-alias", "root", "/k").count("LocalForward 8188 localhost:8188") == 1

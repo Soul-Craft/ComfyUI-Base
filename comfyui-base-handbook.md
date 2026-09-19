@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.5.5.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.5.6.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -56,7 +56,12 @@ run once per machine as **step one**; then each workflow package is **step two**
    placeholders (`token_here`, `replace_with_ids`…) are named and ignored; a token its service rejects fails the run
    before anything downloads. No token ever appears in a log or on the process list: `hf` reads it from its
    environment, and the suite runs with every token name stripped. JupyterLab's token rides `JUPYTER_TOKEN` (or
-   `JUPYTER_PASSWORD`) in its environment; without one the boot does not start it and says so (2.1.0).
+   `JUPYTER_PASSWORD`) in its environment; without one the boot does not start it and says so (2.1.0). Since 2.5.6,
+   where `BASE_LISTEN` is loopback (every host but RunPod, so the terminal is reachable only through an ssh tunnel)
+   the boot GENERATES a token instead of leaving the terminal dark, and writes it owner-only to `state/tokens.env`.
+   It is still never printed, for the same reason no other token is: with a shared store the boot log is a file every
+   machine mounts. `podctl jupyter <machine>` reads it over ssh and prints the URL with the token already in it. On a
+   public bind with no credential, 2.1.0's refusal is unchanged.
 10. **The base owns ComfyUI's launch flags.** `state/comfyui_args.txt` is the only source. An image's own args file
     (RunPod's `runpod-slim/comfyui_args.txt`) is imported once, on the first real run, and never read again; nothing
     creates a phantom file on images that have none. `HYGIENE_ARGS` entries are ensured present, `HYGIENE_ARGS_REMOVE`
@@ -403,6 +408,20 @@ provisioning, a status page), in the project's own repository.
 
 ## 10. Record
 
+- 2.5.6: the terminal a customer needs, and four things that had to be right before it could exist. JupyterLab
+  now GENERATES a token where `BASE_LISTEN` is loopback, so the machine is not dark until somebody invents a
+  credential; on a public bind with no credential 2.1.0's refusal is unchanged, because a generated token there is
+  still a service on a proxy URL that nobody asked to start. The token is written owner-only to `state/tokens.env`
+  and is NEVER printed: the boot log is a file on the volume, and with a shared store every machine mounts it, so
+  the rule that has forbidden logging a supplied token since 2.1.0 applies to a generated one too. `podctl jupyter
+  <machine>` reads it over ssh and prints the URL. The IP in that hint is read from the machine's own NIC
+  (`hostname -I`); an earlier draft asked api.ipify.org, which the outbound-host allowlist caught — the base asks
+  the network nothing about itself. `--port LOCAL:REMOTE` and a per-alias offset (`tunnel_locals`) because with one
+  GPU per workflow every machine serves 8188 and one number can reach only one of them; a plain `8188` is
+  unchanged. `_base_local_dirs` creates the machine-local directories the launch line names, which is why ComfyUI
+  refused to start on a shared root: `--user-directory` pointed at a path no machine had made yet. And
+  `recall_library` no longer feeds the shared workspace back to itself as a separate library, which left a stale
+  fstab line naming a mount that no longer exists.
 - 2.5.5: the GPU lease is the MACHINE's, so it moved off the volume to `BASE_LOCAL_STATE`. It was written to
   `$BASE_VOLUME/comfy-base/state/gpu.lease`, which is per machine only while the volume is. Under the shared root
   (2.5.0) `/workspace` IS one store that every machine mounts, so that one file became a global mutex: three

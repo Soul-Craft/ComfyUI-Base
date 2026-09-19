@@ -79,14 +79,35 @@ SSH_ALIAS = (os.environ.get("PODCTL_HOST") or "").strip() or "runpod"
 SSH_USER = "root"
 KEY_PATH = "~/.ssh/id_ed25519"
 VOLUME_ROOT = "/workspace"                              # the persistent root on the machine: the base's BASE_VOLUME there
+# 2.5.6: the ComfyUI forward is per ALIAS, because with one GPU per workflow every machine serves on 8188 and
+# identical LocalForward lines mean only whichever `ssh <alias>` ran first gets the port; the rest fail or, worse,
+# the operator reads one product's panel believing it is another's. TUNNEL_LOCAL maps alias to local port and an
+# unknown alias keeps 8188, so a single-machine setup is unchanged.
+# Every service is per alias, not just ComfyUI. The first machine's session took 9199 and 11434 as well, and
+# because ExitOnForwardFailure is set the SECOND machine's session then died on those and took its own ComfyUI
+# forward down with it, so a product could not be opened even though its own port was free. Measured on two live
+# machines. An unknown alias keeps the original numbers, so a single-machine setup is unchanged.
+TUNNEL_LOCAL = {"verda": 0, "runpod": 0, "verda-krea2": 0, "verda-cc": 1, "verda-h3": 2}
+TUNNEL_SERVICES = [("comfy", 8188), ("jupyter", 8888), ("metrics", 9199), ("ollama", 11434)]
 SSH_BLOCK = ("Host {alias}\n  HostName {host}\n  Port {port}\n  User {user}\n  IdentityFile {key}\n  StrictHostKeyChecking accept-new\n"
-             "  LocalForward 8188 localhost:8188\n  LocalForward 9199 localhost:9199\n  LocalForward 11434 localhost:11434\n")
+             "  LocalForward {comfy} localhost:8188\n  LocalForward {jupyter} localhost:8888\n"
+             "  LocalForward {metrics} localhost:9199\n  LocalForward {ollama} localhost:11434\n")
+
+
+def tunnel_locals(alias):
+    """The local port for each service on this alias: the remote port plus the alias's offset, so every machine
+    gets its own set and two of them never contend for one number."""
+    off = TUNNEL_LOCAL.get(alias, 0)
+    return {name: remote + off for name, remote in TUNNEL_SERVICES}
 
 
 def _block_for(alias, user, key):
     """The block as it would be written for this run, host and port left as {host} {port} (the name RUNPOD_BLOCK is kept for
     the suite and for anyone who read it before 2.2.0; the provider fills the rest)."""
-    return SSH_BLOCK.replace("{alias}", alias).replace("{user}", user).replace("{key}", key)
+    blk = SSH_BLOCK.replace("{alias}", alias).replace("{user}", user).replace("{key}", key)
+    for name, local in tunnel_locals(alias).items():
+        blk = blk.replace("{%s}" % name, str(local))
+    return blk
 
 
 RUNPOD_BLOCK = _block_for(SSH_ALIAS, SSH_USER, KEY_PATH)
@@ -152,7 +173,8 @@ def write_ssh_config(path, host, port):
     start = next((i for i, ln in enumerate(lines) if re.match(r"^Host\s+%s\s*$" % re.escape(SSH_ALIAS), ln)), None)
     if start is None:
         sep = "" if text == "" or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
-        text = text + sep + SSH_BLOCK.format(alias=SSH_ALIAS, user=SSH_USER, key=KEY_PATH, host=host, port=port)
+        text = text + sep + SSH_BLOCK.format(alias=SSH_ALIAS, user=SSH_USER, key=KEY_PATH, host=host, port=port,
+                                             **tunnel_locals(SSH_ALIAS))
     else:
         end = next((j for j in range(start + 1, len(lines)) if re.match(r"^Host\s", lines[j])), len(lines))
         for j in range(start + 1, end):
@@ -208,6 +230,17 @@ SCP_CMD = ["scp", "-q", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChe
 TUNNEL_PORTS = [8188, 8888]      # ComfyUI, JupyterLab
 
 
+def tunnel_port(v):
+    """A --port value: a plain number stays an INT, as it always was, and LOCAL:REMOTE stays a string. Keeping the
+    plain case an int means every caller and every test that predates the pair form is untouched (2.5.6)."""
+    t = str(v)
+    if ":" not in t:
+        return int(t)
+    local, _, remote = t.partition(":")
+    int(local); int(remote)                       # both halves must be numbers, and say so here rather than in ssh
+    return "%d:%d" % (int(local), int(remote))
+
+
 def ssh_run(remote_cmd, env=None, timeout=None):
     """One command on the pod, no forwards, no TTY. Returns the CompletedProcess."""
     import subprocess
@@ -222,8 +255,14 @@ def tunnel_argv(ports=None, host=None, port=None, key=None, user=None):
     forwards and bound nothing (2.0.21), while the config's LocalForward lines would double-bind 8188."""
     argv = ["ssh", "-N", "-F", "/dev/null", "-i", str(key), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes"]
+    # 2.5.6: a port may be "LOCAL:REMOTE". With one GPU per workflow, every machine serves ComfyUI on 8188 and a
+    # tunnel that binds 8188 locally can therefore only ever reach ONE of them: the second refuses with
+    # ExitOnForwardFailure, which is honest but leaves the operator unable to see two products at once. A plain
+    # "8188" still means 8188 both sides, so nothing that worked before changes.
     for p in (ports or TUNNEL_PORTS):
-        argv += ["-L", "%d:127.0.0.1:%d" % (int(p), int(p))]
+        local, _, remote = str(p).partition(":")
+        remote = remote or local
+        argv += ["-L", "%d:127.0.0.1:%d" % (int(local), int(remote))]
     return argv + ["-p", str(int(port)), "%s@%s" % (user or SSH_USER, host)]
 
 
@@ -722,6 +761,7 @@ def cmd_upload(prov, args):
 LOCAL_STATE = "/var/lib/comfy-base-machine"      # lib/00-env.sh's BASE_LOCAL_STATE default
 LEASE_PATH = LOCAL_STATE + "/gpu.lease"
 LEGACY_LEASE_PATH = "/workspace/comfy-base/state/gpu.lease"
+REMOTE_HOME = "/workspace/comfy-base"   # the base on the machine; the zip installs here
 
 
 def lease_session_id(env=None):
@@ -1040,6 +1080,31 @@ def cmd_tunnel(prov, args):
     return subprocess.call(argv)
 
 
+def cmd_jupyter(prov, args):
+    """The URL, with the token already in it, ready to paste into a browser.
+
+    2.5.6: boot.sh generates a JupyterLab token and writes it to state/tokens.env owner-only, and deliberately does
+    NOT print it — the boot log is a file on the volume, and with a shared store that volume is mounted by every
+    machine. So the token is fetched over the ssh channel, on demand, by whoever can already reach the machine.
+    The local port is the alias's own (tunnel_locals), because with one GPU per workflow every machine serves 8888
+    and a single number could only ever reach one of them."""
+    r = ssh_run("cat %s/state/tokens.env 2>/dev/null" % REMOTE_HOME, timeout=30)
+    if r.returncode != 0:
+        print("jupyter  Host %s does not answer (podctl ssh-config first)" % SSH_ALIAS); return 1
+    tok = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("JUPYTER_TOKEN="):
+            tok = line.split("=", 1)[1].strip()
+    if not tok:
+        print("jupyter  no token on the machine yet — it is written the first time boot.sh starts JupyterLab.")
+        print("jupyter  If ComfyUI is running but JupyterLab is not, restart the machine's boot (podctl ensure).")
+        return 1
+    local = tunnel_locals(SSH_ALIAS)["jupyter"]
+    print("jupyter  tunnel:  ssh -L %d:127.0.0.1:8888 %s -N" % (local, SSH_ALIAS))
+    print("jupyter  then:    http://127.0.0.1:%d/lab?token=%s" % (local, tok))
+    return 0
+
+
 class _SshIO:
     """The smallest PodIO for a read-only probe over `Host runpod` (a timeout: `status` must never hang on a dead pod)."""
     def remote(self, cmd):
@@ -1147,8 +1212,11 @@ def build_parser():
     p.add_argument("--purpose", default="", help="what you are doing, so the next session knows whether to wait")
     p.add_argument("--minutes", type=int, default=60, help="how long to hold it (default 60)")
     p.add_argument("--force", action="store_true", help="take it even though another session holds a live one")
+    p = sub.add_parser("jupyter", help="the JupyterLab URL with the token in it, read from the machine over ssh"); p.add_argument("pod")
     p = sub.add_parser("tunnel", help="the ONE ssh session that forwards ports (ComfyUI 8188, JupyterLab 8888); runs until killed")
-    p.add_argument("pod"); p.add_argument("--port", type=int, action=_FreshAppend, default=list(TUNNEL_PORTS), help="repeatable; default 8188 and 8888")
+    p.add_argument("pod"); p.add_argument("--port", type=tunnel_port, action=_FreshAppend, default=list(TUNNEL_PORTS),
+                   help="repeatable; default 8188 and 8888. LOCAL:REMOTE shifts the local side, e.g. --port 8190:8188 "
+                        "reaches a second machine's ComfyUI on 8190 while the first keeps 8188")
     for sp in sub.choices.values():                                  # --provider after the verb too (a hook that reads argv sees both forms)
         sp.add_argument("--provider", dest="provider_after", default=None, choices=list(_hosts.NAMES), help=argparse.SUPPRESS)
     return ap
@@ -1164,7 +1232,7 @@ def main(argv=None):
         if prov.experimental:
             print("note    host %s is EXPERIMENTAL: written from first-party docs, not yet proven on a live account (hosts/%s/README.md)" % (prov.name, prov.name), file=sys.stderr)
         rc = {"status": cmd_status, "pods": cmd_pods, "image": cmd_image, "ensure": cmd_ensure, "ssh-config": cmd_ssh_config,
-         "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy, "upload": cmd_upload, "tunnel": cmd_tunnel, "install": cmd_install,
+         "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy, "upload": cmd_upload, "tunnel": cmd_tunnel, "jupyter": cmd_jupyter, "install": cmd_install,
          "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune}[args.cmd](prov, args)
         if isinstance(rc, int):
             return rc

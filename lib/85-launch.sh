@@ -21,6 +21,16 @@ _base_hf_home(){ # packs that fetch their own weights at first queue (RMBG, Flor
   # ~/.cache/huggingface, which is container disk on the pod — re-downloaded after every stop. On the volume it persists.
   if [ -n "$BASE_PERSIST_ROOT" ]; then echo "$BASE_PERSIST_ROOT/huggingface"; fi
 }
+_base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHINE must exist before it runs
+  # The args file lives on the SHARED store, so --user-directory and --temp-directory reach every machine, while
+  # the directories they name are per machine and were created only by the install that wrote them. A machine
+  # that joined the store without installing therefore had the flags and not the folders, and ComfyUI REFUSED to
+  # start: "argument --user-directory: The path ... does not exist". Measured on two machines at once, 2.5.6.
+  local d
+  for d in $(_base_args_extra | awk '/^\//{print}'); do
+    case "$d" in /*) mkdir -p "$d" 2>/dev/null || true ;; esac
+  done
+}
 _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints what would actually run
   local extra pv hf
   extra="$(_base_args_extra | tr '\n' ' ')"; extra="${extra% }"
@@ -30,6 +40,7 @@ _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints
 }
 _base_start_comfy(){
   local extra=() line i _w pv=()
+  _base_local_dirs
   if [ -f "$ARGS_FILE" ]; then
     while IFS= read -r line; do case "$line" in ''|'#'*) continue;; esac; read -r -a _w <<< "$line"; extra+=(${_w[@]+"${_w[@]}"}); done < "$ARGS_FILE"
   fi

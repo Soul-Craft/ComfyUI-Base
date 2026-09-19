@@ -262,3 +262,49 @@ def test_unit_a_shared_root_makes_a_separate_library_redundant(tmp_path):
     r = _bash('base_env_setup 2>&1; echo "LIB=[$BASE_LIBRARY]"',
               env={"BASE_VOLUME": str(vol), "BASE_HOST": "local", "BASE_VOLUME_SHARED": "0", "BASE_LIBRARY": str(lib)})
     assert "LIB=[%s]" % lib in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_jupyter_generates_one_token_keeps_it_private_and_never_goes_tokenless(tmp_path):
+    """2.5.6: a customer needs the terminal to upload a LoRA, and every comparable product hands them one with a
+    token printed in the startup log. Tokenless is still refused, which was the whole point of 2.1.0; what changes
+    is that the base GENERATES the token rather than leaving the terminal dark until the customer invents one.
+    This is Jupyter's own model restored, and a per-machine random token beats the shared default password some
+    public templates fall back to."""
+    home = tmp_path / "comfy-base"; (home / "tools" / "bin").mkdir(parents=True); (home / "state").mkdir()
+    jl = home / "tools" / "bin" / "jupyter-lab"; jl.write_text("#!/bin/sh\nexit 0\n"); jl.chmod(0o755)
+    tf = home / "state" / "tokens.env"
+    # boot.sh is standalone: base.sh does not source it, so the helper that sources base.sh cannot see it
+    def run():
+        e = {k: v for k, v in os.environ.items() if k not in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD")}
+        e.update(BOOT_HOME=str(home), BASE_LISTEN="127.0.0.1")
+        return subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter' % BASE],
+                              capture_output=True, text=True, env=e, cwd=str(tmp_path))
+    r = run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    saved = [l.split("=", 1)[1] for l in tf.read_text().splitlines() if l.startswith("JUPYTER_TOKEN=")]
+    assert len(saved) == 1 and len(saved[0]) >= 32, saved
+    assert oct(tf.stat().st_mode)[-3:] == "600", "the token file must be owner-only"
+    # and it is NEVER printed. The boot log is a file on the volume; with a shared store that volume is mounted by
+    # every machine, so a generated token in it is readable by every session on every one of them. The suite has
+    # forbidden logging an operator-supplied token since 2.1.0 and a generated one is the same secret — the house
+    # rule is that a rule applies to ALL instances of its pattern, not the instance that prompted it. What the log
+    # carries instead is how to fetch it.
+    assert saved[0] not in r.stdout, "the generated token was printed into the boot log"
+    assert "ssh -L 8888:127.0.0.1:8888" in r.stdout and "podctl jupyter" in r.stdout, r.stdout
+    # a second boot REUSES it and does not append: caught doing exactly that before the fix
+    r2 = run()
+    again = [l for l in tf.read_text().splitlines() if l.startswith("JUPYTER_TOKEN=")]
+    assert len(again) == 1 and again[0].endswith(saved[0]), again
+    # and it binds what BASE_LISTEN says, which is loopback on every host but RunPod
+    assert "--ip" in (BASE / "lib" / "boot.sh").read_text()
+    # the generation is gated on that bind: on a PUBLIC one with no credential, 2.1.0's refusal stands. A generated
+    # token would otherwise start a service on a *.proxy.runpod.net URL that nobody asked for.
+    pub = tmp_path / "public"; (pub / "comfy-base" / "tools" / "bin").mkdir(parents=True)
+    (pub / "comfy-base" / "state").mkdir()
+    jl2 = pub / "comfy-base" / "tools" / "bin" / "jupyter-lab"; jl2.write_text("#!/bin/sh\nexit 0\n"); jl2.chmod(0o755)
+    e = {k: v for k, v in os.environ.items() if k not in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD")}
+    e.update(BOOT_HOME=str(pub / "comfy-base"), BASE_LISTEN="0.0.0.0")
+    r3 = subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter' % BASE],
+                        capture_output=True, text=True, env=e, cwd=str(tmp_path))
+    assert r3.returncode == 0 and "JupyterLab not started" in r3.stdout and "never tokenless" in r3.stdout, r3.stdout
+    assert not (pub / "comfy-base" / "state" / "tokens.env").exists(), "a public bind must not generate a token"
