@@ -43,7 +43,7 @@ own block in `~/.ssh/config`.
 ## Where each host is documented
 
 - `hosts/runpod/README.md`: the RunPod recipe as it works today (the API key, `PUBLIC_KEY`, the proxy, the commands).
-- `hosts/verda/README.md`: Verda, written by its own session (the folder holds a recipe only until its provider lands).
+- `hosts/verda/README.md`: Verda, and what the live runs of 2026-09-17 and 2026-09-18 answered.
 - `hosts/crusoe/README.md`: Crusoe, the person's recipe; `hosts/crusoe/provider.py` is the stub whose docstring is the
   full REST command map; `hosts/crusoe/startup.sh` is the VM's every-boot startup script.
 - `hosts/local/README.md`: an owned NVIDIA box; `hosts/local/install-local.sh` is the one-command install.

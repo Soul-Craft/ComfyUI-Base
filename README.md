@@ -11,8 +11,8 @@ and the boot, and runs each package's own test suite from the zip it ships. MIT,
 - **The core** (`lib/`, `py/`, `suite/`) runs on any Linux host with an NVIDIA GPU and one persistent volume root.
   Four settings say what differs between hosts: `BASE_HOST`, `BASE_VOLUME`, `BASE_VOLUME_KIND`, `BASE_LISTEN`
   (`lib/00-env.sh` documents them; the handbook §1 explains them).
-- **The hosts** (`hosts/`) are the per-host subsets: RunPod (proven on live pods), Verda (experimental, written from
-  first-party docs), Crusoe Cloud (interface only, so far) and an owned box (`hosts/local`). `hosts/README.md` is the matrix.
+- **The hosts** (`hosts/`) are the per-host subsets: RunPod and Verda (both proven on live accounts), Crusoe Cloud
+  (interface only, so far) and an owned box (`hosts/local`). `hosts/README.md` is the matrix.
 - **The driver** (`_build/pod/podctl.py`) runs on your Mac: `podctl --provider <host> pods | status | ensure | install |
   stop | start | restart | deploy | upload | lease | tunnel`. Everything it does over ssh is the same on every host;
   the provider answers where the machine is and how it boots.
@@ -87,8 +87,8 @@ pull request. You need `uv` on PATH.
 | Host | Status |
 |---|---|
 | RunPod | proven on live pods |
-| Verda | experimental: written from first-party docs and tested against a fake API server, not yet run on a live account |
+| Verda | proven on a live account, 2026-09-17 and 2026-09-18 (`hosts/verda/README.md` records what the runs answered) |
 | Crusoe Cloud | interface only: every call mapped in `hosts/crusoe/provider.py`, nothing implemented yet |
 | an owned NVIDIA box | a recipe with a quickstart (`hosts/local/README.md`, RTX Pro 6000 / Blackwell), not yet reported end to end |
 
-The Verda and Crusoe providers, and a report from an owned box, are the open items; issues and pull requests welcome.
+The Crusoe provider and a report from an owned box are the open items; issues and pull requests welcome.

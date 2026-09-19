@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.10.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.10.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -112,7 +112,7 @@ host's provider (Mac-side, loaded by `podctl`), its startup script and its READM
 | Host | The machine | Volume root | The boot | Listen | Status |
 |---|---|---|---|---|---|
 | `runpod` | a container behind RunPod REST v1, sshd on a mapped port | `/workspace`, a network volume (`mount`) | the start command `podctl ensure` wraps around `boot.sh` | `0.0.0.0` (RunPod's HTTP proxy needs it) | proven |
-| `verda` | a VM behind Verda's (DataCrunch's) REST API, `root@<ip>:22`; an OS volume that IS the image next time | `/workspace`, a block volume `startup.sh` formats once and mounts | `comfy-base-boot.service` | `127.0.0.1`, reached through `podctl tunnel` | EXPERIMENTAL: written from first-party docs, not yet proven on a live account |
+| `verda` | a VM behind Verda's (DataCrunch's) REST API, `root@<ip>:22`; an OS volume that IS the image next time | `/workspace`, a block volume `startup.sh` formats once and mounts | `comfy-base-boot.service` | `127.0.0.1`, reached through `podctl tunnel` | proven (live account, 2026-09-17 and 2026-09-18) |
 | `crusoe` | a VM with an every-boot startup script and a default-deny firewall, `ubuntu@<ip>:22` | `/workspace` (`mount`) | `comfy-base-boot.service` | `127.0.0.1`, through the tunnel | interface only |
 | `local` | an owned NVIDIA box, no API | a directory of your choosing (`BASE_VOLUME_KIND=dir`) | `comfy-base-boot.service`, installed by hand | `127.0.0.1` | a recipe |
 
@@ -176,10 +176,10 @@ private images). Before the base is installed that boots the image as it was plu
 when the API is not available: the JupyterLab terminal on port 8888, where `bash lib/boot.sh --print-sshd-bootstrap`
 prints the sshd snippet to paste.
 
-### 1.2 Verda (experimental)
+### 1.2 Verda
 
-Written from Verda's own documentation and API reference and not yet proven on a live account; `podctl --provider
-verda` says so on every run. The recipe, in full, is `hosts/verda/README.md`; the shape:
+Proven on a live account, 2026-09-17 and 2026-09-18 (2.5.3); the driver no longer warns. What those runs answered,
+and the recipe in full, is `hosts/verda/README.md`; the shape:
 
 - **Credentials:** a client id and secret (OAuth2 client credentials, exchanged for a bearer token), from
   `VERDA_CLIENT_ID` + `VERDA_CLIENT_SECRET` or `~/.verda/credentials` (mode 600). The key is `~/.ssh/verda_comfyui`;
@@ -462,6 +462,15 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.10.1: the front page stops calling a proven host experimental. 2.5.3 promoted Verda after live runs on
+  2026-09-17 and 2026-09-18: it set `experimental = False`, rewrote `hosts/verda/README.md` around what those
+  runs answered, and recorded the change here. It did not touch the four other places that still said
+  otherwise - this handbook's own host table, its 1.2 heading and opening line, `hosts/README.md`, and the
+  top-level README in three spots, including the status table a visitor reads first and the sentence naming
+  Verda an open item. So for a day the repository advertised a working host as unproven, which is the one
+  direction a status claim should never be wrong in: overselling gets found out, underselling just loses
+  people. All corrected against the provider flag, which was right the whole time.
 
 - 2.10.0: the MCP client configuration stops being this repository's to own. 2.7.0 committed a `.mcp.json` at
   the root, which Claude Code and Cursor read automatically: every person who cloned the repository was
