@@ -68,6 +68,11 @@ base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.
   fi
   # ---- packs: named, never blocking. The pack's own newest code cannot run with a newest dependency.
   while IFS= read -r name; do [ -n "$name" ] && failed+=("$name"); done < <(grep -E '\(IMPORT FAILED\):' "$log" | sed -E 's/.*\(IMPORT FAILED\):[[:space:]]*//' | xargs -n1 basename 2>/dev/null | sort -u || true)
+  # 3.3.0: a pack that fails on a module nothing declared gets it (from the reviewed map, lib/47-latest.sh), and is judged again
+  if [ "${#failed[@]}" -gt 0 ] && _base_repair_modules "$log"; then
+    rc=0; _base_quick_test "$log" || rc=$?; failed=()
+    while IFS= read -r name; do [ -n "$name" ] && failed+=("$name"); done < <(grep -E '\(IMPORT FAILED\):' "$log" | sed -E 's/.*\(IMPORT FAILED\):[[:space:]]*//' | xargs -n1 basename 2>/dev/null | sort -u || true)
+  fi
   if [ "${#failed[@]}" -gt 0 ]; then
     warn "pack(s) that do not import with the newest dependencies (named, not blocking): ${failed[*]}"
     for name in "${failed[@]}"; do
@@ -130,6 +135,8 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   # ComfyUI registers custom nodes at import time, so a package that ships one has no other way
   # to say "the running process cannot see this yet".
   if [ "${#PKG_RESTART_WHY[@]}" -gt 0 ]; then BASE_RESTART_WHY+=(${PKG_RESTART_WHY[@]+"${PKG_RESTART_WHY[@]}"}); fi
+  # 3.3.0: Python packages this run moved (the newest pass, a repaired module): the running server has the old ones loaded
+  if [ "${BASE_PY_MOVED:-0}" -gt 0 ] 2>/dev/null; then BASE_RESTART_WHY+=("$BASE_PY_MOVED Python package(s) moved; the running server still has the old ones loaded"); fi
   local live=0
   curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1 && live=1
   if [ "$live" = 0 ]; then

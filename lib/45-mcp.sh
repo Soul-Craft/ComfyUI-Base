@@ -34,7 +34,10 @@ base_mcp(){ # comfy-cli + comfy-mcp into the run's venv, bound to the discovered
   # built it and it does not care either way — a venv made without --seed has no pip at all.
   # 3.0.0: present here; their NEWEST arrives in the one resolve after this stage (lib/47-latest.sh), never in a separate
   # --upgrade, which resolves only what it names and can overshoot a cap another package declares (2.12.3's lesson)
-  if ! _base_uvpip -q ${c:+-c "$c"} "comfy-cli>=1.14.0" comfy-mcp 2>&1 | tail -3; then
+  # 3.3.0: the newest set (lib/47-latest.sh) already installs both; a second install is a second resolve for nothing
+  if "$PY" -c 'import importlib.metadata as m; m.version("comfy-mcp"); m.version("comfy-cli")' >/dev/null 2>&1; then
+    note "comfy-cli and comfy-mcp are in the venv (the newest set installed them)"
+  elif ! _base_uvpip -q ${c:+-c "$c"} "comfy-cli>=1.14.0" comfy-mcp 2>&1 | tail -3; then
     miss "comfy-cli / comfy-mcp install failed"; BASE_MCP_RESULT="FAILED (install)"
     BASE_WARN+=("comfy mcp not installed: the machine runs, an agent cannot drive it")
     return 0

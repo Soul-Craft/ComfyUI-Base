@@ -257,6 +257,7 @@ base_packs(){ # base_packs git | pip
     else
       printf '%s\n' "$out" | awk -F'\t' '$1=="summary"{printf "  %s\n", $2}'
       if _base_run_watched "requirements (one resolve)" _base_derived_install; then ok "ComfyUI + every pack's requirements + PIP_EXTRA installed, newest"
+        BASE_DERIVED_DONE="$(_base_derived_fp)"      # 3.3.0: the newest pass does not resolve this same set again
       else miss "the derived requirement set failed to install (uv's reason is above)"; BASE_FAILED+=("requirements: the derived set did not install"); fi
     fi
   fi
@@ -342,7 +343,10 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
     local ref="${SAGE_REF:-main}" stampf="$VENV/.comfy-base-sageattention"
     sha="$(git ls-remote https://github.com/thu-ml/SageAttention "$ref" 2>/dev/null | awk 'NR==1{print substr($1,1,12)}')"
     pytag="$("$PY" -c 'import sys; print("cp%d%d" % sys.version_info[:2])' 2>/dev/null)"
-    tv="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null)"
+    # 3.3.0: the key names torch's CUDA backend too (2.14.0 exists for cu130 and cu132 alike, and a build for one is
+    # not a build for the other); the public version alone is what keys before 3.3.0 carried
+    local tvpub tvfull
+    tvfull="$("$PY" -c 'import torch; print(torch.__version__.replace("+", "-"))' 2>/dev/null)"; tvpub="${tvfull%%-*}"; tv="$tvfull"
     key="sageattention-${sha:-unresolved}-${pytag:-cp}-torch${tv:-0}-${SAGE_ARCHS:+archs-}$(printf '%s' "${SAGE_ARCHS:-${BASE_GPU_SM:-sm}}" | tr ';.' '_-')"
     # already built from exactly this source for exactly this venv: nothing to do. Anything else (main moved, a new
     # Python, a new torch, another GPU) rebuilds or reinstalls from the cache, so it is never left behind.
@@ -352,6 +356,17 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
     if [ -n "$sha" ] && { [ "$stamped" = "$key" ] || { [ -z "${SAGE_ARCHS:-}" ] && [ -n "${BASE_GPU_SM:-}" ] && _base_sage_covers "$stamped" "$prefix" "$smtok"; }; } \
        && "$PY" -c "import sageattention" >/dev/null 2>&1; then
       ok "sageattention $(_base_sage_ver) already built from SageAttention $sha for this venv (its newest)"; return 0
+    fi
+    # a build stamped with a pre-3.3.0 key for this very venv (same source, Python, torch, GPU; it imports with this
+    # torch) is this venv's build: adopt it under the new key rather than spend 10 to 20 minutes rebuilding it
+    if [ -n "$sha" ] && [ "$tvpub" != "$tvfull" ]; then
+      local okey="sageattention-${sha}-${pytag:-cp}-torch${tvpub:-0}-${SAGE_ARCHS:+archs-}$(printf '%s' "${SAGE_ARCHS:-${BASE_GPU_SM:-sm}}" | tr ';.' '_-')"
+      local oprefix="sageattention-${sha}-${pytag:-cp}-torch${tvpub:-0}-"
+      if { [ "$stamped" = "$okey" ] || { [ -z "${SAGE_ARCHS:-}" ] && [ -n "${BASE_GPU_SM:-}" ] && _base_sage_covers "$stamped" "$oprefix" "$smtok"; }; } \
+         && "$PY" -c "import sageattention" >/dev/null 2>&1; then
+        echo "${prefix}${stamped#"$oprefix"}" > "$stampf"
+        ok "sageattention $(_base_sage_ver) already built from SageAttention $sha for this venv (its newest; the key now names ${tvfull#*-})"; return 0
+      fi
     fi
     local cc="${BASE_GPU_SM:-}"; cc="${cc#sm_}"
     if [ -n "${SAGE_ARCHS:-}" ]; then cc="$SAGE_ARCHS"             # 2.1.0: the image build has no GPU and wants several ("9.0;12.0")

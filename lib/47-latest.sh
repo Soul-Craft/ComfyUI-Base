@@ -97,13 +97,75 @@ base_torch_constraints(){ # C2: constraints-torch.txt, fresh from the venv: the 
   return 0
 }
 
-_base_derived_install(){ # [extra uv args...] → one resolve of the derived file (plus the base's venv tools), newest everything
-  local backend="${BASE_TORCH_BACKEND:-$(_base_venv_backend)}" idx=() con=()
+_base_canon(){ printf '%s' "$1" | tr 'A-Z_.' 'a-z--'; }
+_base_overrides_effective(){ # [this round's overrides file] → prints the path of the overrides every resolve uses, nothing when none
+  # 3.3.0: a package forced past a cap stays forced. forced.txt carries each earlier force as a FLOOR (name>=version:
+  # never a pin, the resolver still takes the newest), and every resolve applies it, so the first install of a run no
+  # longer pushes those packages back under the cap for the newest pass to force up again. A round's own force for a
+  # name wins over that name's floor.
+  local explicit="${1:-}" eff="$BASE_LIFT_DIR/overrides.effective.txt" names=" " l n
+  : > "$eff"
+  if [ -n "$explicit" ] && [ -s "$explicit" ]; then
+    cat "$explicit" >> "$eff"
+    while IFS= read -r l; do [ -n "$l" ] && names="$names$(_base_canon "${l%%[<>=!~ ;[]*}") "; done < "$explicit"
+  fi
+  if [ -s "$BASE_LIFT_DIR/forced.txt" ]; then
+    while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      n="$(_base_canon "${l%%[<>=!~ ;[]*}")"
+      case "$names" in *" $n "*) ;; *) printf '%s\n' "$l" >> "$eff";; esac
+    done < "$BASE_LIFT_DIR/forced.txt"
+  fi
+  if [ -s "$eff" ]; then echo "$eff"; fi
+  return 0
+}
+_base_derived_install(){ # [--overrides file] [extra uv args...] → one resolve of the derived file (plus the base's venv tools), newest everything
+  local backend="${BASE_TORCH_BACKEND:-$(_base_venv_backend)}" idx=() con=() args=() explicit="" prev="" a eff
+  [ -n "$BASE_LIFT_DIR" ] || _base_lift_dir
+  for a in "$@"; do
+    if [ "$prev" = "--overrides" ]; then explicit="$a"; elif [ "$a" != "--overrides" ]; then args+=("$a"); fi
+    prev="$a"
+  done
   while IFS= read -r a; do idx+=("$a"); done < <(_base_uv_index_args)
   if [ -n "${CONSTRAINTS:-}" ] && [ -s "$CONSTRAINTS" ]; then con=(-c "$CONSTRAINTS"); fi
-  _base_uv pip install --python "$PY" --upgrade ${backend:+--torch-backend "$backend"} ${idx[@]+"${idx[@]}"} \
-    ${con[@]+"${con[@]}"} -r "$BASE_LIFT_DIR/derived.txt" \
-    pip setuptools wheel pytest "huggingface_hub[hf-xet]" "comfy-cli>=1.14.0" comfy-mcp ninja packaging "$@"
+  eff="$(_base_overrides_effective "$explicit")"
+  if _base_uv pip install --python "$PY" --upgrade ${backend:+--torch-backend "$backend"} ${idx[@]+"${idx[@]}"} \
+       ${con[@]+"${con[@]}"} ${eff:+--overrides "$eff"} -r "$BASE_LIFT_DIR/derived.txt" \
+       pip setuptools wheel pytest "huggingface_hub[hf-xet]" "comfy-cli>=1.14.0" comfy-mcp ninja packaging ${args[@]+"${args[@]}"}; then
+    return 0
+  fi
+  # a carried floor that no longer resolves (a release withdrawn, a Python dropped) must never stop the install: once more without them
+  if [ -z "$explicit" ] && [ -s "$BASE_LIFT_DIR/forced.txt" ]; then
+    echo "  the carried floors did not resolve; once more without them (they are dropped)"
+    : > "$BASE_LIFT_DIR/forced.txt"
+    _base_uv pip install --python "$PY" --upgrade ${backend:+--torch-backend "$backend"} ${idx[@]+"${idx[@]}"} \
+      ${con[@]+"${con[@]}"} -r "$BASE_LIFT_DIR/derived.txt" \
+      pip setuptools wheel pytest "huggingface_hub[hf-xet]" "comfy-cli>=1.14.0" comfy-mcp ninja packaging ${args[@]+"${args[@]}"}
+    return $?
+  fi
+  return 1
+}
+_base_derived_fp(){ # → a fingerprint of everything one derived resolve reads: the derived file, the constraints, the carried floors
+  cat "$BASE_LIFT_DIR/derived.txt" "${CONSTRAINTS:-/nonexistent}" "$BASE_LIFT_DIR/forced.txt" 2>/dev/null | cksum
+}
+BASE_DERIVED_DONE=""       # the fingerprint of the derived set this run already installed (3.3.0: never resolved twice)
+_base_derived_install_once(){ # the derived install, unless this run already installed exactly this set
+  if [ -n "$BASE_DERIVED_DONE" ] && [ "$(_base_derived_fp)" = "$BASE_DERIVED_DONE" ]; then
+    ok "the requirement set is unchanged since the install above: not resolved twice"; return 0
+  fi
+  _base_derived_install "$@" || return $?
+  BASE_DERIVED_DONE="$(_base_derived_fp)"
+  return 0
+}
+_base_dist_version(){ "$PY" -c 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' "$1" 2>/dev/null || true; }
+_base_python_moved(){ # BASE_PY_MOVED: how many Python packages differ from the pre-run snapshot (a reason to restart). Never on a runtime machine.
+  BASE_PY_MOVED=0
+  if _base_runtime_on; then return 0; fi
+  [ -n "${BASE_VENV_SNAPSHOT:-}" ] && [ -f "$BASE_VENV_SNAPSHOT" ] || return 0
+  local now; now="$(_base_uv pip freeze --python "$PY" 2>/dev/null || true)"
+  [ -n "$now" ] || return 0
+  BASE_PY_MOVED="$(printf '%s\n' "$now" | grep -vxFf "$BASE_VENV_SNAPSHOT" | grep -c . || true)"
+  return 0
 }
 
 _base_outdated(){ # → "name installed latest" for every package still behind, torch's closure excluded
@@ -141,6 +203,7 @@ _base_revert_forced(){ # <over-lines> <round-pairs> → sets _BASE_KEPT to the o
     want="$(printf '%s\n' "$pairs" | sed -n "s/^$f==//p" | head -1)"
     over="$(printf '%s' "$over" | grep -v "^$f==" || true)"; [ -n "$over" ] && over="$over"$'\n'
     BASE_UPSTREAM+=("$f ${want:-?}: cannot be forced: $h $hv refuses it at import ($e); $h needs upgrading upstream")
+    _BASE_REFUSED+=("$f"$'\t'"${want:-?}"$'\t'"$h"$'\t'"$hv")
     note "not forcing $f ${want:-?}: $h $hv refuses it at import; named upstream"
   done < <(_base_probe_forced "${names[@]}")
   _BASE_KEPT="$over"
@@ -161,16 +224,32 @@ base_venv_latest(){ # C2-C4, C6: constraints from the venv, the derived install,
   if [ ! -x "${PY:-/nonexistent}" ] || ! command -v uv >/dev/null 2>&1; then note "skipped: no venv interpreter or no uv"; BASE_LIFT_RESULT="skipped"; return 0; fi
   case "$BASE_VENV_RESULT" in failed*|rolled*) note "skipped: the venv step failed"; BASE_LIFT_RESULT="skipped (venv failed)"; return 0;; esac
   base_torch_constraints
-  local out rc=0 round=0 line n have want over="" tried=" " log
+  local out rc=0 round=0 line n have want over="" tried=" " log last_scan="" dirty=1 f w h hv
   _base_lift_dir; log="$BASE_LIFT_DIR/lift.log"; : > "$log"
+  _BASE_REFUSED=()
+  # 3.3.0: a force a holder refused is remembered (state/lift/refused.tsv) and tried again only when either version moves
+  if [ -s "$BASE_LIFT_DIR/refused.tsv" ]; then
+    while IFS=$'\t' read -r f w h hv; do
+      [ -n "$f" ] || continue
+      if [ "$(_base_dist_version "$h")" = "$hv" ]; then
+        tried="$tried$f=$w "; _BASE_REFUSED+=("$f"$'\t'"$w"$'\t'"$h"$'\t'"$hv")
+        BASE_UPSTREAM+=("$f $w: cannot be forced: $h $hv refused it at import (remembered; tried again when either moves); $h needs upgrading upstream")
+      fi
+    done < "$BASE_LIFT_DIR/refused.tsv"
+  fi
   if ! out="$(_base_reqlift 2>&1)"; then err "py/reqlift.py failed: $(printf '%s' "$out" | tail -2)"; BASE_FAILED+=("newest: could not derive the requirement set"); BASE_LIFT_RESULT="FAILED (reqlift)"; return 0; fi
   printf '%s\n' "$out" | awk -F'\t' '$1=="lifted"{printf "  ↑ %s (%s)\n", $4, $2} $1=="held"{printf "  ~ held: %s [%s]\n", $4, $2} $1=="summary"{printf "  %s\n", $2}'
   while IFS=$'\t' read -r kind label name what; do
     if [ "$kind" = lifted ]; then BASE_LIFT_ROWS+=("${what} (upstream pin in $label)"); fi
     if [ "$kind" = held ]; then BASE_UPSTREAM+=("$what: kept as written ($label)"); fi
   done <<< "$out"
-  note "resolving and installing the newest set in one uv call (its log: $log)"
-  _base_derived_install >>"$log" 2>&1 || rc=$?
+  if [ -n "$BASE_DERIVED_DONE" ] && [ "$(_base_derived_fp)" = "$BASE_DERIVED_DONE" ]; then
+    ok "the requirement set is unchanged since the install above: not resolved twice"
+  else
+    note "resolving and installing the newest set in one uv call (its log: $log)"
+    _base_derived_install >>"$log" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] || BASE_DERIVED_DONE="$(_base_derived_fp)"
+  fi
   if [ "$rc" -ne 0 ]; then
     miss "the lifted set did not install in one resolve: uv's reason:"; grep -v '^\s*$' "$log" | tail -8 | sed 's/^/      /'
     BASE_FAILED+=("newest: the lifted requirement set did not install (see $log)"); BASE_LIFT_RESULT="FAILED (resolve)"; return 0
@@ -180,7 +259,8 @@ base_venv_latest(){ # C2-C4, C6: constraints from the venv, the derived install,
   while [ "$round" -lt 3 ]; do
     round=$((round + 1))
     local behind=() pairs=""
-    while read -r n have want; do [ -n "$n" ] && behind+=("$n|$have|$want"); done < <(_base_outdated)
+    last_scan="$(_base_outdated)"; dirty=0
+    while read -r n have want; do [ -n "$n" ] && behind+=("$n|$have|$want"); done <<< "$last_scan"
     [ "${#behind[@]}" -gt 0 ] || break
     local fresh=0 b
     for b in "${behind[@]}"; do
@@ -192,6 +272,7 @@ base_venv_latest(){ # C2-C4, C6: constraints from the venv, the derived install,
     printf '%s' "$pairs" > "$BASE_LIFT_DIR/overrides.txt"
     if [ -n "$over" ]; then printf '%s' "$over" >> "$BASE_LIFT_DIR/overrides.txt"; fi
     note "round $round: forcing $(printf '%s' "$pairs" | grep -c . | tr -d ' ') package(s) past another package's cap"
+    dirty=1
     if _base_derived_install --overrides "$BASE_LIFT_DIR/overrides.txt" >>"$log" 2>&1; then
       _base_revert_forced "$over$pairs" "$pairs"
       if [ "$_BASE_KEPT" != "$over$pairs" ]; then _base_install_overrides "$_BASE_KEPT" >>"$log" 2>&1 || true; fi
@@ -216,12 +297,16 @@ base_venv_latest(){ # C2-C4, C6: constraints from the venv, the derived install,
     while IFS= read -r line; do [ -n "$line" ] && BASE_LIFT_ROWS+=("${line%%==*} → ${line#*==} (forced past another package's cap; asked for by $(_base_lift_who "${line%%==*}"))"); done <<< "$over"
     ok "$forced package(s) forced to their newest past another package's cap"
   fi
+  # the scan is run again only when something was installed after the last one (3.3.0: otherwise its answer stands)
+  if [ "$dirty" = "1" ]; then last_scan="$(_base_outdated)"; fi
   local still=()
   while read -r n have want; do
     [ -n "$n" ] || continue
     case "${BASE_UPSTREAM[*]-}" in *"$n $want:"*) continue;; esac
     still+=("$n $have < $want")
-  done < <(_base_outdated)
+  done <<< "$last_scan"
+  _base_forced_save "$over"
+  printf '%s\n' ${_BASE_REFUSED[@]+"${_BASE_REFUSED[@]}"} | grep . > "$BASE_LIFT_DIR/refused.tsv" || : > "$BASE_LIFT_DIR/refused.tsv"
   if [ "${#still[@]}" -gt 0 ]; then
     for n in "${still[@]}"; do miss "still behind: $n"; done
     BASE_FAILED+=("newest: still behind after the override loop: ${still[*]}")
@@ -239,6 +324,44 @@ print(" · ".join(out))' 2>/dev/null || true)"
     while IFS= read -r line; do [ -n "$line" ] && BASE_WARN+=("pip check: $line (a pin was lifted past what its package declares)"); done <<< "$conflicts"
   fi
   BASE_LIFT_RESULT="ok: ${#BASE_LIFT_ROWS[@]} lifted or forced · ${#BASE_UPSTREAM[@]} named upstream"
+  _base_python_moved
+  return 0
+}
+_base_missing_dists(){ # <import check log> → the distributions the curated map (py/modmap.py) names for its missing modules
+  "${SYS_PY:-python3}" "$BASE_DIR/py/modmap.py" "$1"
+}
+_BASE_REPAIRED=0
+_base_repair_modules(){ # <import check log> → 0 when it installed a module a pack imports and nothing declared (the check runs again)
+  # 3.3.0, forward only: the missing module at its newest, from the reviewed map and nowhere else; once per run; never
+  # on a runtime machine (it installs nothing) and never in a fake run
+  [ "$_BASE_REPAIRED" = "0" ] || return 1
+  if _base_runtime_on || [ "$BASE_NO_NET" = "1" ] || [ "$BASE_DRY" = "1" ]; then return 1; fi
+  local dists c
+  dists="$(_base_missing_dists "$1" 2>/dev/null | sort -u | tr '\n' ' ')"
+  [ -n "${dists// /}" ] || return 1
+  _BASE_REPAIRED=1
+  c="${CONSTRAINTS:-${BASE_STATE:-}/constraints-torch.txt}"; [ -f "$c" ] || c=""
+  note "a pack imports what nothing declared: installing ${dists% } at its newest (the base's reviewed module map)"
+  if _base_uvpip -q ${c:+-c "$c"} $dists; then
+    BASE_CHANGED+=("installed missing module(s) a pack imports: ${dists% }"); BASE_PY_MOVED=$(( ${BASE_PY_MOVED:-0} + 1 )); return 0
+  fi
+  warn "the missing module(s) ${dists% } could not be installed; the packs that need them are named upstream"; return 1
+}
+_base_forced_save(){ # <this run's kept overrides, name==version lines> → forced.txt: each as a floor, plus the earlier floors for other names
+  local over="$1" f="$BASE_LIFT_DIR/forced.txt" new names=" " l n
+  new="$(printf '%s\n' "$over" | sed -n 's/^\([^=<>!~ ;]*\)==\(.*\)$/\1>=\2/p')"
+  while IFS= read -r l; do [ -n "$l" ] && names="$names$(_base_canon "${l%%[<>=!~ ;[]*}") "; done <<< "$new"
+  {
+    [ -n "$new" ] && printf '%s\n' "$new"
+    if [ -s "$f" ]; then
+      while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        n="$(_base_canon "${l%%[<>=!~ ;[]*}")"
+        case "$names" in *" $n "*) ;; *) printf '%s\n' "$l";; esac
+      done < "$f"
+    fi
+  } > "$f.new" 2>/dev/null
+  mv "$f.new" "$f" 2>/dev/null || true
   return 0
 }
 

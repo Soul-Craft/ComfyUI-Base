@@ -274,7 +274,11 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   ok "venv ready: $BASE_TORCH_INFO"
 }
 _base_torch_family_upgrade(){ # <torch> <backend>: on a reused venv: torchvision, torchaudio and triton to the builds that match torch
-  local tv="$1" backend="$2" out
+  local tv="$1" backend="$2" out have
+  # 3.3.0: never backwards. A venv whose torch is already newer than the pick (a newer build than the index resolves
+  # today) keeps it; installing torch==<pick> there would have moved it down.
+  have="$("$PY" -c 'import importlib.metadata as m; print(m.version("torch").split("+")[0])' 2>/dev/null || true)"
+  if [ -n "$have" ] && [ "$have" != "$tv" ] && _base_vge "$have" "$tv"; then note "torch $have is newer than the pick ($tv): kept, never moved backwards"; tv="$have"; fi
   if out="$(_base_uvpip -q --upgrade --torch-backend "$backend" "torch==$tv" torchvision torchaudio 2>&1)"; then
     base_torch_constraints; return 0
   fi

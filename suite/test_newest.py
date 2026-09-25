@@ -480,3 +480,136 @@ def test_unit_a_sageattention_build_for_a_list_of_archs_serves_each_gpu_in_it(tm
     assert "already built" in r.stdout, r.stdout + r.stderr
     r = _bash(base + 'BASE_GPU_SM=sm_89; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env=env)
     assert "already built" not in r.stdout, r.stdout + r.stderr                              # 8.9 is not in the list: it builds
+
+
+# ---------------------------------------------------------------- 3.3.0: every resolve once, and a force is never undone
+
+def _installs(log):
+    return [l for l in pathlib.Path(log).read_text().splitlines() if l.startswith("pip install")]
+
+
+def test_unit_a_forced_package_is_never_pushed_back_down_by_the_next_run(tmp_path):
+    # 3.2 and before: base_packs pip installed WITHOUT the overrides, so every package the newest pass had forced past a
+    # cap went back down under it, and the newest pass forced it up again: two whole resolves and a reinstall, every run.
+    env, log = _lift_env(tmp_path, [[{"name": "protobuf", "version": "5.29.6", "latest_version": "7.36.2"}], []])
+    r = _bash('base_env_setup; base_discover quiet; base_venv_latest >/dev/null; cat "$BASE_LIFT_DIR/forced.txt"', env=env)
+    assert "protobuf>=7.36.2" in r.stdout, r.stdout + r.stderr                  # kept as a FLOOR: never a pin, always the newest
+    log.write_text("")
+    r = _bash('base_env_setup; base_discover quiet; _base_lift_dir; _base_derived_install; cat "$BASE_LIFT_DIR/overrides.effective.txt"', env=env)
+    first = _installs(log)
+    assert len(first) == 1 and "--overrides" in first[0] and "protobuf>=7.36.2" in r.stdout, (first, r.stdout, r.stderr)
+
+
+def test_unit_an_explicit_round_keeps_the_earlier_floors_too(tmp_path):
+    env, log = _lift_env(tmp_path, [[]])
+    r = _bash('base_env_setup; base_discover quiet; _base_lift_dir; printf "protobuf>=7.36.2\\nmcp>=2.2.0\\n" > "$BASE_LIFT_DIR/forced.txt";'
+              ' printf "mcp==2.3.0\\n" > "$BASE_LIFT_DIR/overrides.txt"; _base_derived_install --overrides "$BASE_LIFT_DIR/overrides.txt";'
+              ' cat "$BASE_LIFT_DIR/overrides.effective.txt"', env=env)
+    lines = sorted(r.stdout.split())
+    assert lines == ["mcp==2.3.0", "protobuf>=7.36.2"], lines                  # this round's force wins its own name
+
+
+def test_unit_the_same_requirement_set_is_not_resolved_twice_in_one_run(tmp_path):
+    env, log = _lift_env(tmp_path, [[]])
+    r = _bash('base_env_setup; base_discover quiet; _base_reqlift >/dev/null; base_torch_constraints; _base_derived_install_once >/dev/null;'
+              ' base_venv_latest; echo DONE', env=env)
+    assert "DONE" in r.stdout and "not resolved twice" in r.stdout, r.stdout + r.stderr
+    assert len(_installs(log)) == 1, _installs(log)
+
+
+def test_unit_the_outdated_scan_runs_once_when_nothing_is_behind(tmp_path):
+    env, log = _lift_env(tmp_path, [[]])
+    _bash('base_env_setup; base_discover quiet; base_venv_latest >/dev/null', env=env)
+    scans = [l for l in log.read_text().splitlines() if l.startswith("pip list")]
+    assert len(scans) == 1, scans
+
+
+def test_unit_a_refused_force_is_not_retried_until_either_version_moves(tmp_path):
+    hub = {"name": "huggingface-hub", "version": "1.9.0", "latest_version": "2.0.0"}
+    env, log = _lift_env(tmp_path, [[hub]])
+    lift = tmp_path / "comfy-base" / "state" / "lift"; lift.mkdir(parents=True, exist_ok=True)
+    (lift / "refused.tsv").write_text("huggingface-hub\t2.0.0\ttransformers\t5.17.0\n")
+    snippet = ('base_env_setup; base_discover quiet; _base_dist_version(){ [ "$1" = transformers ] && echo "%s"; }; base_venv_latest;'
+               ' echo FAILED=${#BASE_FAILED[@]}; printf "U %%s\\n" "${BASE_UPSTREAM[@]}"')
+    r = _bash(snippet % "5.17.0", env=env)
+    assert "FAILED=0" in r.stdout and "U huggingface-hub 2.0.0: cannot be forced" in r.stdout, r.stdout + r.stderr
+    assert not [l for l in _installs(log) if "--overrides" in l], _installs(log)   # no round tried it
+    (tmp_path / "n").unlink(); log.write_text("")
+    _bash(snippet % "5.18.0", env=env)                                          # transformers moved: worth one more try
+    assert [l for l in _installs(log) if "--overrides" in l], _installs(log)
+
+
+def test_unit_python_packages_that_moved_are_a_reason_to_restart(tmp_path):
+    env, _ = _lift_env(tmp_path, [[]])
+    snap = tmp_path / "snap.txt"; snap.write_text("protobuf==5.29.6\nmcp==2.2.0\n")
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_VENV_SNAPSHOT="{snap}";'
+              ' _base_uv(){ [ "$1 $2" = "pip freeze" ] && printf "protobuf==7.36.2\\nmcp==2.2.0\\n"; }; _base_python_moved; echo "MOVED=$BASE_PY_MOVED"', env=env)
+    assert "MOVED=1" in r.stdout, r.stdout + r.stderr
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_VENV_SNAPSHOT="{snap}"; _base_runtime_on(){{ return 0; }};'
+              ' _base_uv(){ [ "$1 $2" = "pip freeze" ] && printf "protobuf==7.36.2\\n"; }; _base_python_moved; echo "MOVED=${BASE_PY_MOVED:-0}"', env=env)
+    assert "MOVED=0" in r.stdout, r.stdout                                      # a runtime's Python never moves within a run
+    r = _bash('base_env_setup; base_discover quiet; BASE_PY_MOVED=3; BASE_DRY=0; BASE_NO_NET=0; curl(){ return 0; }; _base_comfy_pids(){ :; };'
+              ' base_restart', env=env)
+    assert "3 Python package(s) moved" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_a_missing_module_is_installed_only_from_the_curated_map(tmp_path):
+    log = tmp_path / "import.log"
+    log.write_text("Traceback...\nModuleNotFoundError: No module named 'cv2'\n0.1 seconds (IMPORT FAILED): /x/custom_nodes/PackA\n"
+                   "ModuleNotFoundError: No module named 'skimage.color'\n0.1 seconds (IMPORT FAILED): /x/custom_nodes/PackB\n"
+                   "ModuleNotFoundError: No module named 'totally_unknown_mod'\n0.1 seconds (IMPORT FAILED): /x/custom_nodes/PackC\n")
+    r = _bash(f'_base_missing_dists "{log}"')
+    assert sorted(r.stdout.split()) == ["opencv-python-headless", "scikit-image"], r.stdout + r.stderr   # never a guessed name
+    assert "totally_unknown_mod" in r.stderr
+
+
+def test_unit_the_import_check_installs_a_mapped_missing_module_and_judges_again(tmp_path):
+    env, log = _lift_env(tmp_path, [[]])
+    flag = tmp_path / "installed"
+    (tmp_path / "ComfyUI" / "main.py").write_text(
+        f'import os\nif not os.path.exists({str(flag)!r}):\n    print("ModuleNotFoundError: No module named \'cv2\'")\n'
+        f'    print("   0.1 seconds (IMPORT FAILED): /x/custom_nodes/PackZ")\n')
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_VENV_RESULT=reused; _base_uvpip(){{ echo "UVPIP $*"; touch "{flag}"; }};'
+              ' base_import_check; echo "RESULT=$BASE_IMPORT_RESULT"; echo "MOVED=${BASE_PY_MOVED:-0}"; printf "U %s\\n" "${BASE_UPSTREAM[@]}"', env=env)
+    assert "UVPIP" in r.stdout and "opencv-python-headless" in r.stdout, r.stdout + r.stderr
+    assert "RESULT=ok" in r.stdout and "U pack PackZ" not in r.stdout and "MOVED=1" in r.stdout, r.stdout
+
+
+def test_unit_a_reused_venv_never_moves_torch_backwards(tmp_path):
+    site = tmp_path / "site"; (site / "torch-2.15.0.dist-info").mkdir(parents=True)
+    (site / "torch-2.15.0.dist-info" / "METADATA").write_text("Metadata-Version: 2.1\nName: torch\nVersion: 2.15.0\n")
+    calls = tmp_path / "uvpip.log"
+    r = _bash(f'PY="{sys.executable}"; _base_uvpip(){{ echo "UVPIP $*" >> "{calls}"; }}; base_torch_constraints(){{ :; }}; _base_torch_family_upgrade 2.14.0 cu130',
+              env={"PYTHONPATH": str(site)})
+    got = calls.read_text()
+    assert "torch==2.15.0" in got and "torch==2.14.0" not in got, got + r.stdout + r.stderr
+
+
+def test_unit_comfy_mcp_is_not_installed_a_second_time(tmp_path):
+    env, log = _lift_env(tmp_path, [[]])
+    site = tmp_path / "site"
+    for name, ver in (("comfy-mcp", "0.10.0"), ("comfy-cli", "1.21.0")):
+        d = site / ("%s-%s.dist-info" % (name.replace("-", "_"), ver)); d.mkdir(parents=True)
+        (d / "METADATA").write_text("Metadata-Version: 2.1\nName: %s\nVersion: %s\n" % (name, ver))
+    v = tmp_path / "ComfyUI" / ".venv-cu130" / "bin"
+    for b in ("comfy-mcp", "comfy"): _stub(v, b, "exit 0\n")
+    r = _bash('base_env_setup; base_discover quiet; _base_uvpip(){ echo "UVPIP $*"; }; base_mcp; echo "R=$BASE_MCP_RESULT"', env={**env, "PYTHONPATH": str(site)})
+    assert "UVPIP" not in r.stdout and "R=ok" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_the_sageattention_key_names_the_cuda_backend_and_an_existing_build_is_adopted(tmp_path):
+    # torch 2.14.0 exists for cu130 AND cu132 with the same public version: a key without the backend could serve a
+    # cu130 build to a cu132 venv. The key now carries it; a build stamped under the old key for THIS venv (it imports
+    # with this torch) is adopted, not rebuilt (10 to 20 minutes on every machine otherwise).
+    site = tmp_path / "site"; (site / "torch").mkdir(parents=True); (site / "sageattention").mkdir()
+    (site / "torch" / "__init__.py").write_text('__version__ = "2.14.0+cu130"\n'); (site / "sageattention" / "__init__.py").write_text("")
+    venv = tmp_path / "venv"; venv.mkdir()
+    tag = "cp%d%d" % sys.version_info[:2]
+    old = "sageattention-abcdef123456-%s-torch2.14.0-sm_120" % tag
+    (venv / ".comfy-base-sageattention").write_text(old + "\n")
+    r = _bash(f'PY="{sys.executable}"; VENV="{venv}"; BASE_STATE="{tmp_path}/state"; BASE_GPU_SM=sm_120; BASE_DRY=0; BASE_NO_NET=0;'
+              ' git(){ echo "abcdef1234567890abcdef1234567890abcdef12 refs/heads/main"; }; base_build_sageattention',
+              env={"PYTHONPATH": str(site)})
+    stamp = (venv / ".comfy-base-sageattention").read_text().strip()
+    assert stamp == "sageattention-abcdef123456-%s-torch2.14.0-cu130-sm_120" % tag, (stamp, r.stdout, r.stderr)
+    assert "already built" in r.stdout, r.stdout + r.stderr

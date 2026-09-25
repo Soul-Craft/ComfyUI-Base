@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.2.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.3.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -376,7 +376,9 @@ init (env · log · volume check · discover, or materialise the tree · declara
 store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
 consolidate strays (the volume only) → packs git (every pack to its HEAD) → the venv snapshot → `pkg_pre_venv` → venv →
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
-MCP → newest (every package still behind forced to its newest) → `pkg_pre_models` →
+MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
+so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
+either version moves) → `pkg_pre_models` →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
@@ -554,6 +556,20 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.3.0: every Python resolve once, and a force is never undone. Traced on 3.2.1: `base_packs pip` installed the derived
+  set WITHOUT the overrides, so each package the newest pass had forced past a cap (protobuf 7 over its <6 caps) went back
+  down under it on the next run and was forced up again: two whole resolves and a reinstall, every run; a force its holder
+  refused (huggingface-hub 2 under transformers) was installed, probed and taken out again every run; and the newest pass
+  resolved the very set the pip half had just installed. Now forces are carried as floors (`name>=version`, never a pin),
+  every resolve applies them (a round's own force wins its name; floors that no longer resolve are dropped and the install
+  runs without them), a refusal is remembered until either version moves, an identical set is not resolved twice in one run,
+  and the outdated scan runs again only after something was installed. Forward repairs: Python packages that moved are a
+  reason to restart (the live server had kept the old ones loaded); a pack failing on a module nothing declared gets it at
+  its newest from a reviewed map (`py/modmap.py`, never a name taken from an error) and is judged again; a reused venv never
+  moves torch backwards; comfy-mcp is not installed a second time; SageAttention's cache key names torch's CUDA backend,
+  and a build stamped under the old key for the same venv is adopted rather than rebuilt. A runtime machine is untouched
+  (no pip, no restart reason). Exercised on fake pods only.
 
 - 3.2.1: a package may write into its own pack, and the mirror keeps what it writes. Qwen 2.1 fetches its rewriter
   prompts into its own pack in `pkg_post_models` (they cannot ship in the zip); they survive because "unchanged" compares
