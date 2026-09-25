@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.0.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.1.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -35,6 +35,10 @@ run once per machine as **step one**; then each workflow package is **step two**
    moves), comfy-cli, pytest and huggingface_hub are upgraded every run. The OS packages and the NVIDIA driver
    (NVIDIA's `nvidia-open`) are upgraded first (§0.15). A pick that cannot be made stops the run. A pack row's sha is
    the last-tested record, printed every run and written back by `podctl` after a green install; never a target.
+   **One exception, a buyer's machine** (3.1.0, the maintainer's decision of 2026-09-25): with `BASE_RUNTIME` set, a
+   machine installs the newest runtime that passed its maintainer's own sweep (§0.12) and changes nothing else, so a
+   newcomer's first run never meets an untested upstream change. Its freshness comes from runtimes being rebuilt and
+   swept continuously, and an Update that applies a newer proven one. Every other run is everything newest.
 4. **Everything the venv boots from lives on the volume, and the boot cannot brick the machine.**
    `UV_PYTHON_INSTALL_DIR=<volume>/comfy-base/python`, `UV_MANAGED_PYTHON=1`; the probe is HARD on an interpreter
    written to the container disk, so a poisoned venv is never reused. `boot.sh` starts sshd first and never exits,
@@ -93,6 +97,12 @@ run once per machine as **step one**; then each workflow package is **step two**
     extension (`ext/`, §9) copies it onto an empty volume once, and the first install then takes everything to its
     newest like any machine. 3.0.0 retired the frozen mode (`BASE_PINNED`) and `COMFY_TAG`: they held a machine below
     its newest, which §0.3 forbids. The base ships neither the generator nor the extension.
+    **A proven runtime is not a freeze** (3.1.0): `runtime-capture` packs a green machine's code (the tree minus its
+    data, the uv Python, the venv, the packs, JupyterLab, the wheel cache) into parts under 2 GiB with `runtime.json`,
+    the only place its versions are written; `runtime-apply <manifest>` unpacks it on a buyer's machine, and
+    `BASE_RUNTIME=<state/runtime.json>` installs from it with no OS, git, pip or uv step, each skip noted, the driver
+    gate held at the manifest's floor. A package that needs a pack the runtime lacks fails by name ("needs a newer
+    runtime"). It is the §0.3 exception, and nothing else runs this way.
 13. **The model library may be SHARED by several machines** (2.4.0). `BASE_LIBRARY` names a store that more than
     one machine mounts at once, and with it set `models/` and ComfyUI's `output/` and `input/` live there instead of
     on the machine's own volume: a model is downloaded once for all of them rather than once each, and a file one
@@ -314,6 +324,14 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
   basenames the index may adopt. `base.sh stamp-models <pkg dir>` writes ComfyUI's own `models` array into the
   shipped workflow from these rows (`--check` compares).
+- `MODELS_LATER=( <file> ... )` (optional, 3.1.0): the MODELS rows the package's FIRST flow does not need, by their
+  `file`. Only a staged run (`BASE_STAGED=1`, a buyer's machine) acts on it: each gets a stand-in (a 0-byte file at its
+  dest, listed in `state/standins.list`), because ComfyUI validates every active loader's filename before a run, even
+  on branches the run never takes; the server starts on the first flow's files; a detached `base.sh fetch-later`
+  downloads the rest, and `state/progress.json` (§7) says where each is. A LOCAL row and a snapshot row cannot be
+  later. The package keeps a buyer off a flow whose files are still stand-ins (its own page reads `progress.json`
+  and refreshes its dropdowns as files land). Every other run ignores the list, and treats a stand-in it meets as
+  absent.
 - The workflow beside the script must carry `extra.<WF_VERSION_KEY> == PKG_VERSION`; the run refuses a mismatch.
 - Helpers a hook may use: `ok miss err note warn hdr would todo`, `base_mkdir`, `base_run` (dry-run aware),
   `_base_yaml_register <section> <key> <path>`, `base_build_sageattention` (SageAttention 2 from source for this GPU's sm,
@@ -347,10 +365,16 @@ store's install lock → require workflow → tokens (validated; a rejected one 
 consolidate strays (the volume only) → packs git (every pack to its HEAD) → the venv snapshot → `pkg_pre_venv` → venv →
 `pkg_post_venv` → packs pip (the derived, pin-free set) → Comfy MCP → newest (every package still behind forced to its
 newest) → `pkg_pre_models` →
-models (one index over the volume; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
+models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
-smoke → combos → the package's suite → `pkg_post_install` → summary (exit 0, or 1 when anything failed).
+smoke → combos → the later stage handed to a detached `fetch-later` (a staged run) → the package's suite →
+`pkg_post_install` → summary (exit 0, or 1 when anything failed; the verdict kept in `state/last-run/<id>`).
+
+**A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
+moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
+checked against `runtime.json` instead, the venv must import torch, SageAttention must be the runtime's own build,
+and a failed import check is a failure, never a rollback.
 
 ## 6. Any host: the contract
 
@@ -367,7 +391,8 @@ smoke → combos → the package's suite → `pkg_post_install` → summary (exi
 | The boot | `boot.sh`: PID 1 via podctl's start command on RunPod, the process of `comfy-base-boot.service` on a VM host: sshd (keys only) → JupyterLab (base tools venv, `JUPYTER_TOKEN`/`JUPYTER_PASSWORD`) → boot extensions (§9) → ComfyUI (base venv, base line, bound to `BASE_LISTEN`) → sleep forever |
 | Restart | `_base_pids_from_table`: a python running `main.py` from the tree, or naming a `…/ComfyUI/main.py`; never PID 1 |
 | Uploads | `<volume>/packages/` (`podctl upload`); each package extracted into its own folder there |
-| A baked image | a project's own (the base ships no generator): the base built at these very paths and parked on the container disk; a boot extension copies it onto an empty volume once and installs the project's packages, pinned and non-interactive (§0.12) |
+| A baked image | a project's own (the base ships no generator): the base built at these very paths and parked on the container disk; a boot extension copies it onto an empty volume once and installs the project's packages, non-interactive, everything newest (§0.12) |
+| A buyer's machine | one OS disk and one NVMe data disk, created from nothing by `podctl create`; `runtime-apply` then `BASE_RUNTIME` + `BASE_STAGED=1` per package (`podctl buyer-install`); `pause` keeps the disks, `put-away` copies `output/` and `input/` to the Mac and deletes them (§0.3, §0.12) |
 
 **RunPod, three image families:** RunPod's ComfyUI (tree `/workspace/runpod-slim/ComfyUI`,
 `runpod-slim/comfyui_args.txt` imported once, sshd native); community templates that keep the code on the container
@@ -393,7 +418,14 @@ every source), `boot.sh`, `comfy-base-boot.service` (the unit's text, always wri
 `/etc/systemd/system` on a VM host), `ext/` when a project's image put extensions there (§9), `state/` (`boot.env`,
 `host.env` (`BASE_HOST`, `BASE_VOLUME`, written by the driver), `comfyui_args.txt`, `tokens.env` 0600,
 `constraints-torch.txt`, `boot-facts.txt`, `volume.env` on RunPod, `gpu.lease`, `packages/<id>.manifest`, `logs/`: install
-logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`), `python/` (the uv-managed interpreter), `tools/` (JupyterLab) and
+logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
+verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a staged install `standins.list`,
+`later.queue`, `later.failed`, `fetch-later.pid` and `progress.json`:
+`{"format": 1, "updated", "stage": "first|later|done", "files": [{"file", "rel", "bytes", "state":
+"present|standin|downloading|failed"}], "later": {"files", "bytes", "done_files", "done_bytes"}}`, every state read
+from the disk and the file replaced whole, never written in place; ComfyUI's environment names the state dir as
+`COMFY_BASE_STATE`, so a package reads `$COMFY_BASE_STATE/progress.json` and treats its absence as "nothing staged"),
+`python/` (the uv-managed interpreter), `tools/` (JupyterLab) and
 `dead-venvs/` (quarantined venvs). A package manifest records its packs, model claims, superseded names and hooks;
 `bash base.sh status` renders them and prints `state/host.env` when there is one; `bash base.sh latest` asks every
 pinned pack's remote what HEAD is now.
@@ -498,6 +530,21 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.1.0: a buyer's machine, opt-in end to end, with every plain run unchanged. A proven runtime: `runtime-capture` on
+  a green machine (parts under GitHub's 2 GiB and `runtime.json`, `py/runtime.py`), `runtime-apply` on a buyer's, and
+  `BASE_RUNTIME` installing from it with no OS, git, pip or uv step (§0.3's one exception, §0.12). The first flow
+  first: `MODELS_LATER` and `BASE_STAGED=1` stand in for the rest, which a detached `base.sh fetch-later` brings behind
+  the started server while `state/progress.json` reports each file. `BASE_FETCH_JOBS` fetches several files at once
+  (default 1, the old serial loop, same output). Verda: `balance`, `availability`, `create_machine` (the data disk,
+  then the instance with its own OS disk, no startup script; a refused instance takes its new disk with it),
+  `machine_volumes`, `delete_volumes`. podctl: `balance`, `availability`, `create`, `pause`, `put-away`,
+  `buyer-install` (zips alone: no packager check, no Mac gate, no pack records written), `progress`,
+  `runtime-capture`; `install()` takes a run environment and zip-born items. Each run keeps its verdict in
+  `state/last-run/<id>`, which is what capture reads.
+  ComfyUI's environment carries `COMFY_BASE_STATE` (the base's state dir), so a package's own route finds
+  `progress.json` without guessing. Exercised by the suite only (macOS, Python 3.12 and 3.14); not yet on a live
+  machine.
 
 - 3.0.3: renders stay on the store, and a machine runs one ComfyUI. Both measured on a Verda machine on a shared store
   (`BASE_VOLUME_SHARED=1`). First, `comfyui_args.txt` still named `--output-directory` and `--input-directory` on the

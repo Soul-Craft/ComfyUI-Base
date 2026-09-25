@@ -32,6 +32,10 @@ base_boot_tools(){ # JupyterLab in the base's tools venv, on the newest Python, 
     mkdir -p "$link/bin"; printf '#!/bin/bash\necho "fake jupyter-lab $*"\n' > "$link/bin/jupyter-lab"; chmod +x "$link/bin/jupyter-lab"
     echo "fake ts=$(_base_ts)" > "$stamp"; ok "fake tools venv (BASE_NO_NET)"; BASE_TOOLS_RESULT="built (fake)"; BASE_CHANGED+=("tools venv built (fake)"); return 0
   fi
+  if _base_runtime_on; then                           # 3.1.0: JupyterLab came with the proven runtime
+    if [ -x "$link/bin/jupyter-lab" ]; then _base_runtime_skip "JupyterLab"; BASE_TOOLS_RESULT="runtime"; return 0; fi
+    warn "the runtime carries no JupyterLab at $link: the file browser will not start (ComfyUI is unaffected)"; BASE_TOOLS_RESULT="missing (runtime)"; return 0
+  fi
   command -v uv >/dev/null 2>&1 || _base_ensure_uv || { warn "tools venv: no uv: the boot starts without JupyterLab"; BASE_TOOLS_RESULT="failed (no uv)"; return 0; }
   mm="$(_base_newest_python_minor)"
   [ -n "$mm" ] || { warn "tools venv: uv lists no Python: JupyterLab not upgraded"; BASE_TOOLS_RESULT="failed (no python)"; return 0; }

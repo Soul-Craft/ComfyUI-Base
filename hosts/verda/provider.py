@@ -43,6 +43,7 @@ CREDENTIALS_PATH = pathlib.Path.home() / ".verda" / "credentials"
 LIBRARY_MOUNT = "/mnt/comfy-library"               # where startup.sh mounts the SHARED library; the base's BASE_LIBRARY
 LIBRARY_SRC_ENV = "VERDA_LIBRARY"                  # the library's NFS endpoint, e.g. nfs.fin-02.verda.com:/pseudo
 STARTUP_SCRIPT_NAME = "comfy-base-startup"         # the name the script is registered under (GET /scripts)
+DEFAULT_IMAGE = "24.04.cuda13.2.docker"   # the image TYPE, which POST /instances wants (measured 2026-09-24); the console shows a display name
 STARTUP_SCRIPT_FILE = HERE / "startup.sh"
 REMOTE_STARTUP = "/root/comfy-base-startup.sh"     # where `ensure` puts the script on the running machine
 SSH_PORT = 22
@@ -788,6 +789,67 @@ class VerdaProvider(Provider):
         inst, host = self._up_and_configured(pod_id, ssh_config)
         say("  ssh answers on %s:%d (Host %s -> %s)" % (host, SSH_PORT, _c().SSH_ALIAS, pod_id))
         return pod_id
+
+    # -- 3.1.0: a buyer's machine, made from nothing in a fresh project (buyer verbs in podctl; the app drives them)
+    def balance(self):
+        """The prepaid balance: {"amount": float, "currency": str} (GET /balance)."""
+        b = self.api.get("/balance") or {}
+        if not isinstance(b, dict):
+            raise PodctlError("GET /balance answered %r" % (b,))
+        return {"amount": float(b.get("amount") or 0), "currency": str(b.get("currency") or "")}
+
+    def availability(self, instance_type, spot=False):
+        """The locations where `instance_type` can be deployed now (GET /instance-availability), in the API's order."""
+        rows = self.api.get("/instance-availability?is_spot=%s" % ("true" if spot else "false")) or []
+        return [str(r.get("location_code")) for r in rows
+                if isinstance(r, dict) and r.get("location_code") and instance_type in (r.get("availabilities") or [])]
+
+    def create_machine(self, name, instance_type, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False,
+                       wait=True, ssh_config=None, say=print):
+        """A buyer's machine from nothing: an NVMe data volume, then the instance with its own OS volume and that data
+        volume attached. NO startup script at create time (a fresh OS volume has no fstab entry, and the registered
+        script would wait ten minutes for one); `ensure` configures it over ssh. A refused instance (503: sold out
+        here) takes its new data volume with it, so nothing is left billing. Returns the instance id."""
+        img = image or self.env.get("VERDA_IMAGE") or DEFAULT_IMAGE
+        keys = self.key_ids(pubkey=pubkey, register=True, log=say)
+        vid = new_id(self.api.post("/volumes", {"type": "NVMe", "location_code": location, "size": int(data_gb),
+                                                "name": "%s-data" % name}))
+        body = {"hostname": hostname_for(name), "image": img, "instance_type": instance_type, "location_code": location,
+                "ssh_key_ids": keys, "os_volume": {"name": "%s-os" % name, "size": int(os_gb)}, "existing_volumes": [vid],
+                "description": "ComfyUI Base, a buyer's machine, created by podctl", "is_spot": bool(spot)}
+        try:
+            pod_id = new_id(self.api.post("/instances", body))
+        except Exception:
+            try:
+                self.api.put("/volumes", {"id": vid, "action": "delete", "is_permanent": True})
+            except Exception as e:      # the refusal is the news; a leftover volume is named so it can be removed
+                say("  !! could not delete the new data volume %s after the refusal: %s" % (vid, e))
+            raise
+        say("created %s (%s): %s on %s in %s, OS volume %s-os %d GB, data volume %s %d GB" % (
+            pod_id, body["hostname"], img, instance_type, location, name, int(os_gb), vid, int(data_gb)))
+        if wait:
+            inst, host = self._up_and_configured(pod_id, ssh_config)
+            say("  ssh answers on %s:%d (Host %s -> %s)" % (host, SSH_PORT, _c().SSH_ALIAS, pod_id))
+        return pod_id
+
+    def machine_volumes(self, ident):
+        """The ids of every volume a machine keeps: its instance's volumes, or an OS volume and its stem's data volumes."""
+        inst = self._instance(ident)
+        if inst is not None:
+            ids = [str(v) for v in (inst.get("volume_ids") or [])]
+            osv = inst.get("os_volume_id")
+            return ([str(osv)] if osv and str(osv) not in ids else []) + ids
+        vol = self._volume(ident)
+        if vol is None:
+            raise PodctlError("%s: no such instance or volume" % ident)
+        stem = volume_stem(vol.get("name"))
+        return [str(v["id"]) for v in (self.api.get("/volumes") or [])
+                if isinstance(v, dict) and v.get("id") and not is_shared_volume(v) and stems_match(v.get("name"), stem)]
+
+    def delete_volumes(self, ids, permanent=False):
+        """To the trash (restorable for Verda's 96 hours) unless permanent. One call per volume."""
+        for vid in ids:
+            self.api.put("/volumes", {"id": vid, "action": "delete", "is_permanent": bool(permanent)})
 
     def host_env(self):
         """BASE_HOST and BASE_VOLUME, plus BASE_LIBRARY when the machine has a shared library.

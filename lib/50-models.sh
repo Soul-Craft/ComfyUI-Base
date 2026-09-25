@@ -310,6 +310,161 @@ _base_disk_gate(){ # <needed bytes> → 0 proceed, 1 stop. Honest about a pooled
   return 0
 }
 
+# ---------------------------------------------------------------- stages (3.1.0): the first flow first, the rest behind a started server
+# A package may name the files its first flow does NOT need: MODELS_LATER=( <MODELS file> ... ). Only a staged run
+# (BASE_STAGED=1, a buyer's machine) acts on it: those rows get a STAND-IN, a 0-byte file at the declared dest, so
+# ComfyUI's validator (which checks every active loader's filename, even on branches a run never takes) accepts the
+# graph, and a detached `base.sh fetch-later` downloads the real files after ComfyUI has started. A stand-in is
+# listed in state/standins.list and nothing counts, moves, renames, prunes or reports it as a model. Every other
+# run ignores MODELS_LATER, and treats a stand-in it meets as absent.
+_base_later_rows(){ # prints the validated MODELS_LATER entries; exit 1 naming each bad one
+  local f cat fam purp file url rest hit bad=0 rows
+  rows="$(_base_model_rows 2>/dev/null || true)"
+  for f in ${MODELS_LATER[@]+"${MODELS_LATER[@]}"}; do
+    hit=""
+    while IFS='|' read -r cat fam purp file url rest; do if [ "$file" = "$f" ]; then hit="$url"; break; fi; done <<< "$rows"
+    if [ -z "$hit" ]; then echo "  !! MODELS_LATER names '$f', which is no MODELS row's file" >&2; bad=1; continue; fi
+    if [ "$hit" = "LOCAL" ]; then echo "  !! MODELS_LATER: '$f' is LOCAL, the buyer's own file: it cannot come later" >&2; bad=1; continue; fi
+    case "$f" in */) echo "  !! MODELS_LATER: '$f' is a snapshot folder: a stand-in cannot stand in for a directory" >&2; bad=1; continue;; esac
+    echo "$f"
+  done
+  return $bad
+}
+_base_is_later(){ local f; for f in ${MODELS_LATER[@]+"${MODELS_LATER[@]}"}; do [ "$f" = "$1" ] && return 0; done; return 1; }
+_base_standins(){ echo "$BASE_STATE/standins.list"; }
+_base_standin_is(){ # <dest> → 0 when it is a registered stand-in: listed AND still 0 bytes
+  [ -f "$1" ] && [ ! -s "$1" ] && [ -f "$(_base_standins)" ] && grep -qxF -- "$1" "$(_base_standins)"
+}
+_base_standin_make(){ # <dest> → a 0-byte file, registered
+  local list; list="$(_base_standins)"; mkdir -p "$(dirname "$1")" "$(dirname "$list")"
+  [ -e "$1" ] || : > "$1"
+  touch "$list"; grep -qxF -- "$1" "$list" || echo "$1" >> "$list"
+}
+_base_standin_drop(){ # <dest> → unregistered, and removed while it is still empty
+  local list; list="$(_base_standins)"
+  if [ -f "$1" ] && [ ! -s "$1" ]; then rm -f "$1"; fi
+  if [ -f "$list" ]; then grep -vxF -- "$1" "$list" > "$list.tmp" || true; mv "$list.tmp" "$list"; fi
+}
+_base_standin_sweep(){ # keep only the listed dests that are still empty (a download replaced the others)
+  local list d; list="$(_base_standins)"; [ -f "$list" ] || return 0
+  : > "$list.tmp"
+  while IFS= read -r d; do if [ -n "$d" ] && [ -f "$d" ] && [ ! -s "$d" ]; then echo "$d" >> "$list.tmp"; fi; done < "$list"
+  mv "$list.tmp" "$list"
+}
+_base_later_queue_add(){ # <spec>... → merged into state/later.queue by dest, so a bundle's packages add up rather than overwrite
+  local q="$BASE_STATE/later.queue" spec d; mkdir -p "$BASE_STATE"; touch "$q"
+  for spec in "$@"; do
+    d="${spec##*|}"
+    awk -F'|' -v d="$d" '$5 != d' "$q" > "$q.tmp"; echo "$spec" >> "$q.tmp"; mv "$q.tmp" "$q"
+  done
+}
+_base_progress(){ # [stage] → state/progress.json from the queue, the stand-in list and the disk (a report: never fatal)
+  "$SYS_PY" "$BASE_DIR/py/stage_progress.py" --queue "$BASE_STATE/later.queue" --standins "$(_base_standins)" \
+    --failed "$BASE_STATE/later.failed" --out "$BASE_STATE/progress.json" --stage "${1:-later}" 2>/dev/null \
+    || note "progress.json not written (py/stage_progress.py failed)"
+  return 0
+}
+
+# ---------------------------------------------------------------- fetching: one at a time, or BASE_FETCH_JOBS at once
+_base_fetch_jobs(){ local n="${BASE_FETCH_JOBS:-1}"; if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then echo "$n"; else note "BASE_FETCH_JOBS='$n' is not a positive integer: fetching one file at a time" >&2; echo 1; fi; }
+_base_fetch_one(){ # <spec KIND|rel|url|bytes|dest> → rc of the download
+  local kind rel url bytes dest; IFS='|' read -r kind rel url bytes dest <<<"$1"
+  if [ "$kind" = "SNAP" ]; then _base_snapshot "$url" "$dest" "$bytes"; else _base_download "$url" "$dest" "$bytes"; fi
+}
+_base_fetch_fold(){ # <rc> <secs> <spec> → the verdict line and the run's counters, in the caller's shell
+  local rc="$1" secs="$2" kind rel url bytes dest _sz; IFS='|' read -r kind rel url bytes dest <<<"$3"
+  if [ "$rc" = "0" ]; then
+    if [ "$kind" = "SNAP" ]; then _sz="$bytes"; else _sz="$(_base_fsize "$dest")"; fi
+    BASE_DL_BYTES=$(( BASE_DL_BYTES + _sz )); BASE_DL_TIME=$(( BASE_DL_TIME + secs ))
+    ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$secs")"
+    MODEL_DL+=("$rel"); DL_DESTS+=("$dest"); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$(_base_bytes_to_gb "$bytes")")"
+  else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
+}
+_base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE_FETCH_JOBS at a time, reported in queue order
+  local n spec i=0 rc t0 logd rel
+  n="$(_base_fetch_jobs)"
+  if [ "$n" = "1" ]; then                          # exactly the 3.0 behaviour: live output, one file after another
+    for spec in "$@"; do
+      IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
+      BASE_DL_SECS=0; t0=$SECONDS; rc=0; _base_fetch_one "$spec" || rc=$?
+      _base_fetch_fold "$rc" "$(( SECONDS - t0 ))" "$spec"
+    done
+    return 0
+  fi
+  logd="$(_base_mktemp_d)"
+  note "fetching $# file(s), $n at a time (BASE_FETCH_JOBS)"
+  for spec in "$@"; do                             # job slots, bash 3.2-clean: no `wait -n`
+    i=$((i + 1))
+    while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$n" ]; do sleep 1; done
+    ( t0=$SECONDS; rc=0; _base_fetch_one "$spec" > "$logd/$i.log" 2>&1 || rc=$?; echo "$rc|$(( SECONDS - t0 ))" > "$logd/$i.rc" ) &
+  done
+  wait
+  i=0
+  for spec in "$@"; do
+    i=$((i + 1)); IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
+    [ -f "$logd/$i.log" ] && cat "$logd/$i.log"
+    IFS='|' read -r rc t0 < "$logd/$i.rc" 2>/dev/null || { rc=1; t0=0; }
+    _base_fetch_fold "$rc" "$t0" "$spec"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- the later stage, detached from the install
+_base_later_pending(){ # → the queue's specs whose dest is not yet a complete file
+  local q="$BASE_STATE/later.queue" kind rel url bytes dest
+  [ -f "$q" ] || return 0
+  while IFS='|' read -r kind rel url bytes dest; do
+    [ -n "$dest" ] || continue
+    if [ -f "$dest" ] && [ "$(_base_fsize "$dest")" = "$bytes" ]; then continue; fi
+    echo "$kind|$rel|$url|$bytes|$dest"
+  done < "$q"
+}
+_base_later_launch(){ # after the server started: hand the queue to a detached `base.sh fetch-later`
+  local pending n gb=0 b log
+  pending="$(_base_later_pending)"; [ -n "$pending" ] || return 0
+  n="$(printf '%s\n' "$pending" | awk 'NF' | wc -l | tr -d ' ')"
+  while IFS='|' read -r _ _ _ b _; do gb=$((gb + b)); done <<< "$pending"
+  LATER_PENDING="$n file(s), $(_base_bytes_to_gb "$gb") GB"
+  if [ "$BASE_DRY" = "1" ]; then would "download the later stage ($LATER_PENDING) behind the started server"; return 0; fi
+  mkdir -p "$BASE_STATE/logs"; log="$BASE_STATE/logs/fetch-later_$(date +%Y%m%d-%H%M%S).log"
+  nohup setsid bash "$BASE_DIR/base.sh" fetch-later </dev/null >> "$log" 2>&1 &
+  ok "later stage: $LATER_PENDING downloading in the background (state/progress.json, $log)"
+}
+base_fetch_later(){ # the verb: fetch every pending later file, pass after pass, until a pass gets nothing new
+  base_env_setup
+  if [ "${BASE_VOLUME_SHARED:-0}" = "1" ]; then note "fetch-later: a shared store is the operator's shape, where every file is fetched before the server starts; nothing to do"; return 0; fi
+  if ! base_discover quiet; then err "fetch-later: no ComfyUI tree found"; return 3; fi
+  _base_tmp
+  local pidf="$BASE_STATE/fetch-later.pid" other pending pass=0 before after spec need b
+  other="$(cat "$pidf" 2>/dev/null || true)"
+  if [ -n "$other" ] && [ "$other" != "$$" ] && kill -0 "$other" 2>/dev/null; then note "fetch-later: already running as pid $other; it picks up new queue entries on its next pass"; return 0; fi
+  echo "$$" > "$pidf"
+  base_tokens >/dev/null 2>&1 < /dev/null || true   # HF_TOKEN from state/tokens.env when the buyer gave one; never a prompt here
+  : > "$BASE_STATE/later.failed"
+  local -a specs DL_DESTS
+  while :; do
+    pass=$((pass + 1))
+    pending="$(_base_later_pending | grep -vxF -f "$BASE_STATE/later.failed" || true)"
+    [ -n "$pending" ] || break
+    before="$(printf '%s\n' "$pending" | awk 'NF' | wc -l | tr -d ' ')"
+    specs=(); need=0
+    while IFS= read -r spec; do if [ -n "$spec" ]; then specs+=("$spec"); IFS='|' read -r _ _ _ b _ <<<"$spec"; need=$((need + b)); fi; done <<< "$pending"
+    hdr "LATER STAGE · pass $pass · ${#specs[@]} file(s), $(_base_bytes_to_gb "$need") GB"
+    _base_progress later
+    if ! _base_disk_gate "$need"; then printf '%s\n' "${specs[@]}" >> "$BASE_STATE/later.failed"; break; fi
+    mkdir -p "$STAGING"; [ "$BASE_NO_NET" = "1" ] || _base_xet_check
+    DL_DESTS=(); MODEL_FAIL=()
+    _base_fetch_queue "${specs[@]}"
+    for spec in "${specs[@]}"; do IFS='|' read -r _ b _ <<<"$spec"; if _base_in_list "$b" ${MODEL_FAIL[@]+"${MODEL_FAIL[@]}"}; then echo "$spec" >> "$BASE_STATE/later.failed"; fi; done
+    _base_standin_sweep; _base_progress later
+    after="$(_base_later_pending | grep -vxF -f "$BASE_STATE/later.failed" | awk 'NF' | wc -l | tr -d ' ')"
+    [ "${after:-0}" -lt "$before" ] || break
+  done
+  _base_standin_sweep; rm -f "$pidf"
+  if [ -s "$BASE_STATE/later.failed" ]; then _base_progress later; err "fetch-later: $(wc -l < "$BASE_STATE/later.failed" | tr -d ' ') file(s) not obtained; run 'bash $BASE_DIR/base.sh fetch-later' again"; return 1; fi
+  _base_progress done; ok "fetch-later: every later file is in place"; return 0
+}
+
 # ---------------------------------------------------------------- the stage
 base_models(){
   hdr "MODEL LIBRARY · $M"
@@ -317,8 +472,8 @@ base_models(){
   _base_build_index
   echo "  indexed $(wc -l < "$IDX" | tr -d ' ') model-shaped files under: $IDX_ROOTS"
   local row cat fam purp file url bytes mnote alts rel dest base sz size path cand cand_dev mdev was_partial
-  local -a TODO=() DL_DESTS=()
-  local NEED=0
+  local -a TODO=() DL_DESTS=() LATER_TODO=()
+  local NEED=0 staged_later
   KNOWN=()
   mdev="$(_base_fdev "$M" 2>/dev/null || echo 0)"
   while IFS='|' read -r cat fam purp file url bytes mnote alts; do
@@ -355,8 +510,11 @@ base_models(){
       else TODO+=("SNAP|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes)); todo "$rel  snapshot (~$(_base_bytes_to_gb "$bytes") GB) — queued"; fi
       continue
     fi
-    was_partial=0
-    if [ -f "$dest" ]; then
+    was_partial=0; staged_later=0
+    if [ "${BASE_STAGED:-0}" = "1" ] && _base_is_later "$file"; then staged_later=1; fi
+    if _base_standin_is "$dest"; then                # a stand-in is never a partial file: never renamed, never counted
+      if [ "$staged_later" = "0" ] && [ "$BASE_DRY" != "1" ]; then _base_standin_drop "$dest"; fi   # not staged here: simply absent
+    elif [ -f "$dest" ]; then
       sz="$(_base_fsize "$dest")"
       if _base_size_ok "$sz" "$bytes"; then ok "$rel  ($(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"; continue; fi
       miss "$rel is $(_base_bytes_to_gb "$sz") GB, expected $(_base_bytes_to_gb "$bytes") GB — partial"
@@ -397,6 +555,12 @@ base_models(){
       BASE_FAILED+=("LOCAL model not found on this pod: $base → $rel")
       continue
     fi
+    if [ "$staged_later" = "1" ]; then              # the first flow does not need it: a stand-in now, the file behind the started server
+      if [ "$BASE_DRY" = "1" ]; then would "stand in for $rel (~$(_base_bytes_to_gb "$bytes") GB), fetched after ComfyUI starts"
+      else _base_standin_make "$dest"; todo "$rel  (~$(_base_bytes_to_gb "$bytes") GB): later stage, a stand-in until it arrives"; fi
+      LATER_TODO+=("FILE|$rel|$url|$bytes|$dest"); MODEL_STANDIN+=("$rel")
+      continue
+    fi
     if [ "$was_partial" = "1" ]; then echo "      re-queued for download"
     else todo "$rel  (~$(_base_bytes_to_gb "$bytes") GB) — not on disk anywhere, queued for download"; [ -n "$mnote" ] && echo "      $mnote" || true; fi
     TODO+=("FILE|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes))
@@ -414,19 +578,7 @@ base_models(){
     else
       mkdir -p "$STAGING"
       [ "$BASE_NO_NET" = "1" ] || _base_xet_check
-      for spec in "${TODO[@]}"; do
-        IFS='|' read -r kind rel url bytes dest <<<"$spec"
-        echo -e "\n${CYA}→ $rel${NC}"
-        BASE_DL_SECS=0; local t0=$SECONDS got=1
-        if [ "$kind" = "SNAP" ]; then _base_snapshot "$url" "$dest" "$bytes" && got=0; BASE_DL_SECS=$(( SECONDS - t0 ))
-        else _base_download "$url" "$dest" "$bytes" && got=0; fi
-        if [ "$got" = "0" ]; then
-          local _sz; if [ "$kind" = "SNAP" ]; then _sz="$bytes"; else _sz="$(_base_fsize "$dest")"; fi
-          BASE_DL_BYTES=$(( BASE_DL_BYTES + _sz )); BASE_DL_TIME=$(( BASE_DL_TIME + BASE_DL_SECS ))
-          ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$BASE_DL_SECS")"
-          MODEL_DL+=("$rel"); DL_DESTS+=("$dest"); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$(_base_bytes_to_gb "$bytes")")"
-        else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
-      done
+      _base_fetch_queue "${TODO[@]}"
       rmdir "$STAGING" 2>/dev/null || true
       [ "$STAGING" = "$STAGING_ROOT" ] || rmdir "$STAGING_ROOT" 2>/dev/null || true
       # a *.partial this run renamed is dropped once its complete copy is verified in place
@@ -438,7 +590,9 @@ base_models(){
       DEL_FILES=(${keep[@]+"${keep[@]}"}); DEL_BYTES=$kept_bytes
     fi
   fi
-  echo "  downloaded ${#MODEL_DL[@]} · moved ${#MODEL_MOVED[@]} · in place ${#MODEL_OK[@]} · missing ${#MODEL_FAIL[@]}"
+  if [ "${#LATER_TODO[@]}" -gt 0 ] && [ "$BASE_DRY" != "1" ]; then _base_later_queue_add "${LATER_TODO[@]}"; fi
+  if [ "${BASE_STAGED:-0}" = "1" ] && [ "$BASE_DRY" != "1" ]; then _base_progress first; fi
+  echo "  downloaded ${#MODEL_DL[@]} · moved ${#MODEL_MOVED[@]} · in place ${#MODEL_OK[@]} · missing ${#MODEL_FAIL[@]}${LATER_TODO[0]+ · later ${#LATER_TODO[@]} (stand-ins until they arrive)}"
   if [ "${#MODEL_FAIL[@]}" -gt 0 ]; then err "${#MODEL_FAIL[@]} required file(s) missing — the run will exit non-zero at the summary"; fi
   return 0
 }
@@ -484,6 +638,7 @@ _base_prune_commit(){ # <rows> — stage, verify, then commit or roll back
     [ -n "$cat" ] || continue
     [[ "$file" == */ ]] && continue
     rel="$(_base_dest_rel "$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts")"; dest="$(_base_dest_path "$rel")"
+    _base_standin_is "$dest" && continue              # a stand-in is a promise, not a model: nothing to re-check yet
     if [ ! -f "$dest" ]; then bad="$rel is GONE"; break; fi
     sz="$(_base_fsize "$dest")"
     if [ -n "$bytes" ] && [ "$bytes" != "0" ] && [ "$sz" != "$bytes" ]; then bad="$rel changed size ($sz, expected $bytes)"; break; fi
@@ -506,6 +661,7 @@ _base_prune_commit(){ # <rows> — stage, verify, then commit or roll back
 
 base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (default No); a file another package claims is never offered
   hdr "OLD LAYOUT · DUPLICATES · SUPERSEDED"
+  if [ "${BASE_STAGED:-0}" = "1" ]; then note "prune: skipped, a staged install (later files are still arriving, and a buyer's fresh disk holds nothing to reclaim)"; return 0; fi
   [ -n "$IDX" ] && [ -f "$IDX" ] || _base_build_index
   local rows cat fam purp file url bytes mnote alts rel dest base real dsz size path legacy f pat hit lbase d
   rows="$(_base_model_rows 2>/dev/null || true)"

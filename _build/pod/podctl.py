@@ -520,6 +520,28 @@ def item_for(directory):
             "local_script": d / ("%s-script.sh" % name), "slug": re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()}
 
 
+def item_for_zip(zip_path, logs=None):
+    """An item from a ZIP alone, for a buyer who has no source tree (3.1.0): the base when the zip carries
+    'comfyui-base/', else a package named by the one '<name>-script.sh' at its root. The zip is installed as it is:
+    no packager check, no Mac gate, no pack records written back."""
+    z = pathlib.Path(zip_path).resolve()
+    if not z.is_file():
+        raise PodctlError("%s: no such zip" % z)
+    with zipfile.ZipFile(z) as zf:
+        names = zf.namelist()
+    logs = pathlib.Path(logs) if logs else z.parent / "podruns"
+    if any(n.startswith("comfyui-base/") for n in names):
+        return {"kind": "base", "dir": z.parent, "name": "ComfyUI Base", "zip": z, "script": "comfyui-base/comfyui-base-script.sh",
+                "local_script": z.parent / ".no-local-script", "slug": "base", "buyer": True, "logs": logs}
+    scripts = [n for n in names if "/" not in n and n.endswith("-script.sh")]
+    if len(scripts) != 1:
+        raise PodctlError("%s: not a package zip (want exactly one '<name>-script.sh' at its root, found %d)" % (z.name, len(scripts)))
+    name = scripts[0][: -len("-script.sh")]
+    return {"kind": "pkg", "dir": z.parent, "name": name, "zip": z, "script": "%s/%s" % (name, scripts[0]),
+            "local_script": z.parent / ".no-local-script", "slug": re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower(),
+            "buyer": True, "logs": logs}
+
+
 class PodIO:
     """The real pod: ssh (no forwards), scp, the packager. `say` prints progress lines."""
     def __init__(self, api, pod, env=None, packager=None):
@@ -659,12 +681,46 @@ args_no_gate = _Flag()
 RESTART_REQUIRED = re.compile(r"restart required: ([^\n]+)")
 
 
-def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins_after=None, save_pins=True, today=None, comfy_ref=None, provider="verda"):
+def _env_prefix(run_env):
+    """KEY=value pairs for a remote command line, each value quoted."""
+    return "".join("%s=%s " % (k, _sq(str(v))) for k, v in (run_env or {}).items())
+
+
+def _run_logged(io, name, slug, inner, every=30, timeout=3 * 3600):
+    """One step on the machine, detached, polled through its console. Returns (rc, console text, console path);
+    rc is None when the step could not start or outran the timeout (the reason is already said)."""
+    import datetime
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    console = logs_dir_remote() + "/install_%s_%s.console" % (slug, ts)
+    # braces: only the run goes to the background. `A && B && nohup X &` backgrounds the whole list in a subshell whose
+    # stdout is the ssh channel, and that subshell waits for X — the launch ssh then lasted the whole step (2.0.19)
+    rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && mkdir -p " + _sq(logs_dir_remote()) + " && { nohup setsid bash -c %s </dev/null > %s 2>&1 & }" % (_sq(inner), _sq(console)))
+    if rc != 0:
+        io.say("STOP: could not start %s on the pod (exit %d)\n%s" % (name, rc, _tail(out + err))); return None, "", console
+    io.say("  running: %s\n  console: %s" % (inner, console))
+    waited, last_hdr, text = 0, "", ""
+    while True:
+        rc, out, err = io.remote("cat %s 2>/dev/null" % _sq(console))
+        text = out
+        m = STEP_RC.search(text)
+        if m:
+            return int(m.group(1)), text, console
+        hdrs = [l for l in text.splitlines() if l.startswith("══")]
+        if hdrs and hdrs[-1] != last_hdr:
+            last_hdr = hdrs[-1]; io.say("  %s" % last_hdr[:110])
+        if waited >= timeout:
+            io.say("STOP: %s did not finish within %d s — the run is still going on the pod; console: %s" % (name, timeout, console)); return None, text, console
+        io.sleep(every); waited += every
+
+
+def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins_after=None, save_pins=True, today=None, comfy_ref=None, provider="verda",
+            run_env=None, items=None):
     """Run the documented sequence for each directory in order. Returns 0 when every item ended green, 1 at the first
-    failure (after printing what stopped it and where the console is). `io` is a PodIO or the suite's stand-in."""
+    failure (after printing what stopped it and where the console is). `io` is a PodIO or the suite's stand-in.
+    3.1.0: `items` (from item_for_zip) installs zips a buyer was given, and `run_env` prefixes every remote run."""
     import datetime
     today = today or datetime.date.today().isoformat()
-    items = [item_for(d) for d in dirs]
+    items = items or [item_for(d) for d in dirs]
     for it in items:
         if not it["zip"].exists():
             io.say("STOP: %s has no zip (%s) — build it first" % (it["name"], it["zip"].name)); return 1
@@ -673,8 +729,8 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
     for it in items:
         io.say("══ %s ══" % it["name"])
         try:
-            z = io.check_zip(it["dir"])
-            if not getattr(args_no_gate, "value", False) and hasattr(io, "gate"):
+            z = it["zip"] if it.get("buyer") else io.check_zip(it["dir"])
+            if not it.get("buyer") and not getattr(args_no_gate, "value", False) and hasattr(io, "gate"):
                 io.gate(it["dir"], io.say)
         except PodctlError as e:
             io.say("STOP: %s" % e); return 1
@@ -686,36 +742,17 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
         if rc != 0:
             io.say("STOP: extracting %s on the pod failed (exit %d)\n%s" % (z.name, rc, _tail(out + err))); return 1
         io.say("  extracted %s" % z.name)
-        env = ("COMFY_REF=%s " % _sq(comfy_ref)) if comfy_ref else ""
+        env = (("COMFY_REF=%s " % _sq(comfy_ref)) if comfy_ref else "") + _env_prefix(run_env)
         rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && %sbash %s --check" % (env, _sq(it["script"])))
         if rc != 0:
             io.say("STOP: %s --check exited %d on the pod — nothing was run:\n%s" % (it["name"], rc, _tail(out + err))); return 1
         io.say("  --check ok")
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-        console = logs_dir_remote() + "/install_%s_%s.console" % (it["slug"], ts)
-        prefix = ("BASE_RESTART=1 " if it["kind"] == "pkg" else "") + (("COMFY_REF=%s " % comfy_ref) if comfy_ref else "")
+        prefix = ("BASE_RESTART=1 " if it["kind"] == "pkg" else "") + (("COMFY_REF=%s " % comfy_ref) if comfy_ref else "") + _env_prefix(run_env)
         inner = '%sbash "%s"; echo "STEP RC=$?"' % (prefix, it["script"])      # double quotes: readable in the log, and _sq wraps the whole line
-        # braces: only the run goes to the background. `A && B && nohup X &` backgrounds the whole list in a subshell whose
-        # stdout is the ssh channel, and that subshell waits for X — the launch ssh then lasted the whole step (2.0.19)
-        rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && mkdir -p " + _sq(logs_dir_remote()) + " && { nohup setsid bash -c %s </dev/null > %s 2>&1 & }" % (_sq(inner), _sq(console)))
-        if rc != 0:
-            io.say("STOP: could not start %s on the pod (exit %d)\n%s" % (it["name"], rc, _tail(out + err))); return 1
-        io.say("  running: %s\n  console: %s" % (inner, console))
-        waited, last_hdr, text = 0, "", ""
-        while True:
-            rc, out, err = io.remote("cat %s 2>/dev/null" % _sq(console))
-            text = out
-            m = STEP_RC.search(text)
-            if m:
-                break
-            hdrs = [l for l in text.splitlines() if l.startswith("══")]
-            if hdrs and hdrs[-1] != last_hdr:
-                last_hdr = hdrs[-1]; io.say("  %s" % last_hdr[:110])
-            if waited >= timeout:
-                io.say("STOP: %s did not finish within %d s — the run is still going on the pod; console: %s" % (it["name"], timeout, console)); return 1
-            io.sleep(every); waited += every
-        step_rc = int(m.group(1))
-        logs_dir = it["dir"] / "_build" / "podruns" / today / "pod-logs"
+        step_rc, text, console = _run_logged(io, it["name"], it["slug"], inner, every=every, timeout=timeout)
+        if step_rc is None:
+            return 1
+        logs_dir = (it["logs"] / today / "pod-logs") if it.get("logs") else (it["dir"] / "_build" / "podruns" / today / "pod-logs")
         io.fetch(logs_dir_remote(), logs_dir, newer_than=console)   # only what THIS step wrote (2.0.55)
         io.say("  logs → %s" % logs_dir)
         i = text.find("══ SUMMARY")
@@ -728,7 +765,7 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
                 io.say("      then run the same install again; the new driver is loaded and the run continues from there")
                 return 1
             io.say("STOP: %s ended with STEP RC=%d — the log is the deliverable: %s" % (it["name"], step_rc, console)); return 1
-        if save_pins and it["local_script"].exists():
+        if save_pins and not it.get("buyer") and it["local_script"].exists():
             changes = save_pins_fn(it["local_script"], pin_rows(text))
             if changes:
                 io.say("  pins saved into %s: %s" % (it["local_script"].name, ", ".join("%s %s→%s" % (n, o[:7], w[:7]) for n, o, w in changes)))
@@ -749,6 +786,82 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
 
 
 save_pins_fn = save_pins
+
+
+# ---------------------------------------------------------------- 3.1.0: a buyer's machine
+def runtime_src_remote():
+    """Where a runtime handed over from this Mac lands on the machine (VOLUME_ROOT is the provider's, bound at run time)."""
+    return VOLUME_ROOT + "/.comfy-base-runtime-src"
+
+
+def runtime_manifest_remote():
+    """The manifest runtime-apply keeps: what BASE_RUNTIME names on every install after it."""
+    return VOLUME_ROOT + "/comfy-base/state/runtime.json"
+
+
+def buyer_install(pod_id, base_zip, pkg_zips, runtime, io, jobs=1, every=30, timeout=3 * 3600, logs=None):
+    """A buyer's install, one command: the base zip and the purchased package zips, from the proven runtime, the first
+    flow first. `runtime` is the manifest: an https URL the machine fetches itself, or a local runtime.json whose parts
+    sit beside it (uploaded; slow over a home line, meant for tests and a maintainer's own sweep). No packager check,
+    no Mac gate, no pack records written anywhere: a buyer receives artefacts that already passed all three."""
+    items = [item_for_zip(base_zip, logs)] + [item_for_zip(z, logs) for z in pkg_zips]
+    if items[0]["kind"] != "base" or any(it["kind"] != "pkg" for it in items[1:]):
+        raise PodctlError("buyer-install: --base-zip must be comfyui-base.zip and every other zip a package")
+    if not gpu_gate(io, io.say):
+        return 1
+    base = items[0]
+    io.say("══ runtime ══")
+    io.upload([base["zip"]], pkgs_dir())
+    rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && python3 -m zipfile -e %s ." % _sq(base["zip"].name))
+    if rc != 0:
+        io.say("STOP: extracting %s on the pod failed (exit %d)\n%s" % (base["zip"].name, rc, _tail(out + err))); return 1
+    src = runtime
+    if "://" not in runtime:
+        man = pathlib.Path(runtime).resolve()
+        if not man.is_file():
+            raise PodctlError("buyer-install: no runtime manifest at %s" % man)
+        parts = [man.parent / p["name"] for p in json.loads(man.read_text(encoding="utf-8")).get("parts", [])]
+        missing = [str(p) for p in parts if not p.is_file()]
+        if missing:
+            raise PodctlError("buyer-install: the runtime's parts are not beside its manifest: %s" % ", ".join(missing[:3]))
+        io.upload([man] + parts, runtime_src_remote())
+        src = runtime_src_remote() + "/" + man.name
+    inner = 'bash "%s" runtime-apply %s; echo "STEP RC=$?"' % (base["script"], _sq(src))
+    step_rc, text, console = _run_logged(io, "runtime-apply", "runtime", inner, every=every, timeout=timeout)
+    if step_rc is None:
+        return 1
+    if step_rc != 0:
+        io.say(_tail(text, 30)); io.say("STOP: runtime-apply ended with STEP RC=%d; console: %s" % (step_rc, console)); return 1
+    io.say("  runtime applied")
+    run_env = {"BASE_RUNTIME": runtime_manifest_remote(), "BASE_STAGED": "1", "BASE_FETCH_JOBS": str(int(jobs)),
+               "BASE_NO_SUITE": "1", "BASE_YES": "1", "BASE_NONINTERACTIVE": "1"}
+    return install(pod_id, [], io, every=every, timeout=timeout, save_pins=False, items=items, run_env=run_env)
+
+
+def buyer_comfy_dir(io):
+    """The ComfyUI tree on the machine, as the base recorded it (state/boot.env), else the default."""
+    rc, out, err = io.remote(". %s 2>/dev/null; echo \"${COMFY:-%s/ComfyUI}\"" % (_sq(VOLUME_ROOT + "/comfy-base/state/boot.env"), VOLUME_ROOT))
+    return (out.strip().splitlines() or [VOLUME_ROOT + "/ComfyUI"])[-1]
+
+
+def put_away(prov, pod_id, io, to, yes=False):
+    """Copy the buyer's images (output/, input/) to this Mac, then delete the machine AND its disks (to Verda's trash,
+    restorable for 96 hours): nothing bills while it is put away. Without `yes` it copies and stops there."""
+    vols = prov.machine_volumes(pod_id)
+    comfy = buyer_comfy_dir(io)
+    to = pathlib.Path(to)
+    for sub in ("output", "input"):
+        rc, out, err = io.remote("test -d %s" % _sq(comfy + "/" + sub))
+        if rc == 0:
+            io.fetch(comfy + "/" + sub, to / sub)
+            io.say("  %s/ -> %s" % (sub, to / sub))
+    if not yes:
+        io.say("copied. Nothing deleted: run again with --yes to delete the machine and its disks %s" % ", ".join(vols))
+        return 2
+    io.say(prov.stop(pod_id, wait=True))
+    prov.delete_volumes(vols)
+    io.say("put away: the machine and its disks (%s) are in Verda's trash; the images are in %s" % (", ".join(vols), to))
+    return 0
 
 
 # ---------------------------------------------------------------- CLI
@@ -1315,6 +1428,77 @@ class _FreshAppend(__import__("argparse").Action):
         items.append(values); setattr(ns, self.dest, items)
 
 
+# ---- 3.1.0: the buyer verbs (a host that lacks one says so; Verda has them all)
+def _offered(prov, *names):
+    missing = [n for n in names if not hasattr(prov, n)]
+    if missing:
+        raise PodctlError("%s: not offered by host %s" % (", ".join(missing), getattr(prov, "name", "?")))
+
+
+def cmd_balance(prov, args):
+    _offered(prov, "balance")
+    b = prov.balance()
+    print("%.2f %s" % (b["amount"], b["currency"]))
+
+
+def cmd_availability(prov, args):
+    _offered(prov, "availability")
+    locs = prov.availability(args.gpu, spot=args.spot)
+    print("%s%s: %s" % (args.gpu, " (spot)" if args.spot else "", ", ".join(locs) if locs else "sold out everywhere"))
+    return 0 if locs else 1
+
+
+def cmd_create(prov, args):
+    _offered(prov, "create_machine", "availability")
+    loc = args.location
+    if not loc:
+        locs = prov.availability(args.gpu, spot=args.spot)
+        if not locs:
+            print("STOP: %s is sold out in every location right now%s" % (args.gpu, " (spot)" if args.spot else "")); return 1
+        loc = locs[0]
+    pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
+    pod_id = prov.create_machine(args.name, args.gpu, loc, args.data_gb, os_gb=args.os_gb, pubkey=pub, spot=args.spot,
+                                 wait=not args.no_wait, ssh_config=args.ssh_config)
+    print("next: podctl ensure %s · podctl buyer-install %s --runtime <runtime.json> --base-zip comfyui-base.zip <package zips>" % (pod_id, pod_id))
+
+
+def cmd_pause(prov, args):
+    print(prov.stop(args.pod, wait=True))
+
+
+def cmd_put_away(prov, args):
+    _offered(prov, "machine_volumes", "delete_volumes")
+    return put_away(prov, args.pod, PodIO(prov, prov.pod(args.pod)), args.to, yes=args.yes)
+
+
+def cmd_buyer_install(prov, args):
+    pod = prov.pod(args.pod)
+    print(write_host_env(prov))
+    return buyer_install(args.pod, args.base_zip, args.zips, args.runtime, PodIO(prov, pod), jobs=args.jobs,
+                         every=args.every, timeout=args.timeout, logs=args.logs)
+
+
+def cmd_progress(prov, args):
+    rc, out, err = PodIO(prov, prov.pod(args.pod)).remote("cat %s 2>/dev/null" % _sq(VOLUME_ROOT + "/comfy-base/state/progress.json"))
+    if rc != 0 or not out.strip():
+        print("no progress.json on the machine: nothing is staged, or no staged install has run"); return 1
+    print(out.rstrip())
+
+
+def cmd_runtime_capture(prov, args):
+    io = PodIO(prov, prov.pod(args.pod))
+    out_remote = VOLUME_ROOT + "/.comfy-base-capture"
+    inner = 'rm -rf %s && bash %s runtime-capture %s%s; echo "STEP RC=$?"' % (
+        _sq(out_remote), _sq(VOLUME_ROOT + "/comfy-base/base.sh"), _sq(out_remote), (" --url-base %s" % _sq(args.url_base)) if args.url_base else "")
+    step_rc, text, console = _run_logged(io, "runtime-capture", "capture", inner, every=args.every, timeout=args.timeout)
+    if step_rc is None:
+        return 1
+    if step_rc != 0:
+        print(_tail(text, 30)); print("STOP: runtime-capture ended with STEP RC=%d; console: %s" % (step_rc, console)); return 1
+    io.fetch(out_remote, pathlib.Path(args.to))
+    print("runtime captured -> %s (runtime.json and its parts; publish them, then hand the manifest's URL to buyer-install)" % args.to)
+
+
 def build_parser():
     ap = argparse.ArgumentParser(prog="podctl", description=__doc__.split("\n")[0])
     ap.add_argument("--provider", default=None, choices=list(_hosts.NAMES), help="the host (default: $PODCTL_PROVIDER, else the repository's brand.toml, else runpod)")
@@ -1372,6 +1556,28 @@ def build_parser():
     p.add_argument("--bin", default=None, help="the machine's comfy-mcp path (default: asked over ssh, else the venv beside ComfyUI)")
     p.add_argument("--out", default=".mcp.json", help="where to write it (default: .mcp.json here)")
     p.add_argument("--print", dest="print_only", action="store_true", help="print the JSON instead of writing it")
+    # ---- 3.1.0: a buyer's machine
+    sub.add_parser("balance", help="the account's prepaid balance")
+    p = sub.add_parser("availability", help="the locations where a GPU type can be deployed now"); p.add_argument("--gpu", required=True, help="an instance type, e.g. 1RTXPRO6000.30V")
+    p.add_argument("--spot", action="store_true")
+    p = sub.add_parser("create", help="a buyer's machine from nothing: an NVMe data disk, then the instance with its own OS disk (no startup script; ensure configures it)")
+    p.add_argument("--name", required=True); p.add_argument("--gpu", required=True, help="an instance type")
+    p.add_argument("--location", help="default: the first location with the GPU available now"); p.add_argument("--data-gb", dest="data_gb", type=int, required=True)
+    p.add_argument("--os-gb", dest="os_gb", type=int, default=100); p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")
+    p = sub.add_parser("pause", help="delete the instance and keep its disks (the same as stop --wait): only storage bills"); p.add_argument("pod")
+    p = sub.add_parser("put-away", help="copy output/ and input/ to this Mac; with --yes, then delete the machine and its disks (to the trash)")
+    p.add_argument("pod"); p.add_argument("--to", required=True, help="the local folder the images go to"); p.add_argument("--yes", action="store_true")
+    p = sub.add_parser("buyer-install", help="a buyer's install: the proven runtime, then the base and each package zip, the first flow first; no gate, no pins")
+    p.add_argument("pod"); p.add_argument("zips", nargs="*", help="the purchased package zips, in order")
+    p.add_argument("--runtime", required=True, help="the runtime manifest: an https URL, or a local runtime.json with its parts beside it")
+    p.add_argument("--base-zip", dest="base_zip", required=True, help="comfyui-base.zip")
+    p.add_argument("--jobs", type=int, default=1, help="model files downloaded at once (BASE_FETCH_JOBS)")
+    p.add_argument("--logs", default=None, help="where the machine's logs are copied (default: a podruns/ folder beside the zips)")
+    p.add_argument("--every", type=int, default=30); p.add_argument("--timeout", type=int, default=3 * 3600)
+    p = sub.add_parser("progress", help="the machine's state/progress.json: where a staged install's later files are"); p.add_argument("pod")
+    p = sub.add_parser("runtime-capture", help="capture this green machine's runtime (parts + runtime.json) and copy it here")
+    p.add_argument("pod"); p.add_argument("--to", required=True); p.add_argument("--url-base", dest="url_base", default="", help="the https prefix the parts will be published under")
+    p.add_argument("--every", type=int, default=30); p.add_argument("--timeout", type=int, default=3 * 3600)
     for sp in sub.choices.values():                                  # --provider after the verb too (a hook that reads argv sees both forms)
         sp.add_argument("--provider", dest="provider_after", default=None, choices=list(_hosts.NAMES), help=argparse.SUPPRESS)
     return ap
@@ -1388,7 +1594,9 @@ def main(argv=None):
             print("note    host %s is EXPERIMENTAL: written from first-party docs, not yet proven on a live account (hosts/%s/README.md)" % (prov.name, prov.name), file=sys.stderr)
         rc = {"status": cmd_status, "pods": cmd_pods, "image": cmd_image, "ensure": cmd_ensure, "ssh-config": cmd_ssh_config,
          "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy, "upload": cmd_upload, "tunnel": cmd_tunnel, "jupyter": cmd_jupyter, "install": cmd_install,
-         "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune, "mcp": cmd_mcp}[args.cmd](prov, args)
+         "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune, "mcp": cmd_mcp,
+         "balance": cmd_balance, "availability": cmd_availability, "create": cmd_create, "pause": cmd_pause, "put-away": cmd_put_away,
+         "buyer-install": cmd_buyer_install, "progress": cmd_progress, "runtime-capture": cmd_runtime_capture}[args.cmd](prov, args)
         if isinstance(rc, int):
             return rc
     except PodctlError as e:

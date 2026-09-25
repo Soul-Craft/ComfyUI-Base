@@ -59,6 +59,15 @@
 # BASE_SEED=1            2.1.0: a baked image's seed build (a brand's image generator): toolchain and packs only; base_run
 #                        stops after the ledger (no models, no restart, no smoke, no suite). SAGE_ARCHS="9.0;12.0" builds
 #                        SageAttention for those architectures with no GPU present.
+# BASE_RUNTIME=<manifest>  3.1.0: a BUYER's machine (Paul, 2026-09-25). The install runs from the proven runtime that
+#                        `runtime-apply` unpacked (ComfyUI, the uv Python and venv, the packs, the SageAttention wheel),
+#                        whose versions live ONLY in that manifest: no OS or driver upgrade, no git, no pip, no uv
+#                        resolve, each skip noted. The driver gate still holds, at the manifest's floor. The one
+#                        exception to "everything newest": a newbie's first run never meets an untested upstream change.
+# BASE_STAGED=1          3.1.0: act on the package's MODELS_LATER: those rows get 0-byte stand-ins, the server starts
+#                        on the first flow's files, and a detached `base.sh fetch-later` brings the rest
+#                        (state/later.queue, state/standins.list, state/progress.json). Every other run ignores it.
+# BASE_FETCH_JOBS=<n>    3.1.0: how many model files download at once (default 1, which is exactly the 3.0 behaviour).
 BASE_DRY="${BASE_DRY:-0}"                 # --check
 BASE_FAKE_ROOT="${BASE_FAKE_ROOT:-}"
 BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk — a code tree the base must never adopt or scan
@@ -121,6 +130,7 @@ BASE_STASH_CMD=""
 COMFY_OLD="?"; COMFY_NEW="?"
 PACK_PRESENT=(); PACK_UPDATED=(); PACK_CLONED=(); PACK_DIRTY=(); PACK_DIRS=()
 MODEL_OK=(); MODEL_MOVED=(); MODEL_DL=(); MODEL_PARTIAL=(); MODEL_FAIL=(); MODEL_LOCAL_MISSING=()
+MODEL_STANDIN=(); LATER_PENDING=""; BASE_RUNTIME_NOTE=""
 MODEL_OK_GB=0; MODEL_MOVED_GB=0; MODEL_DL_GB=0; MODEL_FAIL_GB=0
 DEL_FILES=(); DEL_BYTES=0; UNKNOWN_FILES=(); UNCLAIMED_FILES=()
 BASE_TEST_RESULT="not run"; BASE_TEST_RC=0; BASE_SMOKE_RESULT="not run"; BASE_IMPORT_RESULT="not run"

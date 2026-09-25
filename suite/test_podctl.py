@@ -1356,3 +1356,90 @@ def test_unit_podctl_a_restart_required_run_prints_the_restart_to_approve(tmp_pa
     rc = podctl.install("pod1", [base], io, every=1, timeout=60, today="2026-09-25", provider="verda")
     out = capsys.readouterr().out
     assert rc == 1 and "restart it (a person approves this):  podctl --provider verda restart pod1 --wait" in out, out
+
+
+# ---------------------------------------------------------------- 3.1.0: a buyer's machine
+
+def _buyer_zips(tmp_path):
+    """What a buyer holds: the base zip and one purchased package zip, and a local runtime (manifest + one part)."""
+    import zipfile, hashlib
+    d = tmp_path / "bought"; d.mkdir()
+    with zipfile.ZipFile(d / "comfyui-base.zip", "w") as z:
+        z.writestr("comfyui-base/comfyui-base-script.sh", STUB_SCRIPT % ("../..", "base"))
+    with zipfile.ZipFile(d / "my-pkg-verda.zip", "w") as z:
+        z.writestr("my-pkg-script.sh", STUB_SCRIPT % ("../..", "my-pkg"))
+    rt = tmp_path / "rt"; rt.mkdir(); part = rt / "runtime.tar.gz.000"; part.write_bytes(b"part")
+    (rt / "runtime.json").write_text(json.dumps({"format": 1, "parts": [{"name": part.name, "url": part.name, "bytes": 4,
+                                                                         "sha256": hashlib.sha256(b"part").hexdigest()}]}))
+    return d, rt / "runtime.json"
+
+
+def test_unit_item_for_zip_knows_the_base_from_a_package_by_the_zip_alone(tmp_path):
+    podctl = _load()
+    d, _ = _buyer_zips(tmp_path)
+    b, p = podctl.item_for_zip(d / "comfyui-base.zip"), podctl.item_for_zip(d / "my-pkg-verda.zip")
+    assert b["kind"] == "base" and b["script"] == "comfyui-base/comfyui-base-script.sh" and b["buyer"]
+    assert p["kind"] == "pkg" and p["name"] == "my-pkg" and p["script"] == "my-pkg/my-pkg-script.sh" and p["slug"] == "my_pkg"
+    import zipfile
+    with zipfile.ZipFile(tmp_path / "not.zip", "w") as z:
+        z.writestr("readme.txt", "x")
+    with pytest.raises(podctl.PodctlError):
+        podctl.item_for_zip(tmp_path / "not.zip")
+
+
+def test_unit_buyer_install_applies_the_runtime_then_installs_staged_with_no_gate_and_no_pins(tmp_path, capsys):
+    podctl = _load()
+    d, man = _buyer_zips(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    io.gate = lambda *a, **k: (_ for _ in ()).throw(AssertionError("a buyer's install never runs the Mac gate"))
+    rc = podctl.buyer_install("pod1", d / "comfyui-base.zip", [d / "my-pkg-verda.zip"], str(man), io, jobs=3, every=1, timeout=60, logs=tmp_path / "logs")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    calls = [c.rstrip() for c in (io.root / "calls.log").read_text().splitlines()]
+    assert calls[0].startswith("comfyui-base-script.sh runtime-apply ") and calls[0].endswith("/.comfy-base-runtime-src/runtime.json")
+    assert calls[1:] == ["comfyui-base-script.sh --check", "comfyui-base-script.sh", "my-pkg-script.sh --check", "my-pkg-script.sh"]
+    runs = [c for c in io.cmds if "STEP RC=" in c and "nohup" in c and "runtime-apply" not in c]
+    for r in runs:
+        assert "BASE_RUNTIME=" in r and "BASE_STAGED=" in r and re.search(r"BASE_FETCH_JOBS=\W{0,12}3\W", r), r   # the whole line is quoted once more
+    uploaded = [pathlib.Path(f).name for u in io.uploads for f in u[0]]
+    assert "runtime.json" in uploaded and "runtime.tar.gz.000" in uploaded
+    assert io.rebuilt == [] and "pins" not in out                       # nothing is written back on a buyer's machine
+    assert (tmp_path / "logs").is_dir()
+
+
+def test_unit_buyer_install_wants_the_base_zip_first(tmp_path):
+    podctl = _load()
+    d, man = _buyer_zips(tmp_path)
+    with pytest.raises(podctl.PodctlError):
+        podctl.buyer_install("pod1", d / "my-pkg-verda.zip", [], str(man), LocalPodIO(tmp_path / "pod"))
+
+
+def test_unit_put_away_copies_the_images_first_and_deletes_only_with_yes(tmp_path, capsys):
+    podctl = _load()
+    io = LocalPodIO(tmp_path / "pod")
+    out_dir = io.root / "ComfyUI" / "output"; out_dir.mkdir(parents=True); (out_dir / "mine.png").write_bytes(b"png")
+
+    class Prov:
+        name = "verda"; stopped = []; deleted = []
+        def machine_volumes(self, pod): return ["v-os", "v-data"]
+        def stop(self, pod, wait=True): self.stopped.append(pod); return "deleted %s" % pod
+        def delete_volumes(self, ids, permanent=False): self.deleted.extend(ids)
+    prov = Prov()
+    rc = podctl.put_away(prov, "pod1", io, tmp_path / "mac", yes=False)
+    assert rc == 2 and (tmp_path / "mac" / "output" / "mine.png").read_bytes() == b"png" and prov.stopped == [] and prov.deleted == []
+    rc = podctl.put_away(prov, "pod1", io, tmp_path / "mac2", yes=True)
+    assert rc == 0 and prov.stopped == ["pod1"] and prov.deleted == ["v-os", "v-data"] and (tmp_path / "mac2" / "output" / "mine.png").exists()
+
+
+def test_unit_the_buyer_verbs_parse_and_a_host_without_them_says_so():
+    podctl = _load()
+    ap = podctl.build_parser()
+    a = ap.parse_args(["buyer-install", "p1", "a.zip", "b.zip", "--runtime", "https://x/runtime.json", "--base-zip", "comfyui-base.zip", "--jobs", "2"])
+    assert a.zips == ["a.zip", "b.zip"] and a.jobs == 2 and a.base_zip == "comfyui-base.zip"
+    a = ap.parse_args(["create", "--name", "n", "--gpu", "1RTXPRO6000.30V", "--data-gb", "200"])
+    assert a.os_gb == 100 and a.location is None and not a.spot
+    for argv in (["balance"], ["availability", "--gpu", "x"], ["pause", "p"], ["put-away", "p", "--to", "d"], ["progress", "p"], ["runtime-capture", "p", "--to", "d"]):
+        ap.parse_args(argv)
+    class Bare: name = "bare"
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.cmd_balance(Bare(), ap.parse_args(["balance"]))
+    assert "not offered by host bare" in str(e.value)

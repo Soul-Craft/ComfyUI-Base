@@ -137,6 +137,9 @@ _base_start_comfy(){
   local ff; ff="$(_base_ffmpeg_path)"; [ -n "$ff" ] && echo "  ffmpeg with nvenc: $ff (VHS_FORCE_FFMPEG_PATH)" || true
   (cd "$COMFY" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
      if [ -n "$ff" ]; then export VHS_FORCE_FFMPEG_PATH="$ff"; fi
+     # 3.1.0: where the base keeps its state, so a package's own route reads state/progress.json without guessing
+     # (boot.sh knows BASE_HOME from boot.env; an install knows BASE_STATE)
+     _cbs="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; if [ -n "$_cbs" ]; then export COMFY_BASE_STATE="$_cbs"; fi
      nohup "$PY" main.py --listen "${BASE_LISTEN:-0.0.0.0}" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window

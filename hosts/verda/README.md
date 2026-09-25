@@ -232,3 +232,26 @@ Nothing else may listen on `0.0.0.0` on a Verda machine.
 - `/etc/fstab`: one `UUID=... /workspace ext4 defaults,nofail,x-systemd.device-timeout=30 0 2` line.
 - `/workspace/comfy-base/state/host.env`: `BASE_HOST=verda`, `BASE_VOLUME=/workspace`.
 - `/root/comfy-base-startup.sh`: the copy `ensure` ran; `bash /root/comfy-base-startup.sh --ensure` repeats it.
+
+## A buyer's machine (3.1.0)
+
+Everything above is a maintainer's machine. A buyer runs on their own account, and the driver makes that machine
+from nothing:
+
+    podctl --provider verda balance
+    podctl --provider verda availability --gpu 1RTXPRO6000.30V          # where it can be deployed right now
+    podctl --provider verda create --name <n> --gpu 1RTXPRO6000.30V --data-gb 200 [--location FIN-03]
+    podctl --provider verda ensure <instance id>
+    podctl --provider verda buyer-install <instance id> --runtime <runtime.json URL> --base-zip comfyui-base.zip <package zips>
+    podctl --provider verda progress <instance id>                       # where the later files are
+    podctl --provider verda pause <instance id>                          # only the disks bill
+    podctl --provider verda put-away <instance id> --to <folder> --yes   # images to the Mac, the disks to the trash
+
+`create` sends `POST /volumes {"type": "NVMe", ...}` for the data disk, then `POST /instances` with `os_volume`
+(`{"name": "<n>-os", "size": 100}`), that disk in `existing_volumes`, and the image TYPE (`24.04.cuda13.2.docker`,
+or `VERDA_IMAGE`): the display name in §3 is what the console shows, not what the API takes. It never sends a
+`startup_script_id`, because a fresh OS volume has no fstab line and the registered script would wait ten minutes
+for one; `ensure` configures the machine over ssh instead. When the instance is refused (`503 Not enough resources`,
+a sold-out location) the new data disk is deleted at once, so nothing is left billing. `balance` reads
+`GET /balance` and `availability` reads `GET /instance-availability`, both now called by the driver.
+

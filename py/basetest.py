@@ -55,7 +55,8 @@ def _declare(script):
                        "BASE_DECLARE_ONLY": "1", "COMFY_BASE": str(BASE_LIB)})
     packs = [ln[8:].split("|") for ln in r.stdout.splitlines() if ln.startswith("PACKROW ")]
     models = [ln[9:].split("|") for ln in r.stdout.splitlines() if ln.startswith("MODELROW ")]
-    return r, packs, models
+    later = [ln[11:] for ln in r.stdout.splitlines() if ln.startswith("MODELLATER ")]
+    return r, packs, models, later
 
 
 def load_package(pkg_dir):
@@ -66,7 +67,7 @@ def load_package(pkg_dir):
         raise FileNotFoundError("no '*-script.sh' in %s" % pkg_dir)
     script = scripts[0]
     text = script.read_text(encoding="utf-8")
-    r, packs, models = _declare(script)
+    r, packs, models, later = _declare(script)
     if r.returncode != 0:
         raise RuntimeError("declarations invalid:\n" + r.stderr)
     def grab(var, default=""):
@@ -81,7 +82,8 @@ def load_package(pkg_dir):
         wf_name=wf_name, wf=wf, wf_version_key=grab("WF_VERSION_KEY", "package_version"),
         packs=[dict(zip(("dir", "url", "sha", "cnr_id", "why"), p + [""] * (5 - len(p)))) for p in packs],
         models=[dict(zip(("category", "family", "purpose", "file", "url", "bytes", "note", "alts"), m + [""] * (8 - len(m)))) for m in models],
-        superseded=[t.strip("\"'") for t in sup.group(1).split()] if sup else [], loader_cats_extra=lcats)   # a package may quote its globs
+        superseded=[t.strip("\"'") for t in sup.group(1).split()] if sup else [], loader_cats_extra=lcats,
+        models_later=later)   # a package may quote its globs
 
 
 def fnbody_or_all(text, var):

@@ -46,6 +46,9 @@ base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.
       _base_venv_rollback || true
       BASE_FAILED+=("import check: ComfyUI did not start in the rebuilt venv; rolled back to $BASE_VENV_BACKUP"); BASE_IMPORT_RESULT="FAILED (rebuilt venv rolled back)"; BASE_BLOCK_RESTART=1; return 0
     fi
+    if _base_runtime_on; then                         # 3.1.0: nothing was changed, so nothing is rolled back
+      BASE_FAILED+=("import check: ComfyUI did not start from the proven runtime (log: $BASE_STATE/import_check.log)"); BASE_IMPORT_RESULT="FAILED (runtime)"; BASE_BLOCK_RESTART=1; return 0
+    fi
     local changed=""
     if base_lift_rollback_core; then
       changed="$(tr '\n' ' ' < "$BASE_LIFT_DIR/rollback.txt" 2>/dev/null | cut -c1-400)"

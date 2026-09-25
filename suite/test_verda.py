@@ -96,6 +96,11 @@ class FakeVerda:
         self.counter = 0
         self.token = token
         self.delete_fails = False
+        # 3.1.0: the buyer verbs' endpoints
+        self.balance = {"amount": 42.5, "currency": "usd"}
+        self.availability = [{"location_code": "FIN-01", "availabilities": ["1CPU.4V"]},
+                             {"location_code": "FIN-03", "availabilities": [ITYPE, "1CPU.4V"]}]
+        self.sold_out = False       # POST /instances answers 503 "Not enough resources", as measured in FIN-02
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -152,6 +157,10 @@ class FakeVerda:
                     return self._send(200, srv.scripts)
                 if p == "/instance-types":
                     return self._send(200, [{"instance_type": ITYPE}])
+                if p == "/balance":
+                    return self._send(200, srv.balance)
+                if p.startswith("/instance-availability"):
+                    return self._send(200, srv.availability)
                 self._send(404, {"code": "not_found"})
 
             def do_POST(self):
@@ -164,13 +173,17 @@ class FakeVerda:
                     return
                 srv.counter += 1
                 if self.path == "/instances":
+                    if srv.sold_out:
+                        return self._send(503, {"code": "service_unavailable", "message": "Not enough resources"})
                     iid = "inst-new-%d" % srv.counter
                     vol = srv.volumes.get(body.get("image"))
                     os_id = vol["id"] if vol else "os-new-%d" % srv.counter
                     if vol:
                         vol["status"], vol["instance_id"] = "attached", iid
                     else:
-                        srv.volumes[os_id] = _volume(os_id, "OS-" + body["hostname"], True, instance_id=iid, location=body.get("location_code"), size=100)
+                        osv = body.get("os_volume") or {}
+                        srv.volumes[os_id] = _volume(os_id, osv.get("name") or "OS-" + body["hostname"], True, instance_id=iid,
+                                                     location=body.get("location_code"), size=osv.get("size") or 100)
                     for did in body.get("existing_volumes") or []:
                         srv.volumes[did]["status"], srv.volumes[did]["instance_id"] = "attached", iid
                     srv.instances[iid] = _instance(id=iid, hostname=body["hostname"], image=body["image"], instance_type=body["instance_type"],
@@ -234,6 +247,11 @@ class FakeVerda:
                             inst["volume_ids"].remove(vol["id"])
                     elif body.get("action") == "attach":
                         vol["status"], vol["instance_id"] = "attached", body.get("instance_id")
+                    elif body.get("action") == "delete":
+                        if body.get("is_permanent"):
+                            del srv.volumes[vol["id"]]
+                        else:
+                            vol["status"] = "deleted"
                     return self._send(202, {})
                 self._send(404, {"code": "not_found"})
 
@@ -952,5 +970,68 @@ def test_unit_verda_host_env_reads_whether_the_workspace_is_the_store(tmp_path, 
         prov2._last_pod = INST_ID
         monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: types.SimpleNamespace(returncode=0, stdout="ext4\n", stderr=""))
         assert prov2.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\nBASE_LIBRARY=/mnt/comfy-library\n"   # a library beside a local root
+    finally:
+        fake.close()
+
+
+# ---------------------------------------------------------------- 3.1.0: a buyer's machine
+
+def test_unit_verda_balance_and_availability_read_the_api(tmp_path):
+    podctl = _load(); fake = FakeVerda()
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        assert prov.balance() == {"amount": 42.5, "currency": "usd"}
+        assert prov.availability(ITYPE) == ["FIN-03"] and prov.availability("1H200.30V") == []
+        assert fake.calls("GET", "/instance-availability?is_spot=false")
+        prov.availability(ITYPE, spot=True)
+        assert fake.calls("GET", "/instance-availability?is_spot=true")
+    finally:
+        fake.close()
+
+
+def test_unit_verda_create_machine_makes_its_own_disks_and_attaches_no_startup_script(tmp_path, monkeypatch):
+    podctl = _load(); fake = FakeVerda(provision_polls=1)
+    monkeypatch.setattr(podctl, "ssh_banner", lambda *a, **k: "SSH-2.0-OpenSSH")
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov.banner = lambda host, port=22: "SSH-2.0-OpenSSH"
+        pod = prov.create_machine("buyer-one", ITYPE, "FIN-03", 250, ssh_config=_cfg(tmp_path), say=lambda *a: None)
+        (_, _, vbody), = fake.calls("POST", "/volumes")
+        assert vbody == {"type": "NVMe", "location_code": "FIN-03", "size": 250, "name": "buyer-one-data"}
+        (_, _, ibody), = fake.calls("POST", "/instances")
+        assert ibody["os_volume"] == {"name": "buyer-one-os", "size": 100} and ibody["image"] == "24.04.cuda13.2.docker"
+        assert ibody["location_code"] == "FIN-03" and ibody["instance_type"] == ITYPE and len(ibody["existing_volumes"]) == 1
+        assert "startup_script_id" not in ibody and ibody["ssh_key_ids"]
+        assert sorted(prov.machine_volumes(pod)) == sorted([fake.instances[pod]["os_volume_id"]] + ibody["existing_volumes"])
+    finally:
+        fake.close()
+
+
+def test_unit_verda_a_sold_out_create_takes_its_new_disk_with_it(tmp_path):
+    podctl = _load(); fake = FakeVerda(); fake.sold_out = True
+    mod = _verda(podctl)
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        with pytest.raises(mod.HttpError) as e:
+            prov.create_machine("buyer-two", ITYPE, "FIN-02", 100, wait=False, say=lambda *a: None)
+        assert e.value.status == 503
+        (_, _, vbody), = fake.calls("POST", "/volumes")
+        dels = [b for m, p, b in fake.calls("PUT", "/volumes") if b.get("action") == "delete"]
+        assert len(dels) == 1 and dels[0]["is_permanent"] is True and not fake.volumes
+    finally:
+        fake.close()
+
+
+def test_unit_verda_delete_volumes_goes_to_the_trash_one_call_each(tmp_path):
+    podctl = _load()
+    fake = FakeVerda(volumes=[_volume("v-os", "buyer-os", True, status="detached", instance_id=None),
+                              _volume("v-data", "buyer-data", False, status="detached", instance_id=None)])
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        assert sorted(prov.machine_volumes("v-os")) == ["v-data", "v-os"]
+        prov.delete_volumes(["v-os", "v-data"])
+        dels = [b for m, p, b in fake.calls("PUT", "/volumes")]
+        assert dels == [{"id": "v-os", "action": "delete", "is_permanent": False}, {"id": "v-data", "action": "delete", "is_permanent": False}]
+        assert {v["status"] for v in fake.volumes.values()} == {"deleted"}
     finally:
         fake.close()

@@ -15,12 +15,14 @@ _base_validate_tables(){ # every required declaration present and every table ro
   if ! [[ "${PKG_ID:-}" =~ ^[a-z0-9_-]+$ ]]; then echo "  !! PKG_ID must match [a-z0-9_-]+ (got '${PKG_ID:-}')" >&2; bad=1; fi
   _base_pack_rows >/dev/null || bad=1
   _base_model_rows >/dev/null || bad=1
+  _base_later_rows >/dev/null || bad=1
   return $bad
 }
 _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per line, for list-packs / gen-models / suites
   local rc=0
   _base_pack_rows | sed 's/^/PACKROW /' || rc=1
   _base_model_rows | sed 's/^/MODELROW /' || rc=1
+  _base_later_rows | sed 's/^/MODELLATER /' || rc=1
   return $rc
 }
 _base_hook(){ # run a package hook if the package defines it; a failing hook fails the run (no fallbacks)
@@ -36,6 +38,7 @@ base_init(){
   _base_logging
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" = 3 ]; then base_discover || true; exit 3; fi             # no network volume: the refusal, printed
+  if [ "$drc" = 4 ] && _base_runtime_on; then err "runtime mode and no ComfyUI tree: run 'runtime-apply <manifest>' first"; exit 3; fi
   if [ "$drc" = 4 ]; then                                               # a volume without a ComfyUI tree: make one
     local mrc=0; base_comfy_materialize || mrc=$?
     if [ "$mrc" = 4 ]; then note "--check stops here: the tree does not exist yet. The install creates it first; the rest of this report applies once it does."; exit 0; fi
@@ -43,6 +46,7 @@ base_init(){
     if ! base_discover; then exit 3; fi
   fi
   if ! _base_validate_tables; then err "the package's declarations are invalid (see above)"; exit 2; fi
+  if _base_runtime_on; then _base_runtime_init; fi               # 3.1.0: a buyer's machine installs from the proven runtime
   _base_library_link          # 2.4.0: models/ IS the shared library, before anything imports, downloads or renders
   _base_tmp
   base_banner || true            # in a || list, as it was in the `if` it used to sit in: its df probes must not fire the ERR trap
@@ -65,7 +69,9 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   # 3.0.0: the OS and the NVIDIA driver at their newest FIRST: they are the machine's, not the store's, so this runs
   # before the store's lock, and before the driver gate so an upgrade can lift a driver below DRIVER_MIN. A new driver
   # stops the run here, before anything touches the GPU: the machine must restart first (a person approves it).
-  local src=0; base_system || src=$?
+  local src=0
+  if _base_runtime_on; then _base_runtime_skip "the OS and the NVIDIA driver"; BASE_SYSTEM_RESULT="runtime (not upgraded)"
+  else base_system || src=$?; fi
   if [ "$src" = 10 ]; then base_summary; fi
   if ! _base_driver_gate; then base_summary; fi
   # 2.5.0: on a SHARED workspace only, one installer at a time. Nothing above this line writes to the store.
@@ -74,10 +80,19 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   local nfail="${#BASE_FAILED[@]}"      # the OS stage may have recorded a failure that does not stop the run; tokens are judged alone
   base_tokens || true
   if [ "${#BASE_FAILED[@]}" -gt "$nfail" ]; then err "a token was rejected: stopping before anything downloads"; base_summary; fi
-  base_update_comfyui || true
+  if _base_runtime_on; then            # 3.1.0: the tree, the packs and the venv are the runtime's, checked, never moved
+    if ! _base_runtime_comfy; then base_summary; fi
+  else base_update_comfyui || true; fi
   if ! base_comfy_gate; then base_summary; fi
   base_consolidate || true
-  base_packs git || true
+  base_packs git || true               # in runtime mode: located and recorded only; a pack the runtime lacks fails by name
+  if _base_runtime_on; then
+    _base_hook pkg_pre_venv
+    if ! _base_runtime_venv; then base_summary; fi
+    _base_hook pkg_post_venv           # SageAttention accepts only the runtime's own build (lib/40-packs.sh)
+    _base_runtime_skip "the packs' requirements"; _base_runtime_skip "Comfy MCP"; BASE_MCP_RESULT="skipped (runtime)"
+    _base_runtime_skip "the newest-everything pass"; BASE_LIFT_RESULT="runtime (not lifted)"
+  else
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
   _base_hook pkg_pre_venv
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi
@@ -86,6 +101,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   base_packs pip || true
   base_mcp || true                     # the venv and the packs exist; models do not yet, and MCP needs none
   base_venv_latest || true             # 3.0.0: everything still behind is forced to its newest; the import check judges it
+  fi
   if [ "${BASE_SEED:-0}" = "1" ]; then
     # 2.1.0: the template image's seed build (dockerize.py): the toolchain and the packs, never a model, a server or a suite
     hdr "SEED · BASE_SEED=1: no models, no prune, no restart, no smoke, no suite — the image carries the toolchain, the volume gets the models at boot"
@@ -108,6 +124,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   base_restart || true
   base_smoke || true
   base_combos || true
+  _base_later_launch || true           # 3.1.0: a staged install's later files download behind the server that just started
   # the live server is only a valid oracle when it runs the code this run installed
   if [ "$BASE_RESTART_NEEDED" != "1" ] && [ -z "${BASE_SERVER:-}" ] && curl -sf --max-time 3 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then BASE_SERVER="$HOSTPORT"; fi
   base_test "" || true
@@ -243,6 +260,8 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
   [ "${#PACK_UPDATED[@]}" -gt 0 ] && _base_list "${PACK_UPDATED[@]}" || true
   [ "${#PACK_CLONED[@]}" -gt 0 ] && _base_list "${PACK_CLONED[@]}" || true
   echo "  models     ok ${#MODEL_OK[@]} (${MODEL_OK_GB} GB) · moved ${#MODEL_MOVED[@]} (${MODEL_MOVED_GB} GB) · downloaded ${#MODEL_DL[@]} (${MODEL_DL_GB} GB) · partial re-fetched ${#MODEL_PARTIAL[@]} · failed ${#MODEL_FAIL[@]} (${MODEL_FAIL_GB} GB)"
+  if [ "${#MODEL_STANDIN[@]}" -gt 0 ]; then echo "  later      ${#MODEL_STANDIN[@]} file(s) stand in until they arrive${LATER_PENDING:+: $LATER_PENDING downloading behind the server} (state/progress.json)"; fi
+  if _base_runtime_on; then echo "  runtime    ${BASE_RUNTIME_NOTE:-$BASE_RUNTIME} (no OS, git, pip or uv step ran)"; fi
   # the average is the number that says whether Xet actually engaged: plain HTTPS lands an order of magnitude lower
   if [ "${BASE_DL_TIME:-0}" -gt 0 ]; then echo "             average $(_base_rate "$BASE_DL_BYTES" "$BASE_DL_TIME") across ${#MODEL_DL[@]} file(s)"; fi
   [ "${#MODEL_MOVED[@]}" -gt 0 ] && _base_list "${MODEL_MOVED[@]}" || true
@@ -271,6 +290,10 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
   fi
   if declare -F pkg_summary >/dev/null; then pkg_summary || true; fi
   BASE_SUMMARY_DONE=1
+  # 3.1.0: the verdict, kept, so `runtime-capture` can refuse a machine whose last install was not green
+  if [ "$BASE_DRY" != "1" ] && [ -n "${BASE_STATE:-}" ] && [ -n "${PKG_ID:-}" ]; then
+    mkdir -p "$BASE_STATE/last-run" 2>/dev/null && { if [ "${#BASE_FAILED[@]}" -eq 0 ]; then echo "green $(_base_ts) $PKG_VERSION"; else echo "red $(_base_ts) $PKG_VERSION"; fi > "$BASE_STATE/last-run/$PKG_ID"; } 2>/dev/null || true
+  fi
   # exit here, explicitly: a failing last command would trip the ERR trap and turn the contractual exit 1 into 4
   if [ "${#BASE_FAILED[@]}" -eq 0 ]; then exit 0; fi
   exit 1
@@ -328,6 +351,9 @@ base_main(){ # the six forms every package shares, plus the package's own PKG_CO
     test)      shift; base_env_setup; base_discover quiet || true; _base_use_testbed; base_test "${1:-}"; exit "$BASE_TEST_RC" ;;
     rescue)    base_env_setup; _base_logging; if ! base_discover; then exit 3; fi; base_rescue; exit "${BASE_RESCUE_RC:-0}" ;;
     help|-h|--help) base_help ;;
+    runtime-apply)   shift; base_runtime_apply "$@"; exit $? ;;                # 3.1.0: a buyer's machine
+    runtime-capture) shift; base_runtime_capture "$@"; exit $? ;;
+    fetch-later)     base_fetch_later; exit $? ;;
     *)         if ! _base_pkg_command "$@"; then _base_usage; exit 2; fi ;;
   esac
 }
@@ -344,8 +370,11 @@ base_cli(){ # the developer's entry (`bash base.sh test …`): a package script 
     status)       base_env_setup; base_status ;;
     latest)       base_env_setup; base_latest ;;
     install-self) shift; base_install_self "$@" ;;
+    runtime-apply)   shift; trap _base_on_exit EXIT; base_runtime_apply "$@" ;;     # 3.1.0: a buyer's machine
+    runtime-capture) shift; trap _base_on_exit EXIT; base_runtime_capture "$@" ;;
+    fetch-later)     trap _base_on_exit EXIT; base_fetch_later ;;
     test|rescue|help|-h|--help) base_main "$@" ;;
-    *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> | stamp-models <dir> [--check] | test [tier] | rescue | help)" >&2; exit 2 ;;
+    *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> | stamp-models <dir> [--check] | runtime-apply <manifest> | runtime-capture <dir> | fetch-later | test [tier] | rescue | help)" >&2; exit 2 ;;
   esac
 }
 base_install_self(){ # copy this base to $BASE_HOME (the volume) unless it already runs from there; then re-exec the installed copy

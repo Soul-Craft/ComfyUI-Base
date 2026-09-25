@@ -175,9 +175,14 @@ base_packs(){ # base_packs git | pip
       # a declared pack that is not a git checkout (a registry install) has no source to move: it goes aside and is cloned
       if [ -n "$dir" ] && ! { [ -d "$dir/.git" ] && _base_git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; }; then
         if [ "$BASE_DRY" = "1" ]; then would "move $dir aside (not a git checkout) and clone $url at its HEAD"; PACK_DIRS+=("$name|$dir"); continue
-        elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (not a git checkout; no-net: not moved)"); PACK_DIRS+=("$name|$dir"); continue; fi
+        elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (not a git checkout; no-net: not moved)"); PACK_DIRS+=("$name|$dir"); continue
+        elif _base_runtime_on; then PACK_PRESENT+=("$name (runtime)"); PACK_DIRS+=("$name|$dir"); continue; fi
         local aside; if aside="$(_base_pack_move_aside "$dir")"; then note "$name: not a git checkout: moved aside to $aside so it can be cloned at its newest"; dir=""
         else err "$name: not a git checkout and could not be moved aside"; BASE_FAILED+=("pack $name: not a git checkout, not at its newest"); PACK_DIRS+=("$name|$dir"); continue; fi
+      fi
+      if [ -z "$dir" ] && _base_runtime_on; then     # 3.1.0: a buyer's machine clones nothing; the runtime must carry it
+        err "$name is not in the proven runtime (${BASE_RUNTIME_NOTE:-runtime}): this package needs a newer runtime"
+        BASE_FAILED+=("pack $name: not in the runtime"); continue
       fi
       if [ -z "$dir" ]; then
         todo "$name — $why"
@@ -196,6 +201,7 @@ base_packs(){ # base_packs git | pip
       elif [ "$BASE_DRY" = "1" ]; then
         would "fetch $name and move it to the HEAD its remote publishes (never backwards; local edits stashed first)"; PACK_PRESENT+=("$name")
       elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (no-net: not moved)")
+      elif _base_runtime_on; then PACK_PRESENT+=("$name (runtime)")
       else _base_pack_move "$name" "$dir" "$url"; fi
       declared="$declared$(basename "${dir:-$name}") "
       PACK_DIRS+=("$name|$dir")
@@ -214,7 +220,7 @@ base_packs(){ # base_packs git | pip
         uurl="$(_base_git -C "$ud" remote get-url "$(_base_git_remote "$ud")" 2>/dev/null || true)"
         if [ -z "$uurl" ]; then note "$un: undeclared git checkout with no remote: nothing to move it to"; continue; fi
         if [ "$BASE_DRY" = "1" ]; then would "move undeclared $un to its remote HEAD"
-        elif [ "$BASE_NO_NET" != "1" ]; then _base_pack_move "$un" "$ud" "$uurl"; fi
+        elif [ "$BASE_NO_NET" != "1" ] && ! _base_runtime_on; then _base_pack_move "$un" "$ud" "$uurl"; fi
       elif [ -f "$ud/__init__.py" ]; then note "$un: undeclared and not a git checkout: no source to upgrade it from, left alone"; fi
     done
     # the last-tested records: printed on EVERY real run, so podctl can write them back after a green install
@@ -318,6 +324,12 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
   # A failed build FAILS the run (2.0.22: a missing build died at the first render with `No module named 'sageattention'`).
   if [ "$BASE_DRY" = "1" ]; then would "build SageAttention from source for ${BASE_GPU_SM:-the GPU} into $VENV unless the installed build matches main's newest commit"; return 0; fi
   if [ "$BASE_NO_NET" = "1" ]; then note "SageAttention: skipped (fake venv — BASE_NO_NET)"; return 0; fi
+  if _base_runtime_on; then                           # 3.1.0: the runtime's own build, by its cache key, or nothing
+    local want stamped; want="$(_base_runtime_field sageattention.key)"; stamped="$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null || true)"
+    if [ -n "$want" ] && [ "$stamped" = "$want" ] && "$PY" -c "import sageattention" >/dev/null 2>&1; then ok "sageattention from the proven runtime ($want)"; return 0; fi
+    err "SageAttention is not the runtime's build (runtime ${want:-none}, venv ${stamped:-none}): a runtime machine builds nothing; this GPU may need a runtime captured on its own architecture"
+    BASE_FAILED+=("SageAttention: not the runtime's build"); return 0
+  fi
   if [ -n "${SAGE_WHEEL:-}" ]; then note "SAGE_WHEEL is retired in 3.0.0 and ignored: SageAttention is built from its newest source"; fi
   if [[ "${SAGE_REF:-}" =~ ^[0-9a-f]{7,40}$ ]]; then note "SAGE_REF=$SAGE_REF is a commit, retired in 3.0.0 (a commit is a pin): main is used"; SAGE_REF=main; fi
   {
