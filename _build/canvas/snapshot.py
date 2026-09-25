@@ -1,10 +1,10 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["playwright==1.62.0"]
+# dependencies = ["playwright"]
 # ///
 """Photograph a workflow package's canvas in the REAL frontend, and export every node's computeSize().
 
-    uv run "base/comfyui-base/_build/canvas/snapshot.py" --pkg "<package dir>"      # needs: bash testbed.sh --server
+    uv run --upgrade "base/comfyui-base/_build/canvas/snapshot.py" --pkg "<package dir>"      # needs: bash testbed.sh --server
     uv run ... --pkg <dir> --viewport 1728x1117@2 --subgraphs --view band2=0.55,170,-1650
 
 Loads the package's workflow into the testbed's ComfyUI page with Playwright, restores the saved view, screenshots
@@ -19,6 +19,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "py"))
 from canvas import structure_sha, CHROME_LEFT, CHROME_TOP, FRONTEND_ONLY_TYPES, load_spec, package_files              # noqa: E402
+
+
+def ensure_browser():
+    """3.0.0: Playwright is unpinned (always its newest, `uv run --upgrade`), and each release drives its own Chromium
+    build. Installing it is idempotent and takes a second when that build is already present."""
+    import subprocess
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 SELF_DRAWN = ("Label (rgthree)", "Bookmark (rgthree)")           # draw their own text; the size floor does not apply
 SETTINGS = {                                                        # what the page believes its settings are
@@ -221,6 +229,7 @@ def main():
     console, errors = [], []
     sizes = None
     from playwright.sync_api import sync_playwright     # lazy: the module's pure helpers (classify_console) import without a browser stack
+    ensure_browser()                                   # 3.0.0: the browser for this (newest) Playwright
     with sync_playwright() as p:
         b = p.chromium.launch(headless=not a.keep_browser)
         for (W, H, dpr) in viewports:

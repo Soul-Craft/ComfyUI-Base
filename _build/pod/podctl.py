@@ -345,7 +345,8 @@ def _sq(s):
 #   1. the local zip is current (package.py --check)      2. record the volume size, upload the zip
 #   3. extract on the pod (/workspace/packages; a package into its own folder there, 2.0.17)
 #   4. `--check` on the pod — non-zero stops everything
-#   5. the real run, detached, with --latest (BASE_RESTART=1 for a package), its console under state/logs
+#   5. the real run, detached (BASE_RESTART=1 for a package; COMFY_REF=<ref> with --comfy-ref), its console under state/logs.
+#      3.0.0: every run takes everything to its newest, so there is no --latest to pass and no --no-latest to hold it.
 #   6. poll the console for "STEP RC=" (progress = the last section header)
 #   7. copy the pod's state/logs beside the item (_build/podruns/<date>/pod-logs/), print the summary block
 #   8. red → stop with the console's path; green → save the printed pin rows into the local script, rebuild its zip
@@ -389,7 +390,7 @@ def repo_root(path):
 
 
 def pins_elsewhere(script_path, rows):
-    """What a green --latest run MEASURED for files the run does not own — every other '*-script.sh' beside the
+    """What a green install MEASURED for files the run does not own: every other '*-script.sh' beside the
     package and the base's own pack list — WITHOUT writing any of them. Returns [(path, pack, old, new)].
 
     It used to write them. That is the fault behind three separate blockages on 2026-09-08: an install is a
@@ -426,7 +427,7 @@ def write_pins_artefact(base_dir, pod_id, slug, report, today=None):
     today = today or datetime.date.today().isoformat()
     out = pathlib.Path(base_dir) / "_build" / "pins" / ("%s-%s-%s.txt" % (today, pod_id, slug))
     out.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# pins measured by a green --latest install — NOT applied: these files belong to other packages.",
+    lines = ["# pack records measured by a green install: NOT applied: these files belong to other packages.",
              "# measured by %s on pod %s at %s" % (lease_me(), pod_id, datetime.datetime.now().isoformat(timespec="seconds")),
              "# apply deliberately, then run that package's suite and rebuild its zip:",
              "#     uv run \"base/comfyui-base/_build/pod/podctl.py\" pins %s --apply" % out.name, ""]
@@ -655,7 +656,10 @@ class _Flag:
 args_no_gate = _Flag()
 
 
-def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins_after=None, save_pins=True, today=None):
+RESTART_REQUIRED = re.compile(r"restart required: ([^\n]+)")
+
+
+def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins_after=None, save_pins=True, today=None, comfy_ref=None, provider="verda"):
     """Run the documented sequence for each directory in order. Returns 0 when every item ended green, 1 at the first
     failure (after printing what stopped it and where the console is). `io` is a PodIO or the suite's stand-in."""
     import datetime
@@ -682,15 +686,15 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
         if rc != 0:
             io.say("STOP: extracting %s on the pod failed (exit %d)\n%s" % (z.name, rc, _tail(out + err))); return 1
         io.say("  extracted %s" % z.name)
-        rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && bash %s --check" % _sq(it["script"]))
+        env = ("COMFY_REF=%s " % _sq(comfy_ref)) if comfy_ref else ""
+        rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && %sbash %s --check" % (env, _sq(it["script"])))
         if rc != 0:
             io.say("STOP: %s --check exited %d on the pod — nothing was run:\n%s" % (it["name"], rc, _tail(out + err))); return 1
         io.say("  --check ok")
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
         console = logs_dir_remote() + "/install_%s_%s.console" % (it["slug"], ts)
-        prefix = "BASE_RESTART=1 " if it["kind"] == "pkg" else ""
-        flags = " --latest" if latest else ""
-        inner = '%sbash "%s"%s; echo "STEP RC=$?"' % (prefix, it["script"], flags)      # double quotes: readable in the log, and _sq wraps the whole line
+        prefix = ("BASE_RESTART=1 " if it["kind"] == "pkg" else "") + (("COMFY_REF=%s " % comfy_ref) if comfy_ref else "")
+        inner = '%sbash "%s"; echo "STEP RC=$?"' % (prefix, it["script"])      # double quotes: readable in the log, and _sq wraps the whole line
         # braces: only the run goes to the background. `A && B && nohup X &` backgrounds the whole list in a subshell whose
         # stdout is the ssh channel, and that subshell waits for X — the launch ssh then lasted the whole step (2.0.19)
         rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && mkdir -p " + _sq(logs_dir_remote()) + " && { nohup setsid bash -c %s </dev/null > %s 2>&1 & }" % (_sq(inner), _sq(console)))
@@ -717,6 +721,12 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
         i = text.find("══ SUMMARY")
         io.say(text[i:] if i >= 0 else _tail(text, 40))
         if step_rc != 0:
+            rr = RESTART_REQUIRED.search(text)
+            if rr:
+                io.say("STOP: %s needs the machine restarted before anything uses the GPU (%s)." % (it["name"], rr.group(1).strip()))
+                io.say("      restart it (a person approves this):  podctl --provider %s restart %s --wait" % (provider, pod_id))
+                io.say("      then run the same install again; the new driver is loaded and the run continues from there")
+                return 1
             io.say("STOP: %s ended with STEP RC=%d — the log is the deliverable: %s" % (it["name"], step_rc, console)); return 1
         if save_pins and it["local_script"].exists():
             changes = save_pins_fn(it["local_script"], pin_rows(text))
@@ -1065,6 +1075,9 @@ def cmd_prune(prov, args):
 
 
 def cmd_install(prov, args):
+    if getattr(args, "no_latest", False):
+        print("STOP: --no-latest is retired in 3.0.0: every install takes ComfyUI, the packs and every package to their newest")
+        return 2
     dirs = []
     here = pathlib.Path(__file__).resolve().parents[2]
     if args.base:
@@ -1092,7 +1105,10 @@ def cmd_install(prov, args):
         print("lease   could not be taken (%s) — continuing; it is advisory" % e)
     try:
         print(write_host_env(prov))
-        return install(args.pod, dirs, PodIO(prov, pod), every=args.every, timeout=args.timeout, latest=args.latest, save_pins=args.save_pins)
+        if getattr(args, "comfy_ref", None):
+            print("comfyui ref %s (from --comfy-ref; this install only: the next one without it returns the store to the newest release)" % args.comfy_ref)
+        return install(args.pod, dirs, PodIO(prov, pod), every=args.every, timeout=args.timeout, save_pins=args.save_pins,
+                       comfy_ref=getattr(args, "comfy_ref", None), provider=getattr(prov, "name", "verda"))
     finally:
         lease_release(me)
 
@@ -1324,17 +1340,18 @@ def build_parser():
     p.add_argument("--wait", action="store_true")
     p = sub.add_parser("upload", help="scp files to the pod (through Host runpod) and verify size + sha256 on both sides")
     p.add_argument("pod"); p.add_argument("files", nargs="+"); p.add_argument("--to", default=VOLUME_ROOT + "/packages")
-    p = sub.add_parser("install", help="the whole documented sequence, one command: upload, extract, --check, run with --latest, poll, copy logs, save pins")
+    p = sub.add_parser("install", help="the whole documented sequence, one command: upload, extract, --check, run (everything to its newest), poll, copy logs, save the pack records")
     p.add_argument("pod"); p.add_argument("--base", action="store_true", help="ComfyUI Base as step one")
     p.add_argument("--pkg", action="append", help="a package directory (repeatable, in order); relative to the project folder")
     p.add_argument("--every", type=int, default=30, help="poll interval in seconds"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
-    p.add_argument("--no-latest", dest="latest", action="store_false", help="run with the saved pins instead of --latest")
+    p.add_argument("--no-latest", dest="no_latest", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--comfy-ref", metavar="REF", help="ComfyUI at a ref NEWER than the newest release (master, a branch, a newer tag, a full sha), for this install only")
     p.add_argument("--no-save-pins", dest="save_pins", action="store_false", help="do not write the printed pins back after a green run")
     p.add_argument("--force-lease", action="store_true", help="install even though another session holds the GPU lease")
     p.add_argument("--no-gate", action="store_true", help="skip the Mac gate (each zip's own suite, run from the extracted zip) before uploading")
     p = sub.add_parser("prune", help="list the old-layout folders the 2026-09-12 rename left under /workspace/packages (and their workflow copies); --yes removes them")
     p.add_argument("pod"); p.add_argument("--yes", action="store_true", help="remove them (without it, only the list)")
-    p = sub.add_parser("pins", help="apply a pins artefact a green --latest install measured for OTHER packages (deliberate, by that package's session)")
+    p = sub.add_parser("pins", help="apply a records artefact a green install measured for OTHER packages (deliberate, by that package's session)")
     p.add_argument("artefact"); p.add_argument("--apply", action="store_true", help="write the rows (without it, they are only printed)")
     p = sub.add_parser("lease", help="who holds the pod's GPU: read it, take it for N minutes, or release it (advisory, expires)")
     p.add_argument("pod"); p.add_argument("--take", action="store_true"); p.add_argument("--release", action="store_true")

@@ -12,8 +12,10 @@ host-report issue template exists for exactly that, and a report either way move
 ## What the box needs
 
 - Ubuntu 22.04 or 24.04 on x86_64.
-- An NVIDIA driver, 580 or newer (`nvidia-smi` shows it). The base does NOT install a driver on a local box; it only
-  checks, and refuses an older one before downloading anything.
+- An NVIDIA driver (`nvidia-smi` shows it). Since 3.0.0 the base keeps a local box's OS packages and driver at their
+  newest too (NVIDIA's `nvidia-open`) when it can act as root (root, or passwordless `sudo`); a driver change stops the
+  run with "restart required", and you reboot. Without root it says what it could not upgrade and carries on; a
+  driver below 580 is still refused before anything downloads.
 - `uv` on PATH (`curl -LsSf https://astral.sh/uv/install.sh | sh`, then a new shell).
 - Disk: about 40 GB for the base, plus each package's models (a large image or video package is 60 to 130 GB).
 
@@ -26,15 +28,15 @@ worth knowing the chain before something in it refuses to move:
 | | what happens | where |
 |---|---|---|
 | the architecture | `12.0` → `sm_120`, derived at runtime, never a constant | `lib/10-discover.sh` |
-| the wheels | CUDA 13 wheels are the only stable `sm_120` wheels, so torch comes from the `cu130` index | `py/torch_pick.py` |
+| the wheels | torch comes from the newest CUDA build this driver runs, as `uv --torch-backend=auto` picks it | `py/torch_pick.py` |
 | the driver | CUDA 13 needs driver **>= 580**, so the gate refuses anything older *before downloading anything* | `_base_driver_gate` |
-| the version | the newest `+cu130` wheel for the interpreter's own `cpXY` tag; torch is not pinned to a number | `py/torch_pick.py` |
+| the version | the newest torch on that build for the interpreter's own Python; torch is never pinned to a number | `py/torch_pick.py` |
 | SageAttention | no wheel on PyPI carries `sm_100`/`sm_120` kernels, so it is built from source for this GPU's sm | `base_build_sageattention` |
 
 Two practical consequences. A driver below 580 stops the run at the gate with nothing downloaded and the venv
 untouched. That is the gate working, not a failure to work around: install a newer driver and run it again. And the
 SageAttention build wants the GPU visible, because it reads the compute capability to build for it; if you are
-building somewhere the card is not present, pass `SAGE_ARCHS="12.0"` or a prebuilt `SAGE_WHEEL=<url-or-path>`.
+building somewhere the card is not present, pass `SAGE_ARCHS="12.0"`.
 
 The base prints what it found before it commits to anything. `bash base.sh status` on the box shows the driver, the
 derived sm, the tree it discovered and the venv's torch, which is the fastest way to tell whether the chain above
@@ -46,7 +48,7 @@ lines up on your machine.
 
 - `<volume dir>` defaults to `$HOME/comfy`. The script creates it, writes `<dir>/comfy-base/state/host.env` with all
   four knobs, exports them, and runs the base's own installer, `comfyui-base-script.sh`, two levels up from this folder
-  (the same `--check | --latest | test | rescue | help` forms as on every host, passed through).
+  (the same `--check | test | rescue | help` forms as on every host, passed through; `--latest` is a plain run).
 - `--unit`, after the installer has run, installs `comfy-base-boot.service` when systemd is present: the unit the
   installer itself wrote beside `boot.sh` (`<dir>/comfy-base/comfy-base-boot.service`, the same one the VM hosts use,
   its `RequiresMountsFor` line omitted because a directory is not a mount), plus a drop-in

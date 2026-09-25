@@ -279,11 +279,11 @@ base_banner(){
   echo "  args file    $ARGS_FILE $( [ -f "$ARGS_FILE" ] || echo "(absent${ARGS_IMPORT:+ — imports $ARGS_IMPORT on the first run})") · port $PORT"
   echo "  state        $BASE_STATE"
   echo "  log          ${BASE_LOG:-—}"
-  _base_driver_gate
 }
 
-_base_driver_gate(){ # a real gate: CUDA 13 wheels are the only stable sm_120 wheels and need driver >= DRIVER_MIN
-  local want="${DRIVER_MIN:-580}" maj="${DRIVER%%.*}"
+_base_driver_gate(){ # a real gate, run AFTER base_system (3.0.0) so an upgrade can lift the driver first: CUDA wheels need driver >= DRIVER_MIN
+  local want="${DRIVER_MIN:-580}" d="${BASE_DRIVER_AFTER:-$DRIVER}" maj
+  case "$d" in [0-9]*) DRIVER="$d";; esac; maj="${DRIVER%%.*}"
   if [ -z "$BASE_FAKE_ROOT" ] && [[ "$maj" =~ ^[0-9]+$ ]] && [ "$maj" -lt "$want" ]; then
     err "driver $DRIVER is older than $want — CUDA 13 wheels (the only stable sm_120 wheels) need >= $want."
     echo "      Nothing was downloaded and the venv is untouched; the running server is unaffected."

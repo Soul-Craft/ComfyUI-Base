@@ -18,6 +18,15 @@ BASE = pathlib.Path(__file__).resolve().parents[1]
 TOOL = BASE / "_build" / "pod" / "podctl.py"
 
 
+
+@pytest.fixture(autouse=True)
+def _no_session_podctl_env(monkeypatch):
+    """A workspace that exports PODCTL_HOST / PODCTL_TUNNEL_OFFSET / PODCTL_PROVIDER (so a session addresses its own
+    machine) must not change what these tests expect: every test starts with none of them, and sets its own."""
+    for k in list(os.environ):
+        if k.startswith("PODCTL_"):
+            monkeypatch.delenv(k, raising=False)
+
 def _load():
     if not TOOL.exists():
         pytest.skip("no base/comfyui-base/_build/pod/podctl.py (not a repo checkout)")
@@ -612,12 +621,12 @@ def test_unit_podctl_install_runs_the_documented_sequence_and_stops_at_the_first
     extract = [c for c in cmds if "zipfile -e" in c]; checks = [c for c in cmds if "--check" in c]; runs = [c for c in cmds if "STEP RC=" in c and "nohup" in c]
     assert len(extract) == 2 and len(checks) == 2 and len(runs) == 2
     assert cmds.index(extract[0]) < cmds.index(checks[0]) < cmds.index(runs[0]) < cmds.index(extract[1]) < cmds.index(checks[1]) < cmds.index(runs[1])
-    assert '"comfyui-base/comfyui-base-script.sh" --latest' in runs[0] and "BASE_RESTART" not in runs[0]
-    assert 'BASE_RESTART=1 bash "My Pkg/My Pkg-script.sh" --latest' in runs[1]        # 2.0.17: a package runs from its own folder
+    assert 'bash "comfyui-base/comfyui-base-script.sh";' in runs[0] and "BASE_RESTART" not in runs[0] and "--latest" not in runs[0]   # 3.0.0: every run is newest
+    assert 'BASE_RESTART=1 bash "My Pkg/My Pkg-script.sh";' in runs[1]        # 2.0.17: a package runs from its own folder
     assert 'mkdir -p ' in extract[1] and "'My Pkg'" in extract[1] and extract[1].rstrip().endswith("'My Pkg'"), extract[1]
     assert extract[0].rstrip().endswith(" .")                                                  # the base zip carries its own folder
     calls = (io.root / "calls.log").read_text().splitlines()
-    assert calls == ["comfyui-base-script.sh --check", "comfyui-base-script.sh --latest", "My Pkg-script.sh --check", "My Pkg-script.sh --latest"]
+    assert [c.rstrip() for c in calls] == ["comfyui-base-script.sh --check", "comfyui-base-script.sh", "My Pkg-script.sh --check", "My Pkg-script.sh"]
     assert (io.root / "packages" / "My Pkg" / "My Pkg-script.sh").exists() and not (io.root / "packages" / "My Pkg-script.sh").exists()
     # the pod's logs land beside each item, the console among them; the summary is printed; the pins are saved and the zip rebuilt
     for d in (base, pkg):
@@ -849,9 +858,11 @@ def test_unit_podctl_pins_for_other_packages_are_measured_and_recorded_never_wri
 def test_unit_podctl_cli_install_takes_base_and_packages_in_order():
     podctl = _load()
     a = podctl.build_parser().parse_args(["install", "fakepod0000001", "--base", "--pkg", "Example Video Creator", "--pkg", "Example", "--every", "5"])
-    assert a.cmd == "install" and a.base and a.pkg == ["Example Video Creator", "Example"] and a.every == 5 and a.latest and a.save_pins
+    assert a.cmd == "install" and a.base and a.pkg == ["Example Video Creator", "Example"] and a.every == 5 and a.save_pins and a.comfy_ref is None and not a.no_latest
     a = podctl.build_parser().parse_args(["install", "fakepod0000001", "--pkg", "Example", "--no-latest", "--no-save-pins"])
-    assert not a.base and not a.latest and not a.save_pins and a.timeout >= 3600
+    assert not a.base and a.no_latest and not a.save_pins and a.timeout >= 3600          # parsed, then refused by cmd_install (3.0.0)
+    a = podctl.build_parser().parse_args(["install", "fakepod0000001", "--base", "--comfy-ref", "master"])
+    assert a.comfy_ref == "master"
 
 
 # ============================================================== the GPU lease: the pod is leased, not grabbed
@@ -1308,3 +1319,40 @@ def test_unit_mcp_refuses_a_transport_it_does_not_have():
     podctl = _load()
     with pytest.raises(podctl.PodctlError, match="unknown mcp transport"):
         podctl.mcp_server("runpod", "carrier-pigeon")
+
+
+# ---------------------------------------------------------------- 3.0.0: --comfy-ref, no --latest, --no-latest refused, a restart stop
+
+def test_unit_podctl_install_sends_no_latest_and_carries_comfy_ref_on_check_and_run(tmp_path, capsys):
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [base], io, every=1, timeout=60, today="2026-09-25", comfy_ref="master")
+    assert rc == 0, capsys.readouterr().out
+    check = [c for c in io.cmds if "--check" in c][0]; run = [c for c in io.cmds if "nohup" in c][0]
+    assert "COMFY_REF=master" in check and "COMFY_REF=master" in run and "--latest" not in run
+    io.cmds.clear()
+    podctl.install("pod1", [base], io, every=1, timeout=60, today="2026-09-25")
+    assert not [c for c in io.cmds if "COMFY_REF" in c]                                        # per install, never sticky
+
+
+def test_unit_podctl_no_latest_is_refused(capsys):
+    podctl = _load()
+    a = podctl.build_parser().parse_args(["install", "fakepod0000001", "--base", "--no-latest"])
+    assert podctl.cmd_install(None, a) == 2 and "retired in 3.0.0" in capsys.readouterr().out
+
+
+def test_unit_podctl_a_restart_required_run_prints_the_restart_to_approve(tmp_path, capsys):
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    (io.root / "run_rc").write_text("1")
+    script = io.root / "packages"
+    orig = io.remote
+    def remote(cmd):
+        rc, out, err = orig(cmd)
+        if cmd.startswith("cat ") and "STEP RC=1" in out:
+            out = out.replace("STEP RC=1", "  !! restart required: driver 580.178.04 -> 615.71.09\nSTEP RC=1")
+        return rc, out, err
+    io.remote = remote
+    rc = podctl.install("pod1", [base], io, every=1, timeout=60, today="2026-09-25", provider="verda")
+    out = capsys.readouterr().out
+    assert rc == 1 and "restart it (a person approves this):  podctl --provider verda restart pod1 --wait" in out, out

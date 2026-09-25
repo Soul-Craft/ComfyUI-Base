@@ -44,42 +44,66 @@ except Exception: print("")' "$cfg" 2>/dev/null || true)"; fi
   esac
 }
 
-base_import_check(){ # main.py --quick-test-for-ci in the venv; a pack WE installed failing to import blocks the restart advice
+_base_quick_test(){ # <log> → main.py --quick-test-for-ci's exit status (ComfyUI loads, imports every pack, exits)
+  (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch >"$1" 2>&1)
+}
+_base_core_failed(){ # <log> <rc> → 0 when ComfyUI ITSELF did not start (as opposed to a pack that failed to import)
+  local log="$1" rc="$2"
+  # a pack that fails to import prints its traceback and an "(IMPORT FAILED)" line, and ComfyUI still exits 0: a
+  # non-zero exit with no such line is ComfyUI itself (the same judgement 2.x made)
+  [ "$rc" -ne 0 ] && ! grep -q "IMPORT FAILED" "$log"
+}
+base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.0: every dependency is at its newest, so:
+  #   a PACK that does not import with them is named as "needs upgrading upstream" (not a failure, the restart goes on);
+  #   ComfyUI's OWN startup failing is the one thing rolled back: only the packages this run changed, from the snapshot.
   hdr "IMPORT CHECK · main.py --quick-test-for-ci in $VENV"
   if [ "$BASE_DRY" = "1" ]; then note "skipped in --check"; BASE_IMPORT_RESULT="skipped (--check)"; return 0; fi
   if [ "$BASE_NO_NET" = "1" ]; then note "skipped (BASE_NO_NET: fake venv)"; BASE_IMPORT_RESULT="skipped (fake)"; return 0; fi
   case "$BASE_VENV_RESULT" in failed*|rolled*) note "skipped — the venv step failed"; BASE_IMPORT_RESULT="skipped (venv failed)"; BASE_BLOCK_RESTART=1; return 0;; esac
   if [ ! -x "$PY" ]; then note "skipped — no interpreter at $PY"; BASE_IMPORT_RESULT="skipped (no venv)"; return 0; fi
-  _base_tmp; local log="$BASE_TMPD/import_check.log" rc=0 entry name dir ours=() others=()
-  if (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch >"$log" 2>&1); then :; else rc=$?; fi
-  for entry in ${PACK_DIRS[@]+"${PACK_DIRS[@]}"}; do
-    name="${entry%%|*}"; dir="${entry#*|}"
-    if grep -F "IMPORT FAILED" "$log" | grep -qF -- "$(basename "$dir")"; then ours+=("$name"); fi
-  done
-  while IFS= read -r name; do
-    if [ -n "$name" ] && ! _base_in_list "$name" ${ours[@]+"${ours[@]}"}; then others+=("$name"); fi
-  done < <(grep -E '\(IMPORT FAILED\):' "$log" | sed -E 's/.*\(IMPORT FAILED\):[[:space:]]*//' | xargs -n1 basename 2>/dev/null || true)
-  if [ "${#ours[@]}" -gt 0 ]; then
-    err "pack(s) this run installed do not import in this venv: ${ours[*]}"
-    local diag
-    for name in "${ours[@]}"; do
-      echo "  ── $name"
-      diag="$(grep -n -B2 -A25 -F "$name" "$log" 2>/dev/null | grep -E 'Traceback|Error|error|File "' 2>/dev/null | head -20 || true)"
-      if [ -n "$diag" ]; then printf '%s\n' "$diag" | sed 's/^/     /'; else echo "     (no traceback line matched '$name' — read the full log)"; fi
+  _base_tmp; local log="$BASE_TMPD/import_check.log" rc=0 name failed=() diag
+  _base_quick_test "$log" || rc=$?
+  # ---- ComfyUI itself did not start: that stops every machine on the store, so the newest set is rolled back
+  if _base_core_failed "$log" "$rc"; then
+    miss "ComfyUI itself did not start (exit $rc): last lines:"; tail -12 "$log" | sed 's/^/     /'
+    cp "$log" "$BASE_STATE/import_check.log" 2>/dev/null || true
+    if [ -n "$BASE_VENV_BACKUP" ] && _base_confirm_yes "Roll the venv back to $BASE_VENV_BACKUP (the old server keeps running either way)? [Y/n] "; then
+      _base_venv_rollback || true
+      BASE_FAILED+=("import check: ComfyUI did not start in the rebuilt venv; rolled back to $BASE_VENV_BACKUP"); BASE_IMPORT_RESULT="FAILED (rebuilt venv rolled back)"; BASE_BLOCK_RESTART=1; return 0
+    fi
+    local changed=""
+    if base_lift_rollback_core; then
+      changed="$(tr '\n' ' ' < "$BASE_LIFT_DIR/rollback.txt" 2>/dev/null | cut -c1-400)"
+      rc=0; _base_quick_test "$log" || rc=$?
+      if ! _base_core_failed "$log" "$rc"; then
+        err "ComfyUI starts again with the packages this run changed put back: ${changed:-none}"
+        BASE_FAILED+=("import check: ComfyUI did not start with the newest of: ${changed:-?}; those were rolled back, ComfyUI starts, and they need upgrading upstream")
+        BASE_UPSTREAM+=("ComfyUI $COMFY_NEW does not start with the newest of: ${changed:-?}")
+        BASE_IMPORT_RESULT="FAILED (core; rolled back, ComfyUI starts)"
+      else
+        BASE_FAILED+=("import check: ComfyUI does not start (exit $rc), even with this run's changes rolled back; see $BASE_STATE/import_check.log")
+        BASE_IMPORT_RESULT="FAILED (core, exit $rc)"; BASE_BLOCK_RESTART=1; return 0
+      fi
+    else
+      BASE_FAILED+=("import check: ComfyUI does not start (exit $rc) and there was no snapshot to roll back to"); BASE_IMPORT_RESULT="FAILED (core, exit $rc)"; BASE_BLOCK_RESTART=1; return 0
+    fi
+  fi
+  # ---- packs: named, never blocking. The pack's own newest code cannot run with a newest dependency.
+  while IFS= read -r name; do [ -n "$name" ] && failed+=("$name"); done < <(grep -E '\(IMPORT FAILED\):' "$log" | sed -E 's/.*\(IMPORT FAILED\):[[:space:]]*//' | xargs -n1 basename 2>/dev/null | sort -u || true)
+  if [ "${#failed[@]}" -gt 0 ]; then
+    warn "pack(s) that do not import with the newest dependencies (named, not blocking): ${failed[*]}"
+    for name in "${failed[@]}"; do
+      diag="$(grep -n -B2 -A25 -F "$name" "$log" 2>/dev/null | grep -E 'Error|error' 2>/dev/null | grep -v 'IMPORT FAILED' | tail -1 | sed -E 's/^[0-9]+[-:]//' | cut -c1-200 || true)"
+      echo "  ── $name: ${diag:-see the log}"
+      BASE_UPSTREAM+=("pack $name does not import with the newest dependencies (${diag:-see $BASE_STATE/import_check.log}): the pack needs upgrading upstream")
     done
     cp "$log" "$BASE_STATE/import_check.log" 2>/dev/null || true; echo "  full log: $BASE_STATE/import_check.log"
-    BASE_FAILED+=("import check: ${ours[*]} failed to import"); BASE_IMPORT_RESULT="FAILED: ${ours[*]}"; BASE_BLOCK_RESTART=1
-    if declare -F pkg_import_check >/dev/null; then pkg_import_check || true; fi
-    if [ -n "$BASE_VENV_BACKUP" ] && _base_confirm_yes "Roll the venv back to $BASE_VENV_BACKUP (the old server keeps running either way)? [Y/n] "; then _base_venv_rollback || true; fi
-    return 0
-  fi
-  if [ "${#others[@]}" -gt 0 ]; then warn "other packs failed to import (not installed by this run, not blocking): ${others[*]}"; fi
-  if [ "$rc" -ne 0 ] && ! grep -q "IMPORT FAILED" "$log"; then
-    miss "quick-test exited $rc without an IMPORT FAILED line — last lines:"; tail -15 "$log" | sed 's/^/     /'
-    BASE_FAILED+=("import check: main.py exited $rc"); BASE_IMPORT_RESULT="FAILED (exit $rc)"; BASE_BLOCK_RESTART=1; return 0
   fi
   if declare -F pkg_import_check >/dev/null; then pkg_import_check || { BASE_BLOCK_RESTART=1; BASE_IMPORT_RESULT="FAILED (package check)"; return 0; }; fi
-  BASE_IMPORT_RESULT="ok (${#PACK_DIRS[@]} packs import)"; ok "every pack imports; ComfyUI loaded and exited cleanly"
+  if [ -z "$BASE_IMPORT_RESULT" ] || [ "${BASE_IMPORT_RESULT#FAILED}" = "$BASE_IMPORT_RESULT" ]; then
+    if [ "${#failed[@]}" -gt 0 ]; then BASE_IMPORT_RESULT="ok: ComfyUI starts; ${#failed[@]} pack(s) named for upstream (${failed[*]})"
+    else BASE_IMPORT_RESULT="ok (${#PACK_DIRS[@]} packs import)"; ok "every pack imports; ComfyUI loaded and exited cleanly"; fi
+  fi
 }
 
 base_restart(){ # reports what needs a restart and prints the exact launch line; BASE_RESTART=1 actually does it

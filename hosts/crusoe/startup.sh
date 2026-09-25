@@ -11,7 +11,7 @@
 #
 # Stages, each skipped once it is done:
 #   1. the persistent disk at /workspace (wait for it, mkfs once, mount by UUID from fstab)
-#   2. the NVIDIA driver gate (driver 580 or newer; installs it from NVIDIA's repository and reboots ONCE when older)
+#   2. the NVIDIA driver gate (driver 580 or newer; installs NVIDIA's newest, nvidia-open, and reboots ONCE when older)
 #   3. the CUDA 13 toolkit and build-essential (SageAttention builds from source and needs nvcc that links cuBLAS)
 #   4. the base's systemd unit, comfy-base-boot.service, which runs /workspace/comfy-base/boot.sh at every boot
 #      (the base's own unit text once installed; a matching bootstrap copy before that)
@@ -30,7 +30,7 @@
 # ---- settings (edit here; a startup script takes no arguments) ---------------------------------------------------
 WORKSPACE="/workspace"                                          # the base's BASE_VOLUME; the persistent disk mounts here
 DRIVER_MIN="${DRIVER_MIN:-580}"                                 # the base's own gate: CUDA 13 torch wheels need this
-DRIVER_AUTOINSTALL="${DRIVER_AUTOINSTALL:-1}"                   # 1: install the 580 driver from NVIDIA's repo when older, then reboot once
+DRIVER_AUTOINSTALL="${DRIVER_AUTOINSTALL:-1}"                   # 1: install NVIDIA's newest driver (nvidia-open) when older, then reboot once
 DISK_DEV="${DISK_DEV:-}"                                        # empty: auto-detect the one unmounted vd[b-z] disk
 SSH_USER="${SSH_USER:-ubuntu}"                                  # the login user the driver uses; owns /workspace so installs need no sudo
 UNIT="/etc/systemd/system/comfy-base-boot.service"
@@ -101,13 +101,13 @@ own_workspace(){ # the driver logs in as $SSH_USER and installs into /workspace 
 
 # ---- apt helpers: wait for the boot-time unattended-upgrades lock, add NVIDIA's CUDA repository once ------------------
 apt_i(){ apt-get -o DPkg::Lock::Timeout=600 install -y -qq "$@"; }
-nvidia_repo(){
+nvidia_repo(){ # NVIDIA's CUDA repository, from the NEWEST cuda-keyring its index lists (3.0.0: no pinned keyring version)
   [ -f /usr/share/keyrings/cuda-archive-keyring.gpg ] && return 0
-  local kr="/tmp/cuda-keyring_1.1-1_all.deb"
   . /etc/os-release
-  local dist="ubuntu${VERSION_ID//./}"
-  curl -fsSL -o "$kr" "https://developer.download.nvidia.com/compute/cuda/repos/$dist/x86_64/cuda-keyring_1.1-1_all.deb" \
-    && dpkg -i "$kr" >/dev/null && apt-get -o DPkg::Lock::Timeout=600 update -qq
+  local url="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${VERSION_ID//./}/x86_64" deb
+  deb="$(curl -fsSL "$url/" 2>/dev/null | grep -oE 'cuda-keyring_[0-9][^"<>]*_all\.deb' | sort -uV | tail -1)"
+  [ -n "$deb" ] || return 1
+  curl -fsSL -o "/tmp/$deb" "$url/$deb" && dpkg -i "/tmp/$deb" >/dev/null && apt-get -o DPkg::Lock::Timeout=600 update -qq
 }
 
 # ---- 2. the NVIDIA driver gate (the base refuses a driver below DRIVER_MIN before downloading anything) ------------
@@ -122,25 +122,26 @@ driver_gate(){
   if [ "$DRIVER_AUTOINSTALL" != "1" ]; then
     status "STOPPED: driver ${maj:-absent} < $DRIVER_MIN and DRIVER_AUTOINSTALL=0. Install driver $DRIVER_MIN and reboot."; return 1
   fi
-  if [ -f "$sentinel" ]; then
-    status "STOPPED: driver $DRIVER_MIN was installed on $(cat "$sentinel") and the driver is still '${maj:-absent}'. Not rebooting again; check $LOG and 'apt list --installed | grep nvidia'."; return 1
-  fi
-  status "installing NVIDIA driver $DRIVER_MIN from NVIDIA's CUDA repository (one reboot follows)"
   nvidia_repo || { status "STOPPED: could not add NVIDIA's apt repository (see $LOG)"; return 1; }
-  # the branch package names NVIDIA publishes for Ubuntu; the first that exists wins
+  local cand; cand="$(apt-cache policy nvidia-open 2>/dev/null | sed -n 's/.*Candidate: //p' | head -1)"
+  # the loop guard keys on the VERSION installed: the same driver installed and still not loaded means a reboot did not help
+  if [ -f "$sentinel" ] && [ "$(cat "$sentinel")" = "${cand:-?}" ]; then
+    status "STOPPED: nvidia-open $cand was installed and the driver is still '${maj:-absent}'. Not rebooting again; check $LOG and 'apt list --installed | grep nvidia'."; return 1
+  fi
+  status "installing NVIDIA's newest driver (nvidia-open ${cand:-?}) from NVIDIA's CUDA repository (one reboot follows)"
   local pkg ok=0
-  for pkg in "nvidia-driver-$DRIVER_MIN-open" "nvidia-open-$DRIVER_MIN" "nvidia-driver-$DRIVER_MIN" "cuda-drivers-$DRIVER_MIN"; do
+  for pkg in nvidia-open cuda-drivers; do
     if apt-cache show "$pkg" >/dev/null 2>&1; then
       log "apt-get install $pkg"
       if apt_i "$pkg"; then ok=1; break; fi
     fi
   done
-  [ "$ok" = 1 ] || { status "STOPPED: no installable driver $DRIVER_MIN package found (see $LOG)"; return 1; }
-  mkdir -p "$SENTINEL_DIR"; date -u +%FT%TZ > "$sentinel"
+  [ "$ok" = 1 ] || { status "STOPPED: no installable NVIDIA driver package found (see $LOG)"; return 1; }
+  mkdir -p "$SENTINEL_DIR"; echo "${cand:-?}" > "$sentinel"
   if [ "$MODE" = "--ensure" ]; then
-    status "driver $DRIVER_MIN installed; reboot once (sudo reboot), then run this script again with --ensure"; return 1
+    status "nvidia-open ${cand:-?} installed; restart once (podctl restart), then run this script again with --ensure"; return 1
   fi
-  status "driver $DRIVER_MIN installed; rebooting once. Reconnect in about two minutes and tail $LOG"
+  status "nvidia-open ${cand:-?} installed; rebooting once. Reconnect in about two minutes and tail $LOG"
   sleep 3; reboot
   exit 0
 }
@@ -150,11 +151,11 @@ driver_gate(){
 toolchain_gate(){
   export PATH="/usr/local/cuda/bin:$PATH"
   if command -v nvcc >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1; then log "CUDA toolchain: $(nvcc --version | grep -o 'release [0-9.]*'), $(g++ --version | head -1)"; return 0; fi
-  status "installing build-essential and the CUDA 13 toolkit (nvcc, cuBLAS headers); about 3 GB, 5 to 10 minutes"
+  status "installing build-essential and NVIDIA's newest CUDA toolkit (nvcc, cuBLAS headers); about 3 GB, 5 to 10 minutes"
   nvidia_repo || { status "STOPPED: could not add NVIDIA's apt repository (see $LOG)"; return 1; }
   apt_i build-essential || { status "STOPPED: apt could not install build-essential (see $LOG)"; return 1; }
   local pkg ok=0
-  for pkg in cuda-toolkit-13-0 cuda-toolkit-13 cuda-toolkit; do
+  for pkg in cuda-toolkit cuda-toolkit-13; do                    # the newest-tracking metapackage first
     if apt-cache show "$pkg" >/dev/null 2>&1; then log "apt-get install $pkg"; if apt_i "$pkg"; then ok=1; break; fi; fi
   done
   [ "$ok" = 1 ] && command -v nvcc >/dev/null 2>&1 || { status "STOPPED: no CUDA toolkit package installed (see $LOG); SageAttention cannot build without nvcc"; return 1; }

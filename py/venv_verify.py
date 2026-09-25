@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify a freshly built venv from the inside. Prints one fact line, then every problem; exit 1 on any.
 
-Run as: VENV=... BASE_PERSIST_ROOT=/workspace BASE_WANT_PY=3.14 BASE_WANT_SM=sm_120 BASE_EXTRA_IMPORTS="a b" $PY venv_verify.py
+Run as: VENV=... BASE_PERSIST_ROOT=/workspace BASE_WANT_PY=3.14 BASE_WANT_BACKEND=cu132 BASE_WANT_SM=sm_120 BASE_EXTRA_IMPORTS="a b" $PY venv_verify.py
 
 A non-zero exit fires the automatic rollback, and that rollback is what leaves the pod BOOTABLE instead
 of bricked. So the persistence closure is fatal here, not a warning: the base interpreter, the pyvenv.cfg
@@ -16,6 +16,7 @@ venv = os.environ["VENV"]
 vol = os.path.realpath(os.environ["BASE_PERSIST_ROOT"]) if os.environ.get("BASE_PERSIST_ROOT") else ""
 want_py = os.environ.get("BASE_WANT_PY") or ""
 want_sm = os.environ.get("BASE_WANT_SM") or ""
+want_backend = os.environ.get("BASE_WANT_BACKEND") or ""
 extra = (os.environ.get("BASE_EXTRA_IMPORTS") or "").split()
 t0 = time.time()
 import torch  # noqa: E402
@@ -26,8 +27,11 @@ archs = torch.cuda.get_arch_list()
 have_py = "%d.%d" % sys.version_info[:2]
 if want_py and have_py != want_py:
     probs.append("python is %s, not %s" % (sys.version.split()[0], want_py))
-if not cu.startswith("13"):
-    probs.append("torch CUDA %s is not 13.x" % cu)
+have_backend = "cu" + cu.replace(".", "") if cu != "none" else "cpu"
+if want_backend and have_backend != want_backend:
+    probs.append("torch is built for %s, not the picked %s" % (have_backend, want_backend))
+elif not want_backend and cu == "none":
+    probs.append("torch has no CUDA build")
 if want_sm and want_sm not in archs:
     probs.append("%s not in torch arch list" % want_sm)
 if not torch.cuda.is_available():

@@ -22,7 +22,7 @@ exists beside the repository passes at step 2 and fails on the pod ten minutes a
 same command on every push and pull request.
 
 You need `uv` on PATH. A fresh clone has no venv, so the suite reaches pytest through
-`uv run --no-project --python 3.12 --with pytest`; without `uv` it reports "no pytest and no uv" and exits 1.
+`uv run --no-project --python <the newest uv has> --with pytest`; without `uv` it reports "no pytest and no uv" and exits 1.
 
 ## Tests
 

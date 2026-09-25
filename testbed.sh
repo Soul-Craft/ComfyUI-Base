@@ -5,7 +5,10 @@
 #
 #      bash testbed.sh            # provision/update source only  (fast, ~500 MB)
 #      bash testbed.sh --server   # also build a CPU venv and start ComfyUI
-#      bash testbed.sh --latest   # packs at their remotes' HEAD instead of the pinned commits
+#      COMFY_REF=master bash testbed.sh --server   # ComfyUI at a ref NEWER than the newest release (default: the newest release)
+#  3.0.0: always the newest. ComfyUI at its newest release, every pack at its remote's HEAD, the newest Python uv
+#  provides, torch upgraded, and every requirement installed from one pin-free set (py/reqlift.py), so ComfyUI's
+#  own == pins (its frontend packages) never hold anything below its newest. --latest is accepted and changes nothing.
 #      bash testbed.sh --stop     # stop the server
 #      bash testbed.sh --status   # what is here and what is running
 #
@@ -47,10 +50,11 @@ PORT="${TESTBED_PORT:-8199}"
 LOG="$HERE/.testbed-server.log"
 PIDF="$HERE/.testbed-server.pid"
 PORTF="$HERE/.testbed-server.port"   # the port a running server took; read by the base's runner and verify.sh (base 2.2.0)
-COMFY_TAG="${COMFY_TAG:-}"          # empty = newest release tag
+COMFY_REF="${COMFY_REF:-}"          # empty = the newest release tag; else a branch, a newer tag or a full commit (3.0.0: COMFY_TAG is retired)
 # The base is either this script's own directory (testbed.sh ships in the ComfyUI Base repository) or a
 # comfyui-base/ beside it (a brand repository keeps the base as a submodule at base/comfyui-base).
 if [ -f "$HERE/base.sh" ]; then BASE_SH="$HERE/base.sh"; else BASE_SH="$HERE/comfyui-base/base.sh"; fi
+REQLIFT="$(dirname "$BASE_SH")/py/reqlift.py"
 LATEST=0
 
 GREEN='\033[0;32m'; YEL='\033[1;33m'; CYA='\033[0;36m'; NC='\033[0m'
@@ -132,12 +136,26 @@ _latest_tag() {
 
 provision_source() {
   hdr "SOURCE"
-  local tag="${COMFY_TAG:-$(_latest_tag)}"
+  local tag; tag="$(_latest_tag)"
   [ -n "$tag" ] || { warn "could not reach github to read ComfyUI's tags"; return 1; }
-  if [ -d "$COMFY/.git" ]; then
+  if [ -n "${COMFY_TAG:-}" ]; then note "COMFY_TAG is retired (3.0.0): the newest release, or COMFY_REF for something newer"; fi
+  if [ -n "$COMFY_REF" ]; then                        # a ref newer than the release: fetched and checked out detached
+    if [ ! -d "$COMFY/.git" ]; then
+      note "cloning ComfyUI at $COMFY_REF …"
+      git clone -q --depth 1 --branch "$COMFY_REF" https://github.com/comfyanonymous/ComfyUI "$COMFY" \
+        || { git init -q "$COMFY" && git -C "$COMFY" remote add origin https://github.com/comfyanonymous/ComfyUI \
+             && git -C "$COMFY" fetch -q --depth 1 origin "$COMFY_REF" && git -C "$COMFY" checkout -q --detach FETCH_HEAD; } \
+        || { warn "could not clone ComfyUI at $COMFY_REF"; return 1; }
+    elif git -C "$COMFY" fetch -q --depth 1 origin "$COMFY_REF" 2>/dev/null; then
+      git -C "$COMFY" checkout -q --detach FETCH_HEAD
+    else
+      warn "could not fetch ComfyUI $COMFY_REF; the tree is left as it was"
+    fi
+    ok "ComfyUI → $COMFY_REF ($(git -C "$COMFY" rev-parse --short HEAD)); the newest release is $tag"
+  elif [ -d "$COMFY/.git" ]; then
     git -C "$COMFY" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag" >/dev/null 2>&1 || true
     git -C "$COMFY" checkout -q "$tag" 2>/dev/null || true
-    ok "ComfyUI already here → $tag"
+    ok "ComfyUI → $tag (the newest release)"
   else
     note "cloning ComfyUI $tag …"
     git clone -q --depth 1 --branch "$tag" https://github.com/comfyanonymous/ComfyUI "$COMFY"
@@ -150,15 +168,10 @@ provision_source() {
     if [ ! -d "$CN/$dir/.git" ]; then
       if git clone -q --depth 1 "$url" "$CN/$dir" 2>/dev/null; then ok "$dir (cloned)"; else warn "$dir — clone failed ($url)"; continue; fi
     fi
-    if [ -n "$sha" ] && [ "$LATEST" != "1" ]; then
-      # what the pod installs: the pinned commit. --depth 1 clones need the object fetched first.
-      if ! git -C "$CN/$dir" cat-file -e "$sha^{commit}" 2>/dev/null; then
-        git -C "$CN/$dir" fetch -q --depth 1 origin "$sha" >/dev/null 2>&1 || git -C "$CN/$dir" fetch -q --tags --force origin >/dev/null 2>&1 || true
-      fi
-      if git -C "$CN/$dir" checkout -q --detach "$sha" 2>/dev/null; then ok "$dir @ ${sha:0:12} (pinned)"; else warn "$dir — pinned commit ${sha:0:12} unreachable"; fi
-    else
-      git -C "$CN/$dir" pull -q --ff-only >/dev/null 2>&1 && ok "$dir (HEAD)" || note "$dir (kept — detached or not fast-forwardable)"
-    fi
+    # 3.0.0: what the machines install, the remote's HEAD (the row's sha is only the last-tested record)
+    if git -C "$CN/$dir" fetch -q --depth 1 origin HEAD >/dev/null 2>&1 && git -C "$CN/$dir" checkout -q --detach FETCH_HEAD 2>/dev/null; then
+      ok "$dir @ $(git -C "$CN/$dir" rev-parse --short HEAD) (HEAD)"
+    else warn "$dir: could not move to its remote's HEAD"; fi
   done
   # Packages' own vendored packs (no git URL; the pod copies them from the package, the testbed links them
   # so an edit is live on the next server restart). Keep this list in step with each package's VENDORED_PACKS.
@@ -177,21 +190,43 @@ provision_source() {
 provision_server() {
   hdr "VENV + SERVER (CPU)"
   command -v uv >/dev/null || { warn "uv is not installed — needed to build the venv"; return 1; }
+  local mm have
+  mm="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV | head -1)"
+  have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  if [ -x "$VENV/bin/python" ] && [ -n "$mm" ] && [ "$have" != "$mm" ]; then note "the venv is Python $have, the newest is $mm: rebuilding it"; rm -rf "$VENV"; fi
   if [ ! -x "$VENV/bin/python" ]; then
-    note "creating a Python 3.12 venv …"
-    uv venv --python 3.12 "$VENV" >/dev/null
+    note "creating a Python ${mm:-3} venv …"
+    uv venv --python "${mm:-3}" "$VENV" >/dev/null
   fi
-  note "installing torch (CPU) + ComfyUI requirements — this is the slow part …"
-  uv pip install -q --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
-  uv pip install -q --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest >/dev/null   # pytest: the suites run under this venv so they can import ComfyUI
-  # pack requirements, best effort: several are CUDA-only and will not resolve here
-  local row dir
+  uv python upgrade "${mm:-}" >/dev/null 2>&1 || true
+  note "installing torch (CPU) + every requirement at its newest: this is the slow part …"
+  uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
+  # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
+  local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$HERE/.testbed-derived.txt"
   for row in "${PACKS[@]}"; do
     dir="${row%%|*}"
-    [ -f "$CN/$dir/requirements.txt" ] || continue
-    uv pip install -q --python "$VENV/bin/python" -r "$CN/$dir/requirements.txt" >/dev/null 2>&1 \
-      && ok "reqs: $dir" || warn "reqs: $dir — some deps do not resolve on this host (expected for CUDA-only packs)"
+    [ -f "$CN/$dir/requirements.txt" ] && files+=("$dir=$CN/$dir/requirements.txt")
   done
+  if [ -f "$REQLIFT" ] && uv run --no-project --quiet --with packaging python "$REQLIFT" --out "$derived" --map "$derived.map" "${files[@]}" >/dev/null; then
+    if uv pip install -q --upgrade --python "$VENV/bin/python" --index-strategy unsafe-best-match -r "$derived" pytest >/dev/null 2>&1; then
+      ok "every requirement at its newest ($(grep -c . "$derived") lines, one resolve)"
+    else
+      # best effort on a Mac: several packs are CUDA-only and will not resolve here; install what does, pack by pack
+      warn "the full set does not resolve on this host (expected for CUDA-only packs): installing it pack by pack"
+      uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest >/dev/null 2>&1 || true
+      local f
+      for f in "${files[@]}"; do
+        uv run --no-project --quiet --with packaging python "$REQLIFT" --out "$derived.one" --map /dev/null "$f" >/dev/null 2>&1 || continue
+        uv pip install -q --upgrade --python "$VENV/bin/python" --index-strategy unsafe-best-match -r "$derived.one" >/dev/null 2>&1 \
+          && ok "reqs: ${f%%=*}" || warn "reqs: ${f%%=*}: some deps do not resolve on this host (expected for CUDA-only packs)"
+      done
+      rm -f "$derived.one"
+    fi
+  else
+    warn "no reqlift beside the base: installing ComfyUI's requirements as written (its == pins hold the frontend back)"
+    uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest >/dev/null
+  fi
+  "$VENV/bin/python" -c 'import importlib.metadata as m; print("  frontend " + m.version("comfyui-frontend-package"))' 2>/dev/null || true
   stop_server
   note "starting ComfyUI --cpu on port $PORT …"
   ( cd "$COMFY" && nohup "$VENV/bin/python" main.py --cpu --port "$PORT" --disable-auto-launch \

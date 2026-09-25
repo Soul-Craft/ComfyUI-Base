@@ -1,10 +1,10 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["playwright==1.62.0"]
+# dependencies = ["playwright"]
 # ///
 """What does the REAL frontend queue? Dump app.graphToPrompt() for declared radio states.
 
-    uv run "base/comfyui-base/_build/canvas/probe.py" --pkg "<package dir>" [--states <json>] [--out <dir>]
+    uv run --upgrade "base/comfyui-base/_build/canvas/probe.py" --pkg "<package dir>" [--states <json>] [--out <dir>]
 
 Loads the package's workflow into the testbed's ComfyUI page and writes prompt-<state>.json for each state in
 <pkg>/_build/snapshots/probe/states.json, so a suite's emulation of bypass/mute can be diffed against the
@@ -22,7 +22,7 @@ from pathlib import Path
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parents[1] / "py"))
-from snapshot import need_server, route_settings          # noqa: E402
+from snapshot import need_server, route_settings, ensure_browser          # noqa: E402
 from canvas import load_spec                                # noqa: E402
 
 from snapshot import JS_LOAD                             # noqa: E402 — one loader, and it clears extra.linearMode
@@ -58,6 +58,7 @@ def main():
     states = json.loads(Path(states_path).read_text(encoding="utf-8")) if states_path.exists() else {"default": {}}
     wf = json.loads(Path(wf_path).read_text(encoding="utf-8"))
     need_server(a.server, wf, set(spec.cuda_only))
+    ensure_browser()                                   # 3.0.0: the browser for this (newest) Playwright
     with sync_playwright() as p:
         b = p.chromium.launch(headless=True); page = b.new_page(); route_settings(page)
         page.goto(f"http://{a.server}/", wait_until="load")

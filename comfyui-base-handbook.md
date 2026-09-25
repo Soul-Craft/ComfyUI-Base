@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.12.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.0.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -13,19 +13,28 @@ run once per machine as **step one**; then each workflow package is **step two**
    A package declares its workflow, its models, its extra packs and its own steps (hooks), nothing more.
 2. **One canonical ComfyUI tree on the volume, one venv beside it, one stamp.** The tree is the one recorded in
    `state/boot.env`, else an existing volume tree (`/workspace/runpod-slim/ComfyUI`, `/workspace/ComfyUI`,
-   `/workspace/*/ComfyUI`), else the base materialises `/workspace/ComfyUI` from GitHub at the newest release tag —
+   `/workspace/*/ComfyUI`), else the base materialises `/workspace/ComfyUI` from GitHub at the newest release tag (or a
+   newer `COMFY_REF`)  - 
    beside whatever `models/ user/ output/ input/ custom_nodes/` an image already keeps there. The container disk
    (`/ComfyUI`, `/opt/ComfyUI`, `$HOME/ComfyUI`) is never adopted and never scanned: it is restored from the image at
-   every start. The venv is `$COMFY/.venv-cu130`, stamped `.comfy-base-venv` (Python, torch, base, the package that
-   last stamped it); an unstamped venv that passes the probe is adopted and stamped; a rebuild happens at the same
+   every start. The venv is `$COMFY/.venv-cu130` (a name kept for every existing volume; its CUDA build is whatever
+   §0.3 picks), stamped `.comfy-base-venv` (Python, torch, backend, base, the package that last stamped it); an unstamped venv that passes the probe is adopted and stamped; a rebuild happens at the same
    path with a backup and automatic rollback. A second tree on the volume is reported (`other tree`), its models are
    consolidated into the canonical one, nothing is deleted.
-3. **Genuine latest, no fallbacks.** Python is the newest CPython minor whose `uv pip compile` resolves ComfyUI's
-   requirements plus every pack present in the tree (with the cu130 index); torch is the newest `+cu130` wheel for
-   it; ComfyUI is its newest `v*` release tag on branch `comfy-base-stable`. A pick that cannot be made stops the
-   run. A venv behind the pick is rebuilt — about ten minutes with wheels cached on the volume. Packs are pinned;
-   `--latest` moves them to their remotes' HEAD and prints the rows to paste back (latest, then tested, then saved:
-   the pins equal the last green run).
+3. **Always the newest, for everything the base installs (3.0.0), and no fallbacks.** Every run, on every host:
+   ComfyUI is its newest `vX.Y.Z` release on branch `comfy-base-stable` (`COMFY_REF` may name something NEWER, such as
+   master, for one run; an older ref is refused). Every node pack, declared or not, is at its remote's HEAD, never
+   moved backwards (local edits stashed by name first). Every Python package is at its newest: ComfyUI's and every
+   pack's requirement files are never installed as written, because their `==` pins would put packages back down;
+   `py/reqlift.py` merges them into one set with every hold lifted, uv resolves it, and whatever another package's
+   cap still holds back is forced to its newest with uv's overrides. A pack whose own newest code cannot import with
+   a newest dependency is named ("needs upgrading upstream") and the install goes on; ComfyUI's own startup failing is
+   the one thing rolled back (only the packages that run changed). torch is the newest release on the newest CUDA
+   build the machine's driver runs (`uv --torch-backend=auto`), never moved backwards on a shared venv. Python is the
+   newest CPython minor that resolves that set, its newest patch. uv, JupyterLab, SageAttention (rebuilt when main
+   moves), comfy-cli, pytest and huggingface_hub are upgraded every run. The OS packages and the NVIDIA driver
+   (NVIDIA's `nvidia-open`) are upgraded first (§0.15). A pick that cannot be made stops the run. A pack row's sha is
+   the last-tested record, printed every run and written back by `podctl` after a green install; never a target.
 4. **Everything the venv boots from lives on the volume, and the boot cannot brick the machine.**
    `UV_PYTHON_INSTALL_DIR=<volume>/comfy-base/python`, `UV_MANAGED_PYTHON=1`; the probe is HARD on an interpreter
    written to the container disk, so a poisoned venv is never reused. `boot.sh` starts sshd first and never exits,
@@ -49,8 +58,8 @@ run once per machine as **step one**; then each workflow package is **step two**
    function boot.sh uses (`lib/85-launch.sh`).
 8. **One deletion prompt, default No.** Duplicates, superseded files (only inside the package's own family
    folders) and partials, never a file another installed package claims (the ledger). `BASE_YES=1` approves.
-9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, pypi.org, pypi.nvidia.com and
-   download.pytorch.org; a `MODELS` row may name no other host. Nothing is uploaded. `--disable-api-nodes` is
+9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, pypi.org, pypi.nvidia.com,
+   download.pytorch.org, the distribution's apt mirrors and developer.download.nvidia.com (NVIDIA's CUDA repository); a `MODELS` row may name no other host. Nothing is uploaded. `--disable-api-nodes` is
    launch-arg hygiene. Tokens come from the shell env, else the machine's own environment (PID 1's: `HF_TOKEN` or its
    aliases `HUGGING_FACE_HUB_TOKEN` / `HF_HUB_TOKEN`), else `state/tokens.env` (0600), else one prompt. Template
    placeholders (`token_here`, `replace_with_ids`…) are named and ignored; a token its service rejects fails the run
@@ -76,13 +85,12 @@ run once per machine as **step one**; then each workflow package is **step two**
     pod on the volume — `podctl deploy --like <pod> --wait`, a NEW pod cloned onto the same volume (image, GPU type,
     disk, ports, env, the base's boot as its start command; the volume's datacenter; never a templateId) that lands
     wherever the datacenter has the GPU free — else the host's support with the machine id.
-12. **A pinned, unattended machine is a mode, not a fork** (2.1.0). A baked image may set `BASE_PINNED=1` and
-    `BASE_NONINTERACTIVE=1`: `base_update_comfyui` fetches and checks out nothing (`COMFY_TAG` is the image's),
-    `base_venv` takes the Python and torch from the seed's stamp and refuses to rebuild, `--latest` is refused, every
-    prompt takes its default. Such an image is the base built at the volume's own paths by a project's image generator
-    (`BASE_SEED=1`: toolchain and packs, no models) and parked on the container disk; a boot extension (`ext/`, §9)
-    copies it onto an empty volume once. The base ships neither the generator nor the extension: what is specific to a
-    project lives in that project's repository. Nothing about rules 1 to 11 changes on an unpinned machine.
+12. **An unattended machine is a mode, not a fork; nothing is ever frozen** (2.1.0, 3.0.0). `BASE_NONINTERACTIVE=1`
+    makes every prompt take its default. A baked image may carry the base built at the volume's own paths by a
+    project's image generator (`BASE_SEED=1`: toolchain and packs, no models), parked on the container disk; a boot
+    extension (`ext/`, §9) copies it onto an empty volume once, and the first install then takes everything to its
+    newest like any machine. 3.0.0 retired the frozen mode (`BASE_PINNED`) and `COMFY_TAG`: they held a machine below
+    its newest, which §0.3 forbids. The base ships neither the generator nor the extension.
 13. **The model library may be SHARED by several machines** (2.4.0). `BASE_LIBRARY` names a store that more than
     one machine mounts at once, and with it set `models/` and ComfyUI's `output/` and `input/` live there instead of
     on the machine's own volume: a model is downloaded once for all of them rather than once each, and a file one
@@ -103,6 +111,21 @@ run once per machine as **step one**; then each workflow package is **step two**
     and scratch are per machine and two servers writing one `user/` tread on each other; and an install takes a
     lock on the store, because pip and uv write a venv in place and neither expects a second writer. RUNNING takes
     no lock at all, which is what makes several GPUs on one store safe: running only reads.
+15. **The OS and the NVIDIA driver are at their newest too, and the base never reboots a machine itself** (3.0.0).
+    The first stage of every run (`lib/15-system.sh`, before the store's lock and before the driver gate): `apt-get
+    full-upgrade`, non-interactive, config files kept, needrestart told only to list (Ubuntu 24.04 would otherwise
+    restart the boot unit mid-install). The driver is NVIDIA's own newest-tracking `nvidia-open` with `cuda-toolkit`,
+    from NVIDIA's CUDA repository (added from its newest `cuda-keyring` when missing). A machine on another family
+    (Verda's images ship Ubuntu's `nvidia-driver-580-server-open`) switches once, in ONE apt transaction that purges
+    the old family's packages and prebuilt kernel modules, after stopping the boot unit (that machine's renders end
+    there, as on any install's restart). After any kernel or driver install the nvidia module must exist for the newest
+    kernel, or the run fails and advises no restart. A driver that changed stops the run before anything uses the GPU:
+    "restart required: A -> B", and `podctl` prints the restart a person approves (Verda forbids an in-guest reboot).
+    RunPod upgrades the container's packages only (the driver is the host's; `libnvidia-*` and `cuda-compat*` held). A
+    host the base cannot upgrade (not apt, no root and no passwordless sudo) is warned about and the run goes on. A new
+    Ubuntu release comes from deploying the provider's newest image, never an in-place release upgrade. Each machine
+    writes `state/machines/<host>.env` (driver, CUDA, kernel) to the store, so an install that moves the shared venv
+    to a new CUDA major names the machines that must run their own install before they render.
 ## 1. Hosts
 
 The core of the base (`lib/`, `py/`, `suite/`) runs on any NVIDIA GPU on any Linux with one persistent volume root.
@@ -145,10 +168,11 @@ holds the interface and a recipe.
 **The one command (2.0.14).** Once a pod is reachable (`podctl ensure`), the whole documented sequence is
 `uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. For each item in order,
 the local zip is checked current, the volume size is recorded for the disk gate, the zip is uploaded and extracted,
-`--check` runs on the pod (non-zero stops everything), the real run goes detached with `--latest` (`BASE_RESTART=1` for a
-package) and is polled until `STEP RC=`, the pod's `state/logs` are copied to `<item>/_build/podruns/<date>/pod-logs/`,
-the summary block is printed, and a green run saves the printed pin rows into the local script and rebuilds its zip
-("latest, then tested, then saved"). A red run stops with the console's path: the log is the deliverable, the fix loop
+`--check` runs on the pod (non-zero stops everything), the real run goes detached (`BASE_RESTART=1` for a package;
+`--comfy-ref <ref>` for a newer ComfyUI, that install only) and is polled until `STEP RC=`, the pod's `state/logs` are
+copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed, and a green run writes the pack records
+it printed (each pack's HEAD) into the local script and rebuilds its zip. A run that upgraded the NVIDIA driver stops with
+"restart required" and prints the `podctl restart` a person approves; the same install then continues. A red run stops with the console's path: the log is the deliverable, the fix loop
 starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888, and 9199 and 11434 beside them:
 the base runs no metrics exporter and no inference server, but a package may run one on the machine and reach
 it on loopback, which is the shape a package takes when its point is that nothing leaves the box) for the canvas tools and
@@ -224,33 +248,34 @@ directory of your choosing; the base binds loopback; `base_boot_install` writes 
 ```bash
 cd <volume>/packages
 python3 -m zipfile -e "comfyui-base.zip" .      # slim images have no unzip
-bash "comfyui-base/comfyui-base-script.sh" [--latest]
+bash "comfyui-base/comfyui-base-script.sh"
 ```
 
 The base's zip is `comfyui-base.zip`, one artefact for every host. The script copies itself to `<volume>/comfy-base/`
 and re-executes from there, then: resolves the host (§1), refuses a volume root that is not a mountpoint (unless
-`BASE_VOLUME_KIND=dir`), finds or materialises the canonical tree (§0.2), reads the tokens (§0.9), moves ComfyUI to
-its newest tag, gates on the version floor, pins the six shared packs (rgthree, KJNodes, VideoHelperSuite,
-cg-use-everywhere, ComfyUI-Manager, ComfyUI-advanced-model-manager), builds or adopts the venv with every present
-pack's requirements, sets the launch-arg hygiene, installs `boot.sh` + the boot unit on a VM host + the tools venv
+`BASE_VOLUME_KIND=dir`), upgrades the OS and the NVIDIA driver (§0.15), finds or materialises the canonical tree
+(§0.2), reads the tokens (§0.9), moves ComfyUI to its newest release, gates on the version floor, moves the six shared
+packs (rgthree, KJNodes, VideoHelperSuite, cg-use-everywhere, ComfyUI-Manager, ComfyUI-advanced-model-manager) to their
+HEAD, builds or adopts the venv with every present pack's requirements at their newest (§0.3), sets the launch-arg hygiene, installs `boot.sh` + the boot unit on a VM host + the tools venv
 (JupyterLab) + `state/boot.env`, writes its ledger entry, and prints the launch line. `--check` is the dry run (on a
 volume with no tree it stops after "would materialise"). `bash base.sh status` lists every package installed on the
 machine and, when the driver wrote one, prints `state/host.env`.
 
 On a machine from a baked image step one has already happened inside the image: a boot extension (`ext/*.sh`, §9)
 copies the seed onto the empty volume on the first boot, and the project's packages install themselves from their
-zips with `BASE_YES=1 BASE_NONINTERACTIVE=1 BASE_PINNED=1 BASE_NO_SUITE=1`. The base ships no such extension.
+zips with `BASE_YES=1 BASE_NONINTERACTIVE=1 BASE_NO_SUITE=1`, taking everything to its newest. The base ships no such
+extension.
 
 ## 3. Step two: a workflow package
 
 ```bash
-cd <volume>/packages && mkdir -p "<name>" && python3 -m zipfile -e "<name>-<host>.zip" "<name>" && BASE_RESTART=1 bash "<name>/<name>-script.sh" [--latest]
+cd <volume>/packages && mkdir -p "<name>" && python3 -m zipfile -e "<name>-<host>.zip" "<name>" && BASE_RESTART=1 bash "<name>/<name>-script.sh"
 ```
 
 A package zip is `<name>-<host>.zip`, the host being its brand's `brand.toml` (§4; `runpod` for a package with no
 brand above it). It is flat and extracts into its own folder (`podctl install` does this): two packages both ship
 `suite.py` and `pytest.ini`, and flat extraction let the second overwrite the first's (2.0.17).
-Same six forms everywhere: install · `--check` · `--latest` (packs to remote HEAD, prints the rows to paste back) ·
+Same six forms everywhere: install · `--check` · `--latest` (3.0.0: the same as a plain install; kept for old callers) ·
 `test [tier]` · `rescue` · `help`, plus the package's own `PKG_COMMANDS`. `BASE_RESTART=1` makes the summary's smoke,
 combos and suite run against the server this run installed.
 
@@ -279,8 +304,9 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`, and `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
   something (SageAttention) is listed for re-run after any venv rebuild.
-- `PACKS` rows: `dir|url|sha|cnr_id|why` — `sha` is 40 hex; a base pack may not be redeclared; two packages pinning
-  one pack to two commits is an error naming both.
+- `PACKS` rows: `dir|url|sha|cnr_id|why`: `sha` is 40 hex, the last-tested record (every run takes the pack to its
+  remote's HEAD); a base pack may not be redeclared; two packages naming one pack from two URLs is an error naming
+  both, and two different records for one pack is a note.
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
   fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
@@ -289,7 +315,7 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 - The workflow beside the script must carry `extra.<WF_VERSION_KEY> == PKG_VERSION`; the run refuses a mismatch.
 - Helpers a hook may use: `ok miss err note warn hdr would todo`, `base_mkdir`, `base_run` (dry-run aware),
   `_base_yaml_register <section> <key> <path>`, `base_build_sageattention` (SageAttention 2 from source for this GPU's sm,
-  dry-run aware; `SAGE_WHEEL` / `SAGE_REF` override; 2.0.22), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
+  dry-run aware; `SAGE_REF` names a branch or tag, default main; rebuilt whenever its full cache key moves; 2.0.22, 3.0.0), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
   A hook that changed something the running server must reload appends its reason to `PKG_RESTART_WHY` (an array);
   the run's restart hand-off then restarts the server (`BASE_RESTART=1`) or prints the launch line with those reasons,
   never a green summary on a stale server.
@@ -307,14 +333,18 @@ Since 2.6.0 the testbed lives in **two possible places**, checked in this order:
 is taken whole — the port file is read from the same root that supplied the tree, never from the other one. Before
 2.6.0 only the second existed, so a clone of this repository on its own could never run the `comfyui` tier; it skipped
 by name forever, which is a poor thing to hand someone who forked the repository to work on it. `bash testbed.sh
---server` provisions an upstream ComfyUI at its newest release tag plus the base's own pinned packs (derived from
-`list-packs`, never hand-listed) and starts it on CPU. It is several GB and gitignored.
+--server` provisions an upstream ComfyUI at its newest release tag (or `COMFY_REF`) plus the base's own packs at their
+HEAD (derived from `list-packs`, never hand-listed), every requirement at its newest through `py/reqlift.py`, on the
+newest Python, and starts it on CPU. It is several GB and gitignored.
 
 ## 5. Pipeline (install)
 
-init (env · log · volume check · discover, or materialise the tree · declarations + `BASE_MIN` gate · banner + driver
-gate) → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate → consolidate
-strays (the volume only) → packs git → `pkg_pre_venv` → venv → `pkg_post_venv` → packs pip → `pkg_pre_models` →
+init (env · log · volume check · discover, or materialise the tree · declarations + `BASE_MIN` gate · banner) → system
+(the OS and the NVIDIA driver at their newest; a new driver stops here with "restart required") → driver gate → the
+store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
+consolidate strays (the volume only) → packs git (every pack to its HEAD) → the venv snapshot → `pkg_pre_venv` → venv →
+`pkg_post_venv` → packs pip (the derived, pin-free set) → Comfy MCP → newest (every package still behind forced to its
+newest) → `pkg_pre_models` →
 models (one index over the volume; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
@@ -379,7 +409,7 @@ over), `bare` (the shell sources without a machine).
 
 ```bash
 cd base/comfyui-base && bash base.sh test                                                        # every tier
-uv run --no-project --python 3.12 --with pytest python base/comfyui-base/_build/rehearse.py <brand>/packages/<name> --layout official|community|bare|volume
+uv run --no-project --with pytest python base/comfyui-base/_build/rehearse.py <brand>/packages/<name> --layout official|community|bare|volume
 bash base/comfyui-base/_build/verify.sh [<brand>/packages/<name>...]                            # zip current, suite from the repo, suite from the zip
 ```
 
@@ -466,6 +496,26 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.0.0: always the newest, for everything the base installs, on every run and every host (§0.3). ComfyUI stays on its
+  newest release, with `COMFY_REF` (`podctl install --comfy-ref`) as the opt-in for something newer; a pack is at its
+  remote's HEAD on every run (a row's sha is the last-tested record); every Python package is at its newest through
+  `py/reqlift.py` and uv's overrides (measured on 2026-09-25: ComfyUI v0.37.2 plus 27 pack requirement files resolve on
+  Python 3.14, the frontend lifted from 1.52.7 to 1.54.7, protobuf forced from 5.29.6 to 7.36.2 past a cap that
+  `google-generativeai` 0.8.6 still imports under); torch follows the newest CUDA build the driver runs through uv's
+  `--torch-backend=auto`; the OS and the NVIDIA driver (NVIDIA's `nvidia-open`, a one-time switch from another family in
+  a single transaction) are upgraded first, and a new driver stops the run before the GPU is used, asking for a restart a
+  person approves. The Verda startup script registered on an account is replaced when it differs (`ensure`) and never
+  attached when stale. RETIRED, each because it held something below its newest: `BASE_PINNED`, `COMFY_TAG`,
+  `BASE_LATEST` (`--latest` is a plain run), `SAGE_WHEEL`, a 40-hex `SAGE_REF`, `BASE_FORCE_SELF`, `podctl --no-latest`.
+  A baked-image consumer that set `BASE_PINNED`/`COMFY_TAG` now gets a machine that upgrades at its first install.
+  `podctl install` no longer rewrites a shared-root machine's `host.env` as a library machine (it read an attached
+  shared volume as a library and dropped `BASE_VOLUME_SHARED=1`): the Verda provider asks the machine what `/workspace` is.
+  The rehearsal's fake machine now runs the package's own `COMFY_MIN` (it was always 0.34.7) and carries the package's
+  vendored node packs (it copied only top-level files), both measured by a consumer whose suite failed only there.
+  2.12.3's `_base_venv_reconcile` is superseded: nothing installs an upstream file one at a time any more (the overshoot
+  it repaired cannot happen in one resolve), and re-resolving `pip check` conflicts would undo a deliberate force; a
+  force its holder refuses at import (transformers with huggingface-hub 2.0.0) is taken back by `py/holders.py` instead.
 
 - 2.12.3: the venv's requirements are made to agree after every pip half, at their newest. On a Verda machine with a
   reused venv, `--latest` ended at the import check: `transformers` 5.17.0, the newest release, requires

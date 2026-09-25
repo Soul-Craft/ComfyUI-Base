@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Probe the venv this interpreter belongs to. Exit 0 = reusable, 1 = rebuild.
 
-Run as: BASE_WANT_PY=3.14 BASE_WANT_TORCH=2.14.0 BASE_WANT_SM=sm_XY BASE_PERSIST_ROOT=/workspace VENV=... $PY venv_probe.py
+Run as: BASE_WANT_PY=3.14 BASE_WANT_TORCH=2.14.0 BASE_WANT_BACKEND=cu132 BASE_WANT_SM=sm_XY BASE_PERSIST_ROOT=/workspace VENV=... $PY venv_probe.py
 
 HARD failures are the ones that would stop a render or mean this is not the venv the base maintains:
-python minor is not the pick, torch is missing or behind the pick, CUDA is not 13.x, the device's sm is
-missing, or the venv boots from a path a pod stop/start wipes. Everything else is a note.
+python minor is not the pick, torch is missing or behind the pick, torch's CUDA build is not the picked backend
+(3.0.0: uv's --torch-backend=auto, never backwards on a shared venv), the device's sm is missing, or the venv boots
+from a path a pod stop/start wipes. Everything else is a note.
 """
 import os
 import sys
@@ -14,6 +15,7 @@ hard, soft = [], []
 want_py = os.environ.get("BASE_WANT_PY") or ""
 want_torch = os.environ.get("BASE_WANT_TORCH") or ""
 want_sm = os.environ.get("BASE_WANT_SM") or ""
+want_backend = os.environ.get("BASE_WANT_BACKEND") or ""
 have_py = "%d.%d" % (sys.version_info[0], sys.version_info[1])
 if want_py and have_py != want_py:
     hard.append("python %s, want %s (newest that resolves)" % (have_py, want_py))
@@ -22,8 +24,9 @@ try:
 except Exception as e:  # noqa: BLE001
     print("    x torch does not import: %s" % e)
     sys.exit(1)
-if not (torch.version.cuda or "").startswith("13"):
-    hard.append("torch CUDA %s, want 13.x" % torch.version.cuda)
+have_backend = "cu" + (torch.version.cuda or "").replace(".", "") if torch.version.cuda else "cpu"
+if want_backend and have_backend != want_backend:
+    hard.append("torch is built for %s, the pick is %s" % (have_backend, want_backend))
 if want_sm:
     try:
         if want_sm not in torch.cuda.get_arch_list():
@@ -38,7 +41,7 @@ if want_torch and have_t != want_torch:
         except Exception:  # noqa: BLE001
             return (0,)
     if key(have_t) < key(want_torch):
-        hard.append("torch %s, newest on the cu130 index is %s" % (have_t, want_torch))
+        hard.append("torch %s, the newest for this Python on %s is %s" % (have_t, want_backend or "its backend", want_torch))
     else:
         soft.append("torch %s is ahead of the index pick %s" % (have_t, want_torch))
 tp = os.path.realpath(os.path.dirname(torch.__file__))

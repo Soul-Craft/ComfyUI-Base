@@ -21,13 +21,16 @@ Tests: `base/comfyui-base/suite/test_podctl.py` (unit tier) against a fake RunPo
 
 ## install — the one command (2.0.14)
 
-    uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<brand>/packages/<name>" [--pkg …] [--every 30] [--timeout 10800] [--no-latest] [--no-save-pins]
+    uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<brand>/packages/<name>" [--pkg …] [--every 30] [--timeout 10800] [--comfy-ref <ref>] [--no-save-pins]
 
 For each item in order: `package.py --check` locally (a stale zip stops before anything is uploaded), the volume size
-recorded for the disk gate, upload, extract, `--check` on the pod (non-zero stops), the real run detached with `--latest`
-(`BASE_RESTART=1` for a package), polled until `STEP RC=` (progress = the run's section headers), the pod's `state/logs`
-copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block printed. Green → the printed pin rows are saved into
-the local script and its zip rebuilt (commit both). Red → stop with the console's path. Exit 0 only when every item is green.
+recorded for the disk gate, upload, extract, `--check` on the pod (non-zero stops), the real run detached (3.0.0:
+everything to its newest; `BASE_RESTART=1` for a package; `COMFY_REF=<ref>` with `--comfy-ref`, that install only), polled
+until `STEP RC=` (progress = the run's section headers), the pod's `state/logs` copied to
+`<item>/_build/podruns/<date>/pod-logs/`, the summary block printed. Green → the pack records it printed (each pack's HEAD)
+are saved into the local script and its zip rebuilt (commit both). "restart required" (a new NVIDIA driver) → stop with
+the `podctl restart` to approve, then run the same install again. Red → stop with the console's path. Exit 0 only when
+every item is green. `--no-latest` is retired and refused.
 
 ## tunnel
 

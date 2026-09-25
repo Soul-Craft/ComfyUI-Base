@@ -1,12 +1,14 @@
-# 40-packs.sh — node packs: the shared six the base owns, the extras each package declares; locate, clone,
-# pin (or --latest), requirements under the torch constraint, an advisory import scan; strays consolidated.
+# 40-packs.sh: node packs: the shared six the base owns, the extras each package declares; locate, clone, move
+# every one to its remote HEAD (3.0.0: always the newest, never backwards), requirements into the venv, an advisory
+# import scan; strays consolidated.
 #
 # Row format (BASE_PACKS and every package's PACKS): dir|url|sha|cnr_id|why
 #   dir     the directory name under custom_nodes (also how the pack is located)
-#   sha     the 40-hex commit the suites were green against; --latest is the only way off it
+#   sha     the 40-hex LAST-TESTED RECORD: the commit a green run last measured. Printed on every run and written back
+#           by podctl after a green install; never a target. Every run moves the pack to its remote HEAD.
 #   cnr_id  the Comfy Registry id when it differs from dir (empty otherwise)
 
-# The packs most workflows share, pinned by the base. A package must not redeclare one of these.
+# The packs most workflows share, declared by the base. A package must not redeclare one of these.
 BASE_PACKS=(
  "rgthree-comfy|https://github.com/rgthree/rgthree-comfy|2c5342a8cb0eaecaabf61435a5f37dd594c510ba||switches, bypassers, any-switch, fast group bypassers/muters, radio panels, Power Lora Loader"
  "ComfyUI-KJNodes|https://github.com/kijai/ComfyUI-KJNodes|57105374f47d0fbb49c9c3926fb981702e0a4b5c|comfyui-kjnodes|SetNode/GetNode routing, resize, patches, video helpers"
@@ -15,8 +17,9 @@ BASE_PACKS=(
  "ComfyUI-Manager|https://github.com/Comfy-Org/ComfyUI-Manager|f82970b7cb63ad44928308f980a1d38fda103cbb|comfyui-manager|the node manager (hygiene sets its security level); RunPod's image bakes it, other images do not"
  "ComfyUI-advanced-model-manager|https://github.com/BISAM20/ComfyUI-advanced-model-manager|232997501a9ae6f9fa83f3594d16ca5341ecdbb2|comfyui-advanced-model-manager|the Hugging Face browser (2.1.0): Hub search and downloads into the library's folders via extra_model_paths.yaml, HF_TOKEN from the environment and sent to huggingface.co only (read once at this pin)"
 )
-# There is no image-owned pack list any more: the tree on the volume is the base's, so every pack in it is either
-# a declared row (pinned, updated) or a directory the base leaves alone. Their requirements all go into the venv.
+# There is no image-owned pack list any more: the tree on the volume is the base's. A declared row and an undeclared
+# git checkout both move to their remote HEAD; an undeclared directory with no git source is reported and left alone.
+# Their requirements all go into the venv.
 DEL_DIRS=()
 BASE_PACKS_LATEST_ROWS=()
 
@@ -49,22 +52,7 @@ _base_fake_clone(){ # BASE_NO_NET: the shape of a clone, no network
   local url="$1" dir="$2"
   mkdir -p "$dir/.git"; printf '[remote "origin"]\n\turl = %s\n' "$url" > "$dir/.git/config"; : > "$dir/requirements.txt"
 }
-_base_pack_pin(){ # <dir> <url> <sha> → "" on success, a reason on failure (stdout is the error channel)
-  # Packs are cloned --depth 1, so the pinned commit is usually not in the clone: ask the remote for that one
-  # object first, widen to a full fetch only if the server refuses single-commit fetches. Both reach the
-  # same commit, or this fails and the caller records it — never a different artifact.
-  local dir="$1" url="$2" sha="$3" rmt=""
-  rmt="$(_base_git_remote "$dir")" || true
-  if [ -z "$rmt" ]; then rmt=origin; _base_git -C "$dir" remote add origin "$url" >/dev/null 2>&1 || true; fi
-  if ! _base_git -C "$dir" cat-file -e "$sha^{commit}" >/dev/null 2>&1; then
-    _base_git -C "$dir" fetch -q --depth 1 "$rmt" "$sha" >/dev/null 2>&1 \
-      || _base_git -C "$dir" fetch -q --tags --force --prune "$rmt" >/dev/null 2>&1 || true
-  fi
-  if ! _base_git -C "$dir" cat-file -e "$sha^{commit}" >/dev/null 2>&1; then echo "commit $sha is not in $url"; return 0; fi
-  if ! _base_git -C "$dir" checkout -q --detach "$sha" >/dev/null 2>&1; then echo "could not check out $sha"; return 0; fi
-  echo ""
-}
-_base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could not move, nothing if it did (--latest)
+_base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could not move, nothing if it did (every run, 3.0.0)
   # Nothing here reads the repo's existing tracking config: baked clones sit on a branch with no upstream or
   # detached after `clone --branch <tag>`, so the remote, the branch and the upstream are re-established from
   # the canonical URL and the update is a fast-forward onto the branch the remote publishes as HEAD.
@@ -91,7 +79,43 @@ _base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could no
   fi
   [ -n "$fix" ] && note "$(basename "$dir"): $fix" >&2 || true
   _base_git -C "$dir" branch -q --set-upstream-to="$rmt/$br" "$br" >/dev/null 2>&1 || true
-  out="$(_base_git -C "$dir" merge -q --ff-only "$rmt/$br" 2>&1)" || { printf '%s\n' "$out"; return 0; }   # diverged: reported, never rewritten
+  # never backwards: a checkout already AHEAD of the remote's HEAD (a descendant of it) stays where it is
+  if _base_git -C "$dir" merge-base --is-ancestor "$rmt/$br" HEAD >/dev/null 2>&1; then return 0; fi
+  if ! out="$(_base_git -C "$dir" merge -q --ff-only "$rmt/$br" 2>&1)"; then
+    # diverged (local commits the remote does not have): the newest is the remote's HEAD. Detach there; the local
+    # branch keeps the local commits, so nothing is lost and nothing is rewritten.
+    if _base_git -C "$dir" checkout -q --detach "$rmt/$br" >/dev/null 2>&1; then
+      note "$(basename "$dir"): diverged from $rmt/$br: detached at the remote HEAD; the local commits stay on branch '$br'" >&2
+    else printf '%s\n' "$out"; fi
+  fi
+  return 0
+}
+_base_pack_move_aside(){ # <dir> → moves a pack directory aside under custom_nodes/comfy-base-aside.disabled, prints the new path
+  local d="$1" aside="$CN/comfy-base-aside.disabled" to   # ".disabled": ComfyUI skips it when it loads custom_nodes
+  mkdir -p "$aside" 2>/dev/null || return 1
+  to="$aside/$(basename "$d")-$(_base_ts)"
+  mv "$d" "$to" 2>/dev/null && printf '%s\n' "$to"
+}
+_base_pack_stash(){ # <dir> <name> → stashes local edits under a named, restorable entry; 0 on success
+  local d="$1" name="$2" ts; ts="$(_base_ts)"
+  if _base_git -C "$d" stash push -q -m "comfy-base $ts" >/dev/null 2>&1; then
+    note "$name: local edits stashed as 'comfy-base $ts' (restore: git -C \"$d\" stash pop), then moved to HEAD"
+    PACK_DIRTY+=("$name (stashed 'comfy-base $ts')"); return 0
+  fi
+  return 1
+}
+_base_pack_move(){ # <name> <dir> <url> → moves one git checkout to its remote HEAD; records the result
+  local name="$1" dir="$2" url="$3" before after out
+  if [ -n "$(_base_git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ] && ! _base_pack_stash "$dir" "$name"; then
+    miss "$name: local edits could not be stashed: not moved"; PACK_DIRTY+=("$name"); BASE_FAILED+=("pack $name: local edits could not be stashed, not at its newest"); return 0
+  fi
+  before="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  out="$(_base_pack_sync "$dir" "$url")"
+  after="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  if [ -n "$out" ]; then
+    PACK_PRESENT+=("$name @ $after"); err "$name not at its newest: $(_base_git_diag "$out")"; BASE_FAILED+=("pack $name: could not move to its remote HEAD ($(_base_git_diag "$out"))")
+  elif [ "$before" != "$after" ]; then PACK_UPDATED+=("$name $before→$after"); ok "$name $before → $after"
+  else PACK_PRESENT+=("$name @ $after"); ok "$name @ $after (its remote HEAD)"; fi
   return 0
 }
 _base_pack_reqfile(){ # <dir> → the requirements file a pack wants installed (Frame-Interpolation ships a no-cupy variant)
@@ -144,12 +168,20 @@ base_packs(){ # base_packs git | pip
     [ "$BASE_DRY" = "1" ] || mkdir -p "$CN" 2>/dev/null || true
     PACK_DIRS=(); BASE_PACKS_LATEST_ROWS=()
     local rows; rows="$(_base_pack_rows)" || { err "the pack tables are invalid (see above)"; BASE_FAILED+=("packs: invalid rows"); return 1; }
+    local declared=" "
     while IFS='|' read -r name url sha cnr why; do
       [ -n "$name" ] || continue
       dir="$(_base_pack_locate "$name" "$url")"
+      # a declared pack that is not a git checkout (a registry install) has no source to move: it goes aside and is cloned
+      if [ -n "$dir" ] && ! { [ -d "$dir/.git" ] && _base_git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; }; then
+        if [ "$BASE_DRY" = "1" ]; then would "move $dir aside (not a git checkout) and clone $url at its HEAD"; PACK_DIRS+=("$name|$dir"); continue
+        elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (not a git checkout; no-net: not moved)"); PACK_DIRS+=("$name|$dir"); continue; fi
+        local aside; if aside="$(_base_pack_move_aside "$dir")"; then note "$name: not a git checkout: moved aside to $aside so it can be cloned at its newest"; dir=""
+        else err "$name: not a git checkout and could not be moved aside"; BASE_FAILED+=("pack $name: not a git checkout, not at its newest"); PACK_DIRS+=("$name|$dir"); continue; fi
+      fi
       if [ -z "$dir" ]; then
         todo "$name — $why"
-        if [ "$BASE_DRY" = "1" ]; then would "git clone --depth 1 $url"; PACK_CLONED+=("$name (would clone)"); continue; fi
+        if [ "$BASE_DRY" = "1" ]; then would "git clone --depth 1 $url (its HEAD)"; PACK_CLONED+=("$name (would clone)"); continue; fi
         if [ "$BASE_NO_NET" = "1" ]; then _base_fake_clone "$url" "$CN/$name"; dir="$CN/$name"; PACK_CLONED+=("$name (fake clone)")
         else
           # git's own exit status is the judge. Piping the clone through `grep -v | tail` made an EMPTY output (a quiet
@@ -158,47 +190,37 @@ base_packs(){ # base_packs git | pip
           local cout="" crc=0
           cout="$(_base_git clone -q --depth 1 "$url" "$CN/$name" 2>&1)" || crc=$?
           [ -n "$cout" ] && { printf '%s\n' "$cout" | grep -v 'depth is ignored' | tail -2 || true; }
-          if [ "$crc" = "0" ]; then dir="$CN/$name"; PACK_CLONED+=("$name")
+          if [ "$crc" = "0" ]; then dir="$CN/$name"; PACK_CLONED+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name cloned at its HEAD"
           else err "clone failed: $name (git exit $crc)"; BASE_FAILED+=("pack: $name clone failed"); continue; fi
         fi
-        if [ "$BASE_LATEST" != "1" ] && [ "$BASE_NO_NET" != "1" ]; then
-          out="$(_base_pack_pin "$dir" "$url" "$sha")"
-          if [ -n "$out" ]; then err "$name: $out"; BASE_FAILED+=("pack $name: $out")
-          else PACK_CLONED[${#PACK_CLONED[@]}-1]="$name @ ${sha:0:12}"; ok "$name cloned at ${sha:0:12}"; fi
-        else ok "$name cloned"; fi
-      else
-        if [ -d "$dir/.git" ] && _base_git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
-          if [ -n "$(_base_git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-            note "$name: local edits — left alone (not moved)"; PACK_DIRTY+=("$name"); BASE_WARN+=("pack $name has local edits, not updated")
-          elif [ "$BASE_DRY" = "1" ]; then
-            if [ "$BASE_LATEST" = "1" ]; then would "fetch $name and merge --ff-only onto the branch its remote publishes as HEAD"
-            else would "check $name out at its pinned commit ${sha:0:12}"; fi
-            PACK_PRESENT+=("$name")
-          elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (no-net: not moved)")
-          else
-            local before after
-            before="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
-            if [ "$BASE_LATEST" = "1" ]; then out="$(_base_pack_sync "$dir" "$url")"; else out="$(_base_pack_pin "$dir" "$url" "$sha")"; fi
-            after="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
-            if [ -n "$out" ]; then
-              PACK_PRESENT+=("$name @ $after")
-              if [ "$BASE_LATEST" = "1" ]; then warn "$name not updated: $(_base_git_diag "$out")"
-              else err "$name: $out"; BASE_FAILED+=("pack $name: $out"); fi   # an unreachable pin installs a pack the suite never saw
-            elif [ "$before" != "$after" ]; then PACK_UPDATED+=("$name $before→$after"); ok "$name $before → $after"
-            else PACK_PRESENT+=("$name @ $after"); ok "$name @ $after"; fi
-          fi
-        else PACK_PRESENT+=("$name (not a git checkout)"); note "$name: not a git checkout — left alone"; fi
-      fi
+      elif [ "$BASE_DRY" = "1" ]; then
+        would "fetch $name and move it to the HEAD its remote publishes (never backwards; local edits stashed first)"; PACK_PRESENT+=("$name")
+      elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (no-net: not moved)")
+      else _base_pack_move "$name" "$dir" "$url"; fi
+      declared="$declared$(basename "${dir:-$name}") "
       PACK_DIRS+=("$name|$dir")
-      if [ "$BASE_LATEST" = "1" ] && [ -n "$dir" ]; then
+      if [ -n "$dir" ] && [ "$BASE_DRY" != "1" ]; then
         BASE_PACKS_LATEST_ROWS+=("$name|$url|$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null || echo "$sha")|$cnr|$why")
       fi
     done <<< "$rows"
-    if [ "$BASE_LATEST" = "1" ] && [ "$BASE_DRY" != "1" ]; then
-      note "--latest: packs are at their remotes' HEAD, NOT at the commits the suites were green against."
-      note "Paste these rows back into BASE_PACKS / PACKS, then re-run the suites before trusting them:"
+    # undeclared git checkouts are software on this machine too: they go to their upstream HEAD the same way
+    local ud un uurl
+    for ud in "${CN:-/nonexistent}"/*/; do
+      ud="${ud%/}"; un="$(basename "$ud")"
+      [ -d "$ud" ] || continue
+      case "$un" in .*|__pycache__|*.disabled) continue;; esac
+      case "$declared" in *" $un "*) continue;; esac
+      if [ -d "$ud/.git" ] && _base_git -C "$ud" rev-parse --git-dir >/dev/null 2>&1; then
+        uurl="$(_base_git -C "$ud" remote get-url "$(_base_git_remote "$ud")" 2>/dev/null || true)"
+        if [ -z "$uurl" ]; then note "$un: undeclared git checkout with no remote: nothing to move it to"; continue; fi
+        if [ "$BASE_DRY" = "1" ]; then would "move undeclared $un to its remote HEAD"
+        elif [ "$BASE_NO_NET" != "1" ]; then _base_pack_move "$un" "$ud" "$uurl"; fi
+      elif [ -f "$ud/__init__.py" ]; then note "$un: undeclared and not a git checkout: no source to upgrade it from, left alone"; fi
+    done
+    # the last-tested records: printed on EVERY real run, so podctl can write them back after a green install
+    if [ "$BASE_DRY" != "1" ] && [ "${#BASE_PACKS_LATEST_ROWS[@]}" -gt 0 ]; then
+      note "pack records (each pack's HEAD this run; podctl writes them back after a green install):"
       printf '  "%s"\n' "${BASE_PACKS_LATEST_ROWS[@]}"
-      BASE_WARN+=("--latest: packs are off their pinned commits; the suites have not been run against these")
     fi
     # packs a package used to install and no longer needs: reported only when no installed package claims them
     for name in ${DROPPED_PACKS:-}; do
@@ -206,45 +228,34 @@ base_packs(){ # base_packs git | pip
     done
     return 0
   fi
-  # ---- pip half: every located pack's requirements under the torch constraint, every run
-  hdr "NODE PACKS · requirements into $VENV"
-  local d rf entry probe=()
+  # ---- pip half (3.0.0): ONE install of the derived, pin-free set, never an upstream file as written. ComfyUI's own
+  # requirements go in every run, not only when the venv is built: --latest once moved ComfyUI 0.34.6 -> 0.35.0 on a
+  # REUSED venv, its four new pins were never installed, and main.py died on `No module named
+  # 'comfy_aimdo.malloc_graph'`. Installing each upstream file as written, though, put every == pin back down on every
+  # run, which is exactly what "always the newest" forbids. py/reqlift.py merges ComfyUI's, every pack's and PIP_EXTRA
+  # into one file with the holds removed (lib/47-latest.sh), and uv resolves it under the torch constraint.
+  hdr "NODE PACKS · requirements into $VENV (one resolve, every upstream pin lifted)"
+  local d rf entry probe=() out
   CONSTRAINTS="${CONSTRAINTS:-$BASE_STATE/constraints-torch.txt}"
-  # ComfyUI's OWN requirements, every run — not only when the venv is BUILT. Seen on a live pod:
-  # --latest moved ComfyUI 0.34.6 -> 0.35.0 on
-  # a REUSED venv, so _base_venv_build never ran, ComfyUI's four new pins were never installed, and
-  # main.py died on `ModuleNotFoundError: No module named 'comfy_aimdo.malloc_graph'`. Every PACK's
-  # requirements were re-installed that run; the thing every pack sits on was not.
-  #
-  # -c "$CONSTRAINTS" is what makes this safe and is why the emergency repair needed --no-deps: a
-  # bare `pip install -r $COMFY/requirements.txt` dies in resolution against the installed cu130
-  # torch. Under the constraint file it is the same call _base_venv_build already makes.
-  if [ -f "$COMFY/requirements.txt" ]; then
-    if [ "$BASE_DRY" = "1" ]; then would "install ComfyUI's own requirements.txt under the torch constraint"
-    elif [ "$BASE_NO_NET" = "1" ]; then note "ComfyUI requirements: pip skipped (BASE_NO_NET)"
-    elif _base_pip install -q --upgrade --upgrade-strategy only-if-needed -c "$CONSTRAINTS" -r "$COMFY/requirements.txt" 2>&1 | tail -2; then ok "ComfyUI requirements (requirements.txt)"
-    else miss "ComfyUI requirements failed"; BASE_FAILED+=("comfyui: own requirements failed"); fi
-  fi
   for entry in ${PACK_DIRS[@]+"${PACK_DIRS[@]}"}; do
     name="${entry%%|*}"; d="${entry#*|}"; rf="$(_base_pack_reqfile "$d")"
-    if [ -z "$rf" ]; then probe+=("$name|$d"); continue; fi
-    if [ "$BASE_DRY" = "1" ]; then would "install $(basename "$rf") into the venv under the torch constraint ($name)"; continue; fi
-    if [ "$BASE_NO_NET" = "1" ]; then note "$name: pip skipped (BASE_NO_NET)"; continue; fi
-    if _base_pip install -q --upgrade --upgrade-strategy only-if-needed -c "$CONSTRAINTS" -r "$rf" 2>&1 | tail -2; then ok "$name requirements ($(basename "$rf"))"
-    else miss "$name requirements failed"; BASE_FAILED+=("pack: $name requirements failed"); fi
+    if [ -z "$rf" ]; then probe+=("$name|$d"); fi
   done
-  # PIP_EXTRA (a package's extra wheels, e.g. ninja) every run, not only when the venv is built: a venv the base built
-  # for another package, or before any package, has never seen this package's extras
-  local -a extras=( ${PIP_EXTRA[@]+"${PIP_EXTRA[@]}"} )          # PIP_EXTRA may be undeclared (bash 3.2 + set -u)
-  if [ "${#extras[@]}" -gt 0 ]; then
-    if [ "$BASE_DRY" = "1" ]; then would "install PIP_EXTRA into the venv under the torch constraint: ${extras[*]}"
-    elif [ "$BASE_NO_NET" = "1" ]; then note "PIP_EXTRA skipped (BASE_NO_NET): ${extras[*]}"
-    elif _base_pip install -q --upgrade --upgrade-strategy only-if-needed -c "$CONSTRAINTS" --extra-index-url https://pypi.nvidia.com "${extras[@]}" 2>&1 | tail -2; then ok "PIP_EXTRA: ${extras[*]}"
-    else miss "PIP_EXTRA install failed: ${extras[*]}"; BASE_FAILED+=("pip: PIP_EXTRA failed (${extras[*]})"); fi
+  if [ "$BASE_DRY" = "1" ]; then would "derive one pin-free requirement set from ComfyUI's, $(_base_all_reqfiles | wc -l | tr -d ' ') file(s) and PIP_EXTRA, and install it in one uv resolve under the torch constraint"
+  elif [ "$BASE_NO_NET" = "1" ]; then note "requirements: pip skipped (BASE_NO_NET)"
+  elif ! command -v uv >/dev/null 2>&1 || [ ! -x "${PY:-/nonexistent}" ]; then miss "no uv or no venv interpreter: requirements not installed"; BASE_FAILED+=("requirements: no uv or no venv")
+  else
+    base_torch_constraints
+    if ! out="$(_base_reqlift 2>&1)"; then
+      miss "py/reqlift.py failed: $(printf '%s' "$out" | tail -2)"; BASE_FAILED+=("requirements: could not derive the requirement set")
+    else
+      printf '%s\n' "$out" | awk -F'\t' '$1=="summary"{printf "  %s\n", $2}'
+      if _base_run_watched "requirements (one resolve)" _base_derived_install; then ok "ComfyUI + every pack's requirements + PIP_EXTRA installed, newest"
+      else miss "the derived requirement set failed to install (uv's reason is above)"; BASE_FAILED+=("requirements: the derived set did not install"); fi
+    fi
   fi
   # 2.12.3: one file at a time, `--upgrade` takes whatever a file names to its newest even past a cap another installed
   # package declares (huggingface-hub 2.0.0 under transformers' <2.0); re-resolve the conflicts together, at their newest
-  _base_venv_reconcile
   # A pack with no requirements file is only fine if what it imports is already in the venv. Writing one
   # into the checkout is not the fix (it dirties the tree and the pack is never updated again).
   _base_pack_imports_report ${probe[@]+"${probe[@]}"}
@@ -271,16 +282,15 @@ base_cuda_toolchain(){ # CAN THIS TOOLKIT LINK WHAT PACKAGES BUILD? "nvcc exists
     BASE_CUDA_BUILD_OK=1; ok "CUDA toolchain links cuBLAS — source builds can proceed"; return 0
   fi
   ver="$("$nvcc" --version 2>/dev/null | sed -nE 's/.*release ([0-9]+)\.([0-9]+).*/\1-\2/p' | head -1)"
-  pkg="cuda-libraries-dev-${ver:-13-0}"
+  pkg="cuda-libraries-dev${ver:+-$ver}"          # the installed toolkit's own; with none readable, NVIDIA's newest-tracking metapackage
   miss "the CUDA toolkit cannot link cuBLAS — nvcc is present but the math libraries are not"
   if [ "$BASE_DRY" = "1" ]; then
     would "apt-get install $pkg, then re-probe (source builds need cuBLAS: llama-cpp-python, SageAttention)"
     BASE_CUDA_BUILD_OK=0; return 0
   fi
-  if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+  if command -v apt-get >/dev/null 2>&1 && _base_can_root; then
     note "installing $pkg (a source build links cuBLAS; the image shipped nvcc + cudart only)"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1 \
-      || { apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1; } || true
+    _base_apt install "$pkg" >/dev/null 2>&1 || { _base_apt update >/dev/null 2>&1 && _base_apt install "$pkg" >/dev/null 2>&1; } || true
     if "$nvcc" -o "$bin" "$src" -lcublas >/dev/null 2>&1; then
       BASE_CUDA_BUILD_OK=1; ok "$pkg installed — the toolchain links cuBLAS now"; BASE_CHANGED+=("$pkg installed (the image shipped no cuBLAS)"); return 0
     fi
@@ -292,20 +302,35 @@ base_cuda_toolchain(){ # CAN THIS TOOLKIT LINK WHAT PACKAGES BUILD? "nvcc exists
 }
 
 base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 built from source for THIS GPU's sm (no PyPI wheel has
-  # sm_100/sm_120 kernels; 1.0.6 crashes there). SAGE_WHEEL=<url-or-path> installs that instead; SAGE_REF pins the git ref
-  # (default main). A failed build FAILS the run. Here because several packages want it and a missing build died at
-  # the first render with `No module named 'sageattention'` (2.0.22).
-  if [ "$BASE_DRY" = "1" ]; then would "build SageAttention from source for ${BASE_GPU_SM:-the GPU} into $VENV unless it already imports"; return 0; fi
+  # sm_100/sm_120 kernels; 1.0.6 crashes there). SAGE_REF names a BRANCH or tag (default main); 3.0.0 retired SAGE_WHEEL and a
+  # 40-hex SAGE_REF, both of which held it below its newest. It is rebuilt whenever the full cache key (the resolved commit,
+  # Python, torch, sm) differs from the one stamped beside the install, so a reused venv follows main like a fresh one.
+  # A failed build FAILS the run (2.0.22: a missing build died at the first render with `No module named 'sageattention'`).
+  if [ "$BASE_DRY" = "1" ]; then would "build SageAttention from source for ${BASE_GPU_SM:-the GPU} into $VENV unless the installed build matches main's newest commit"; return 0; fi
   if [ "$BASE_NO_NET" = "1" ]; then note "SageAttention: skipped (fake venv — BASE_NO_NET)"; return 0; fi
-  if "$PY" -c "import sageattention" >/dev/null 2>&1; then ok "sageattention $(_base_sage_ver) already in $VENV"; return 0; fi
-  if [ -n "${SAGE_WHEEL:-}" ]; then
-    echo "  installing SageAttention from SAGE_WHEEL=$SAGE_WHEEL"
-    _base_pip install -q "$SAGE_WHEEL" 2>&1 | tail -3 || true
-  else
+  if [ -n "${SAGE_WHEEL:-}" ]; then note "SAGE_WHEEL is retired in 3.0.0 and ignored: SageAttention is built from its newest source"; fi
+  if [[ "${SAGE_REF:-}" =~ ^[0-9a-f]{7,40}$ ]]; then note "SAGE_REF=$SAGE_REF is a commit, retired in 3.0.0 (a commit is a pin): main is used"; SAGE_REF=main; fi
+  {
+    # ---- the cache key is the RESOLVED UPSTREAM COMMIT, not a version. A cache keyed on a version would be a pin:
+    # SAGE_REF defaults to main, main moves, and a stale wheel would be served forever: the "stale pin is the same
+    # debt with a delay" this repo refuses. Keyed on the commit (plus the venv's python, torch and the GPU's sm, all
+    # of which change the artefact) the cache can only ever skip rebuilding byte-identical source. ls-remote resolves
+    # the ref in about a second, so a hit costs no clone at all. A 10-20 minute build becomes a ~20 second install.
+    local cache="$BASE_STATE/wheels" sha key hit pytag tv
+    local ref="${SAGE_REF:-main}" stampf="$VENV/.comfy-base-sageattention"
+    sha="$(git ls-remote https://github.com/thu-ml/SageAttention "$ref" 2>/dev/null | awk 'NR==1{print substr($1,1,12)}')"
+    pytag="$("$PY" -c 'import sys; print("cp%d%d" % sys.version_info[:2])' 2>/dev/null)"
+    tv="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null)"
+    key="sageattention-${sha:-unresolved}-${pytag:-cp}-torch${tv:-0}-${SAGE_ARCHS:+archs-}$(printf '%s' "${SAGE_ARCHS:-${BASE_GPU_SM:-sm}}" | tr ';.' '_-')"
+    # already built from exactly this source for exactly this venv: nothing to do. Anything else (main moved, a new
+    # Python, a new torch, another GPU) rebuilds or reinstalls from the cache, so it is never left behind.
+    if [ -n "$sha" ] && [ "$(cat "$stampf" 2>/dev/null)" = "$key" ] && "$PY" -c "import sageattention" >/dev/null 2>&1; then
+      ok "sageattention $(_base_sage_ver) already built from SageAttention $sha for this venv (its newest)"; return 0
+    fi
     local cc="${BASE_GPU_SM:-}"; cc="${cc#sm_}"
     if [ -n "${SAGE_ARCHS:-}" ]; then cc="$SAGE_ARCHS"             # 2.1.0: the image build has no GPU and wants several ("9.0;12.0")
     else
-      if [ -z "$cc" ]; then err "no CUDA device visible — SageAttention needs the GPU's compute capability to build (or pass SAGE_WHEEL=<wheel>, or SAGE_ARCHS=<list>)"; BASE_FAILED+=("SageAttention: no GPU visible, not built"); return 0; fi
+      if [ -z "$cc" ]; then err "no CUDA device visible: SageAttention needs the GPU's compute capability to build (or SAGE_ARCHS=<list>)"; BASE_FAILED+=("SageAttention: no GPU visible, not built"); return 0; fi
       cc="${cc%?}.${cc: -1}"                                        # sm_120 → 12.0 · sm_100 → 10.0 · sm_89 → 8.9
     fi
     base_cuda_toolchain
@@ -313,31 +338,17 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
       err "SageAttention links cuBLAS and this toolkit cannot — not starting a build that cannot finish"
       BASE_FAILED+=("SageAttention: the CUDA toolkit cannot link cuBLAS (the toolchain line above names the fix)"); return 0
     fi
-    # ---- the cache key is the RESOLVED UPSTREAM COMMIT, not a version. A cache keyed on a version would be a pin:
-    # SAGE_REF defaults to main, main moves, and a stale wheel would be served forever — the "stale pin is the same
-    # debt with a delay" this repo refuses. Keyed on the commit (plus the venv's python, torch and the GPU's sm, all
-    # of which change the artefact) the cache can only ever skip rebuilding byte-identical source. ls-remote resolves
-    # the ref in about a second, so a hit costs no clone at all. A 10-20 minute build becomes a ~20 second install.
-    local cache="$BASE_STATE/wheels" sha key hit pytag tv
-    local ref="${SAGE_REF:-main}"
-    # a 40-hex SAGE_REF is a commit, and ls-remote lists REFS: it resolves nothing, which would key the cache on
-    # "unresolved" and rebuild every time. A commit needs no resolving, so it is its own answer.
-    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then sha="${ref:0:12}"
-    else sha="$(git ls-remote https://github.com/thu-ml/SageAttention "$ref" 2>/dev/null | awk 'NR==1{print substr($1,1,12)}')"; fi
-    pytag="$("$PY" -c 'import sys; print("cp%d%d" % sys.version_info[:2])' 2>/dev/null)"
-    tv="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null)"
-    key="sageattention-${sha:-unresolved}-${pytag:-cp}-torch${tv:-0}-${SAGE_ARCHS:+archs-}$(printf '%s' "${SAGE_ARCHS:-${BASE_GPU_SM:-sm}}" | tr ';.' '_-')"
     hit=""; [ -n "$sha" ] && hit="$(ls "$cache/$key"/*.whl 2>/dev/null | head -1)"
     if [ -n "$hit" ]; then
       ok "SageAttention: a cached wheel matches this exact source and venv — installing instead of a 10-20 min build"
       note "$(basename "$hit")  ($key)"
       _base_pip install -q --force-reinstall --no-deps "$hit" 2>&1 | tail -2 || true
       if "$PY" -c "import sageattention" >/dev/null 2>&1; then
-        BASE_CHANGED+=("SageAttention installed from the cached wheel ($sha)"); return 0
+        echo "$key" > "$stampf"; BASE_CHANGED+=("SageAttention installed from the cached wheel ($sha)"); return 0
       fi
       warn "the cached wheel did not import — rebuilding from source and replacing it"; rm -rf "$cache/$key"
     fi
-    _base_pip install -q ninja 2>&1 | tail -1 || true                 # the build's generator
+    _base_pip install -q --upgrade ninja 2>&1 | tail -1 || true       # the build's generator, at its newest
     # torch 2.14's headers demand C++20 and upstream's setup.py hardcodes -std=c++17: every kernel failed at the first
     # include on the pod (2.0.25). Clone the ref, patch the flag, build from the checkout — pip sees the patched tree.
     local src="$BASE_STATE/sageattention-src"; rm -rf "$src"
@@ -346,14 +357,7 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
     # name instead. The DEFAULT stays main on purpose: the cache is keyed on the resolved commit precisely so
     # that tracking upstream costs nothing, and a version-keyed cache would be the stale pin this repo refuses.
     local got=0
-    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-      if git init -q "$src" 2>/dev/null \
-         && git -C "$src" remote add origin https://github.com/thu-ml/SageAttention 2>/dev/null \
-         && git -C "$src" fetch -q --depth 1 origin "$ref" 2>&1 | tail -2 \
-         && git -C "$src" checkout -q FETCH_HEAD 2>/dev/null; then got=1; fi
-    elif git clone -q --depth 1 --branch "$ref" https://github.com/thu-ml/SageAttention "$src" 2>&1 | tail -2; then
-      got=1
-    fi
+    if git clone -q --depth 1 --branch "$ref" https://github.com/thu-ml/SageAttention "$src" 2>&1 | tail -2; then got=1; fi
     if [ "$got" != "1" ]; then
       err "could not clone SageAttention ($ref)"; BASE_FAILED+=("SageAttention: clone failed"); return 0
     fi
@@ -367,14 +371,14 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
       err "the SageAttention build failed (its last lines are above)"; rm -rf "$cache/$key"
     else
       hit="$(ls "$cache/$key"/*.whl 2>/dev/null | head -1)"
-      if [ -n "$hit" ]; then _base_pip install -q --no-deps "$hit" 2>&1 | tail -2 || true
-        ok "wheel cached at $cache/$key — the next venv rebuild on this pod skips the build"
+      if [ -n "$hit" ]; then _base_pip install -q --force-reinstall --no-deps "$hit" 2>&1 | tail -2 || true
+        echo "$key" > "$stampf"; ok "wheel cached at $cache/$key: the next venv rebuild on this pod skips the build"
       else err "the build produced no wheel"; rm -rf "$cache/$key"; fi
     fi
     rm -rf "$src"
-  fi
+  }
   if "$PY" -c "import sageattention" >/dev/null 2>&1; then ok "sageattention $(_base_sage_ver) — built for $BASE_GPU_SM; a ⚡ Sage patch may go ON"
-  else err "sageattention does not import in $VENV — a Sage patch node would fail at queue time"; BASE_FAILED+=("SageAttention not installed (SAGE_WHEEL=<url-or-path> skips the source build)"); fi
+  else err "sageattention does not import in $VENV: a Sage patch node would fail at queue time"; BASE_FAILED+=("SageAttention not installed"); fi
   return 0
 }
 
@@ -426,7 +430,9 @@ base_consolidate(){ # what is already installed elsewhere on this pod: strays of
   return 0
 }
 
-base_list_packs(){ # <pkg dir>... → deduplicated dir|url|sha rows (base packs + every package's), exit 1 on a SHA conflict
+base_list_packs(){ # <pkg dir>... → deduplicated dir|url|sha rows (base packs + every package's); exit 1 when one pack names two URLs.
+  # 3.0.0: a row's sha is a last-tested RECORD and every run takes the pack to its HEAD, so two packages whose records
+  # were written on different days is a note, never a conflict. Two URLs for one directory is still a real conflict.
   local d s out rc=0
   out="$(printf '%s\n' "${BASE_PACKS[@]}")"
   for d in "$@"; do
@@ -437,6 +443,6 @@ base_list_packs(){ # <pkg dir>... → deduplicated dir|url|sha rows (base packs 
     local got; got="$(BASE_DECLARE_ONLY=1 bash "$s" | grep '^PACKROW ' | cut -c9- || true)"
     if [ -n "$got" ]; then out="$out"$'\n'"$got"; fi
   done
-  printf '%s\n' "$out" | awk -F'|' 'NF>=3 && $1!="" { if ($1 in sha) { if (sha[$1]!=$3) { print "  !! " $1 " pinned to two SHAs: " sha[$1] " vs " $3 > "/dev/stderr"; bad=1 } } else { sha[$1]=$3; print $1 "|" $2 "|" $3 } } END { exit bad }' || rc=1
+  printf '%s\n' "$out" | awk -F'|' 'function u(x){ sub(/\.git$/,"",x); sub(/\/$/,"",x); return tolower(x) } NF>=3 && $1!="" { if ($1 in url) { if (u(url[$1])!=u($2)) { print "  !! " $1 " comes from two URLs: " url[$1] " vs " $2 > "/dev/stderr"; bad=1 } else if (sha[$1]!=$3) { print "  ~ " $1 ": records differ (" substr(sha[$1],1,12) " vs " substr($3,1,12) "); every run takes it to its HEAD" > "/dev/stderr" } } else { url[$1]=$2; sha[$1]=$3; print $1 "|" $2 "|" $3 } } END { exit bad }' || rc=1
   return $rc
 }

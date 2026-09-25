@@ -32,6 +32,8 @@ base_mcp(){ # comfy-cli + comfy-mcp into the run's venv, bound to the discovered
   # trio is not at risk; the constraints file is passed anyway, because "not at risk today" is not a guarantee.
   # uv rather than `$PY -m pip`: 30-venv.sh seeds the venv so pip is normally there, but uv is what actually
   # built it and it does not care either way — a venv made without --seed has no pip at all.
+  # 3.0.0: present here; their NEWEST arrives in the one resolve after this stage (lib/47-latest.sh), never in a separate
+  # --upgrade, which resolves only what it names and can overshoot a cap another package declares (2.12.3's lesson)
   if ! _base_uvpip -q ${c:+-c "$c"} "comfy-cli>=1.14.0" comfy-mcp 2>&1 | tail -3; then
     miss "comfy-cli / comfy-mcp install failed"; BASE_MCP_RESULT="FAILED (install)"
     BASE_WARN+=("comfy mcp not installed: the machine runs, an agent cannot drive it")

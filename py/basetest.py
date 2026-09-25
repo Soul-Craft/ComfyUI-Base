@@ -239,7 +239,19 @@ def _fake_code_tree(c, comfy_version):
     (c / "main.py").write_text(""); (c / "requirements.txt").write_text(""); (c / "comfyui_version.py").write_text('__version__ = "%s"\n' % comfy_version)
 
 
-def fake_pod(tmp_path, pkg_dir, strays=False, duplicates=False, foreign=False, local_present=True, poison_venv=False, dangling_venv=False, comfy_version="0.34.7", layout="official"):
+def _pkg_comfy_min(pkg_dir, floor="0.34.7"):
+    """The fake machine's ComfyUI: the package's own COMFY_MIN (3.0.0), never below the fixture's historic 0.34.7. A package
+    needing a newer ComfyUI (Qwen Image 2.1: 0.37.0) otherwise stopped at the version gate before a pack or row was placed."""
+    import re
+    best = floor
+    for sc in pathlib.Path(pkg_dir).glob("*-script.sh"):
+        m = re.search(r'COMFY_MIN="([0-9][0-9.]*)"', sc.read_text(encoding="utf-8", errors="replace"))
+        if m and tuple(int(x) for x in m.group(1).split(".")) > tuple(int(x) for x in best.split(".")):
+            best = m.group(1)
+    return best
+
+
+def fake_pod(tmp_path, pkg_dir, strays=False, duplicates=False, foreign=False, local_present=True, poison_venv=False, dangling_venv=False, comfy_version=None, layout="official"):
     """A machine-shaped tree under <tmp_path>, in one of four layouts:
       official  — RunPod's ComfyUI image: the tree at <root>/ComfyUI with a template venv and runpod-slim/comfyui_args.txt
       community — a community template's runtime: code on the container disk (<root>/image/ComfyUI, /opt/venv, the runtime and
@@ -250,6 +262,7 @@ def fake_pod(tmp_path, pkg_dir, strays=False, duplicates=False, foreign=False, l
                   the driver's state/host.env naming the host, so the base resolves BASE_HOST=vm and binds loopback
     The package is copied to <root>/pkg (so the committed fixture is never rewritten); PID 1's env is <root>/pid1.env.
     Returns the canonical ComfyUI dir (<root>/ComfyUI — for community/bare/volume the place the base materialises it)."""
+    comfy_version = comfy_version or _pkg_comfy_min(pkg_dir)
     root = pathlib.Path(tmp_path); root.mkdir(parents=True, exist_ok=True); c = root / "ComfyUI"; m = c / "models"
     (root / "pid1.env").write_text(PID1_ENV_VM if layout == "volume" else PID1_ENV)
     if layout == "volume":
@@ -303,9 +316,14 @@ def fake_pod(tmp_path, pkg_dir, strays=False, duplicates=False, foreign=False, l
     if local_present:
         mk("stub_local.safetensors", 12, base=root / "local")
     pkg = root / "pkg"; pkg.mkdir(exist_ok=True)
+    import shutil
     for f in pathlib.Path(pkg_dir).iterdir():
         if f.is_file():
             (pkg / f.name).write_bytes(f.read_bytes()); (pkg / f.name).chmod(f.stat().st_mode)
+        elif f.is_dir() and (f / "__init__.py").exists() and not f.name.startswith(("_", ".")):
+            # 3.0.0: a package's vendored node packs ship in its zip, so the fake machine carries them too (they were
+            # missing, and every suite test that reads a pack file failed inside the rehearsal while green elsewhere)
+            shutil.copytree(f, pkg / f.name, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", ".git"))
     (root / "home").mkdir(exist_ok=True)
     return c
 

@@ -1,4 +1,4 @@
-# 20-comfyui.sh — tokens (asked once, stored 0600), ComfyUI to its newest release tag, the version floor.
+# 20-comfyui.sh: tokens (asked once, stored 0600), ComfyUI to its newest release tag (or a newer COMFY_REF), the version floor.
 
 _base_pid1_env(){ # <NAME> — the pod's own environment (PID 1's), which an ssh session does not inherit
   local name="$1" f
@@ -143,12 +143,58 @@ _base_fake_comfy_tree(){ # BASE_NO_NET: the fake "clone" — the fake image's co
     : > "$t/main.py"; : > "$t/requirements.txt"; printf '__version__ = "0.34.7"\n' > "$t/comfyui_version.py"
   fi
 }
+# ---------------------------------------------------------------- which ComfyUI: the newest release, or a newer ref
+# 3.0.0: ComfyUI is ALWAYS the newest release (the newest vX.Y.Z tag), on every run, on every host. COMFY_REF names
+# something NEWER when a fix exists only there (master, a branch, a newer tag, a full 40-hex commit); it is refused
+# when it is an ancestor of the newest release, because an opt-in may only ever move forward. There is no date rule:
+# a release cut after master's last commit must not lock master out. COMFY_TAG and BASE_PINNED are retired: nothing
+# holds ComfyUI still any more.
+_base_comfy_ref(){ # → the ref this run installs: COMFY_REF, else "release" (the newest vX.Y.Z tag)
+  if [ -n "${COMFY_TAG:-}" ] && [ -z "${_BASE_COMFY_TAG_NOTED:-}" ]; then
+    note "COMFY_TAG=$COMFY_TAG is retired in 3.0.0 and ignored: ComfyUI is the newest release (COMFY_REF names something newer)" >&2
+    _BASE_COMFY_TAG_NOTED=1
+  fi
+  if [ -n "${COMFY_REF:-}" ] && [ "${COMFY_REF}" != "release" ]; then printf '%s\n' "$COMFY_REF"; else echo release; fi
+}
+_base_comfy_ref_shape(){ # <ref> → "" when usable, else why not. A sha must be the full 40 hex: GitHub serves nothing shorter.
+  local r="$1"
+  if [[ "$r" =~ ^[0-9a-f]{7,39}$ ]]; then echo "COMFY_REF=$r looks like a short commit id; give the full 40-hex sha (GitHub fetches nothing shorter)"; return 0; fi
+  case "$r" in -*|*" "*|*..*) echo "COMFY_REF=$r is not a branch, tag or commit"; return 0;; esac
+  echo ""
+}
+_base_comfy_newest_tag_remote(){ # <git dir> <remote> → the newest vX.Y.Z tag the remote publishes (read-only)
+  _base_git -C "$1" ls-remote --tags --refs "$2" 'v*' 2>/dev/null | awk '{print $2}' | sed 's|refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true
+}
+_base_comfy_ref_version(){ # <remote url> <ref> → the version that ref's comfyui_version.py reports, fetched into a scratch repo (never $COMFY)
+  local url="$1" ref="$2" d v
+  _base_tmp; d="$BASE_TMPD/comfy-ref-probe"; rm -rf "$d"
+  _base_git init -q "$d" >/dev/null 2>&1 || return 0
+  if _base_git -C "$d" fetch -q --depth 1 --filter=blob:none "$url" "$ref" >/dev/null 2>&1; then
+    v="$(_base_git -C "$d" show FETCH_HEAD:comfyui_version.py 2>/dev/null | sed -nE 's/^__version__[[:space:]]*=[[:space:]]*["'"'"']([0-9.]+)["'"'"'].*/\1/p' | head -1)"
+    printf '%s %s\n' "$(_base_git -C "$d" rev-parse --short FETCH_HEAD 2>/dev/null)" "$v"
+  fi
+  rm -rf "$d"
+  return 0
+}
+_base_comfy_ref_is_older(){ # <git dir> <commit> <newest release tag> → 0 when the commit is an ancestor of the release (older)
+  local g="$1" c="$2" t="$3"
+  [ -n "$t" ] || return 1
+  _base_git -C "$g" rev-parse -q --verify "$t^{commit}" >/dev/null 2>&1 || _base_git -C "$g" fetch -q --force "$(_base_git_remote "$g")" "refs/tags/$t:refs/tags/$t" >/dev/null 2>&1 || true
+  [ "$(_base_git -C "$g" rev-parse "$c" 2>/dev/null)" = "$(_base_git -C "$g" rev-parse "$t^{commit}" 2>/dev/null)" ] && return 1   # the release itself is not "older"
+  _base_git -C "$g" merge-base --is-ancestor "$c" "$t" >/dev/null 2>&1
+}
+
 base_comfy_materialize(){ # the volume holds no ComfyUI tree: create one at $VOL/ComfyUI, beside whatever persist dirs are already there
-  local target="$VOL/ComfyUI" tag="" d
+  local target="$VOL/ComfyUI" tag="" d ref why
   [ -f "$target/main.py" ] && return 0
   hdr "COMFYUI TREE · none on $VOL"
   if [ -d "$target/.git" ]; then err "$target has a .git but no main.py — half a checkout; move it aside and re-run"; BASE_FAILED+=("half a checkout at $target"); return 1; fi
-  if [ "$BASE_DRY" = "1" ]; then would "materialise $target at the newest ComfyUI release tag (beside the models/user/output/input/custom_nodes already there)"; return 4; fi
+  ref="$(_base_comfy_ref)"
+  if [ "$BASE_DRY" = "1" ]; then
+    if [ "$ref" = release ]; then would "materialise $target at the newest ComfyUI release tag (beside the models/user/output/input/custom_nodes already there)"
+    else would "materialise $target at COMFY_REF=$ref (beside the persist dirs already there)"; fi
+    return 4
+  fi
   mkdir -p "$target" || { err "cannot create $target"; return 1; }
   if [ "$BASE_NO_NET" = "1" ]; then
     _base_fake_comfy_tree "$target"; tag="(fake tree)"
@@ -157,11 +203,19 @@ base_comfy_materialize(){ # the volume holds no ComfyUI tree: create one at $VOL
       _base_git init -q "$target" && _base_git -C "$target" remote add origin https://github.com/comfyanonymous/ComfyUI.git \
         || { err "git init failed in $target"; BASE_FAILED+=("materialise: git init"); return 1; }
     fi
-    if [ -n "${COMFY_TAG:-}" ]; then tag="$COMFY_TAG"; note "COMFY_TAG=$tag: materialising the tag the image was built with, not the newest"   # 2.1.0: the seed build and pinned pods
-    else tag="$(_base_git -C "$target" ls-remote --tags --refs origin 'v*' 2>/dev/null | awk '{print $2}' | sed 's|refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"; fi
-    [ -n "$tag" ] || { err "could not read ComfyUI's release tags from GitHub"; BASE_FAILED+=("materialise: no release tag"); return 1; }
-    if ! _base_git -C "$target" fetch -q --depth 1 origin "refs/tags/$tag:refs/tags/$tag" || ! _base_git -C "$target" checkout -q -f -B comfy-base-stable "$tag"; then
-      err "fetch/checkout of $tag failed in $target"; BASE_FAILED+=("materialise: $tag"); return 1
+    if [ "$ref" = release ]; then
+      tag="$(_base_comfy_newest_tag_remote "$target" origin)"
+      [ -n "$tag" ] || { err "could not read ComfyUI's release tags from GitHub"; BASE_FAILED+=("materialise: no release tag"); return 1; }
+      if ! _base_git -C "$target" fetch -q --depth 1 origin "refs/tags/$tag:refs/tags/$tag" || ! _base_git -C "$target" checkout -q -f -B comfy-base-stable "$tag"; then
+        err "fetch/checkout of $tag failed in $target"; BASE_FAILED+=("materialise: $tag"); return 1
+      fi
+    else
+      why="$(_base_comfy_ref_shape "$ref")"
+      if [ -n "$why" ]; then err "$why"; BASE_FAILED+=("materialise: $why"); return 1; fi
+      if ! _base_git -C "$target" fetch -q origin "$ref" || ! _base_git -C "$target" checkout -q -f -B comfy-base-stable FETCH_HEAD; then
+        err "fetch/checkout of COMFY_REF=$ref failed in $target"; BASE_FAILED+=("materialise: COMFY_REF=$ref"); return 1
+      fi
+      tag="$ref @ $(_base_git -C "$target" rev-parse --short HEAD 2>/dev/null)"
     fi
   fi
   for d in models custom_nodes user/default/workflows input output; do mkdir -p "$target/$d"; done
@@ -169,29 +223,41 @@ base_comfy_materialize(){ # the volume holds no ComfyUI tree: create one at $VOL
   BASE_CHANGED+=("materialised ComfyUI at $target ($tag)")
   return 0
 }
-base_update_comfyui(){ # newest v* release tag, checked out on branch comfy-base-stable (a branch: Manager's updater keeps working)
+COMFY_REF_INFO=""
+base_update_comfyui(){ # the newest release (or a newer COMFY_REF), checked out on branch comfy-base-stable (a branch: Manager's updater keeps working)
   hdr "COMFYUI"
-  local tag head_at_tag=0 dirty=0 rmt
+  local tag head_at_tag=0 dirty=0 rmt ref why newest
   COMFY_OLD="$(_base_comfy_version "$COMFY" 2>/dev/null)"; COMFY_NEW="$COMFY_OLD"
   echo "  current      v$COMFY_OLD"
-  # 2.1.0: a pinned pod (the template's image) runs the ComfyUI the image was tested with: no fetch, no checkout, no
-  # remote asked. The version gate still judges COMFY_OLD; a seed below a package's COMFY_MIN fails there, loudly.
-  if [ "$BASE_PINNED" = "1" ]; then ok "pinned at v$COMFY_OLD (BASE_PINNED=1${COMFY_TAG:+, image tag $COMFY_TAG}) — no fetch, no checkout"; return 0; fi
+  if [ -n "${BASE_PINNED:-}" ] && [ "${BASE_PINNED}" != "0" ]; then note "BASE_PINNED is retired in 3.0.0 and ignored: ComfyUI moves to the newest release on every run"; fi
+  ref="$(_base_comfy_ref)"
   if ! _base_git -C "$COMFY" rev-parse --git-dir >/dev/null 2>&1; then
     warn "ComfyUI $COMFY_OLD is not a git checkout — left as the template shipped it; the version gate still applies"; return 0
   fi
   rmt="$(_base_git_remote "$COMFY")"
+  if [ "$ref" != release ]; then
+    why="$(_base_comfy_ref_shape "$ref")"
+    if [ -n "$why" ]; then err "$why"; BASE_FAILED+=("ComfyUI: $why"); return 0; fi
+    echo "  wanted       COMFY_REF=$ref (an opt-in newer than the newest release; the next install without it returns to the release)"
+  fi
   if [ "$BASE_NO_NET" = "1" ]; then note "BASE_NO_NET: no fetch"
   elif [ -z "$rmt" ]; then
     err "ComfyUI checkout has no git remote — the release tags are unreachable, staying on $COMFY_OLD"
     BASE_FAILED+=("ComfyUI: no git remote, still $COMFY_OLD"); return 0
   elif [ "$BASE_DRY" = "1" ]; then
-    # A dry run must not fetch — but it can ask the remote, read-only, what it WOULD move to, so the gate
-    # judges the post-update version instead of the current one.
-    local rtag
-    rtag="$(_base_git -C "$COMFY" ls-remote --tags --refs "$rmt" 'v*' 2>/dev/null | awk '{print $2}' | sed 's|refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
-    if [ -n "$rtag" ]; then COMFY_NEW="${rtag#v}"; would "checkout -B comfy-base-stable $rtag   (ComfyUI $COMFY_OLD → $COMFY_NEW; the gate judges $COMFY_NEW)"
-    else would "fetch tags and check out the newest v* tag"; note "could not reach the remote — the gate judges the CURRENT version"; fi
+    # A dry run must not fetch into $COMFY: but it can ask the remote, read-only, what it WOULD move to, so the gate
+    # judges the post-update version instead of the current one. For a ref that means reading the ref's own
+    # comfyui_version.py through a scratch repository.
+    if [ "$ref" = release ]; then
+      local rtag; rtag="$(_base_comfy_newest_tag_remote "$COMFY" "$rmt")"
+      if [ -n "$rtag" ]; then COMFY_NEW="${rtag#v}"; COMFY_REF_INFO="$rtag"; would "checkout -B comfy-base-stable $rtag   (ComfyUI $COMFY_OLD → $COMFY_NEW; the gate judges $COMFY_NEW)"
+      else would "fetch tags and check out the newest v* tag"; note "could not reach the remote: the gate judges the CURRENT version"; fi
+    else
+      local got sha v; got="$(_base_comfy_ref_version "$(_base_git -C "$COMFY" remote get-url "$rmt" 2>/dev/null)" "$ref")"
+      sha="${got%% *}"; v="${got#* }"
+      if [ -n "$sha" ] && [ -n "$v" ] && [ "$v" != "$got" ]; then COMFY_NEW="$v"; COMFY_REF_INFO="$ref @ $sha"; would "checkout -B comfy-base-stable $ref ($sha, reports $v; the gate judges $v)"
+      else would "fetch $ref and check it out"; note "could not read $ref's version: the gate judges the CURRENT version"; fi
+    fi
     return 0
   else
     local fetch_out fetch_rc=0
@@ -207,12 +273,41 @@ base_update_comfyui(){ # newest v* release tag, checked out on branch comfy-base
       echo "      $(_base_git_diag "$fetch_out")"
       BASE_FAILED+=("ComfyUI: git fetch failed, still $COMFY_OLD"); return 0
     fi
+    if [ "$ref" != release ]; then
+      fetch_rc=0; fetch_out="$(_base_git -C "$COMFY" fetch --force "$rmt" "$ref" 2>&1)" || fetch_rc=$?
+      if [ "$fetch_rc" -ne 0 ]; then
+        err "COMFY_REF=$ref could not be fetched from '$rmt': staying on $COMFY_OLD"
+        echo "      $(_base_git_diag "$fetch_out")"
+        BASE_FAILED+=("ComfyUI: COMFY_REF=$ref not fetched, still $COMFY_OLD"); return 0
+      fi
+    fi
   fi
-  tag="$(_base_git -C "$COMFY" tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
-  if [ -z "$tag" ]; then note "no release tags visible — ComfyUI left at $COMFY_OLD"; return 0; fi
+  newest="$(_base_git -C "$COMFY" tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+  if [ "$ref" = release ]; then
+    tag="$newest"
+    if [ -z "$tag" ]; then note "no release tags visible: ComfyUI left at $COMFY_OLD"; return 0; fi
+  else
+    tag="$(_base_git -C "$COMFY" rev-parse FETCH_HEAD 2>/dev/null || true)"
+    if [ "$BASE_NO_NET" = "1" ]; then tag="$(_base_git -C "$COMFY" rev-parse -q --verify "$ref^{commit}" 2>/dev/null || true)"; fi
+    if [ -z "$tag" ]; then err "COMFY_REF=$ref resolves to no commit here: staying on $COMFY_OLD"; BASE_FAILED+=("ComfyUI: COMFY_REF=$ref unresolved"); return 0; fi
+    if _base_comfy_ref_is_older "$COMFY" "$tag" "$newest"; then
+      err "COMFY_REF=$ref is OLDER than the newest release $newest (an ancestor of it): refused: an opt-in only moves forward"
+      BASE_FAILED+=("ComfyUI: COMFY_REF=$ref is older than $newest, refused"); return 0
+    fi
+  fi
   [ "$(_base_git -C "$COMFY" rev-parse HEAD)" = "$(_base_git -C "$COMFY" rev-parse "$tag^{commit}")" ] && head_at_tag=1 || true
+  _base_comfy_ref_info(){ # sets COMFY_REF_INFO from the checked-out tree
+    local s v; s="$(_base_git -C "$COMFY" rev-parse --short HEAD 2>/dev/null)"; v="$(_base_comfy_version "$COMFY" 2>/dev/null)"
+    if [ "$ref" = release ]; then COMFY_REF_INFO="$tag @ $s"
+    else
+      COMFY_REF_INFO="$ref @ $s (reports $v"
+      if [ -n "$newest" ] && ! _base_vge "$v" "${newest#v}"; then COMFY_REF_INFO="$COMFY_REF_INFO; newest release $newest"; fi
+      COMFY_REF_INFO="$COMFY_REF_INFO)"
+    fi
+  }
   if [ "$head_at_tag" = "1" ]; then
-    COMFY_NEW="${tag#v}"; ok "ComfyUI already at $tag (branch $(_base_git -C "$COMFY" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))"; return 0
+    COMFY_NEW="$(_base_comfy_version "$COMFY" 2>/dev/null)"; _base_comfy_ref_info
+    ok "ComfyUI already at $COMFY_REF_INFO (branch $(_base_git -C "$COMFY" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))"; return 0
   fi
   if [ "$BASE_DRY" = "1" ]; then would "checkout -B comfy-base-stable $tag"; COMFY_NEW="${tag#v}"; return 0; fi
   _base_git -C "$COMFY" diff --quiet && _base_git -C "$COMFY" diff --cached --quiet || dirty=1
@@ -224,8 +319,9 @@ base_update_comfyui(){ # newest v* release tag, checked out on branch comfy-base
     else miss "stash failed — checkout may refuse"; fi
   fi
   if _base_git -C "$COMFY" checkout -q -B comfy-base-stable "$tag"; then
-    COMFY_NEW="${tag#v}"; ok "ComfyUI $COMFY_OLD → $COMFY_NEW (branch comfy-base-stable at $tag)"
-    BASE_CHANGED+=("ComfyUI $COMFY_OLD → $COMFY_NEW")
+    COMFY_NEW="$(_base_comfy_version "$COMFY" 2>/dev/null)"; _base_comfy_ref_info
+    ok "ComfyUI $COMFY_OLD → $COMFY_NEW ($COMFY_REF_INFO, branch comfy-base-stable)"
+    BASE_CHANGED+=("ComfyUI $COMFY_OLD → $COMFY_NEW ($COMFY_REF_INFO)")
   else
     miss "checkout $tag failed — staying on $COMFY_OLD"; BASE_WARN+=("ComfyUI: checkout $tag failed, still $COMFY_OLD")
   fi
@@ -240,7 +336,11 @@ base_comfy_gate(){ # an out-of-date ComfyUI wrecked a run only *after* 123 GB ha
   echo "      Nothing was downloaded and the venv is untouched; the running server is unaffected."
   echo "      Repair the checkout, then re-run:"
   echo "        git -C \"$COMFY\" fetch --tags --force --prune origin"
-  echo "        git -C \"$COMFY\" checkout -B comfy-base-stable \"\$(git -C \"$COMFY\" tag -l 'v*' --sort=-v:refname | head -1)\""
+  if [ "$(_base_comfy_ref)" = release ]; then
+    echo "        git -C \"$COMFY\" checkout -B comfy-base-stable \"\$(git -C \"$COMFY\" tag -l 'v*' --sort=-v:refname | head -1)\""
+  else
+    echo "        git -C \"$COMFY\" fetch origin \"$(_base_comfy_ref)\" && git -C \"$COMFY\" checkout -B comfy-base-stable FETCH_HEAD"
+  fi
   BASE_FAILED+=("ComfyUI $cur < required $want — stopped before any download")
   return 1
 }

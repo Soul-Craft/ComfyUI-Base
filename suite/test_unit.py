@@ -95,7 +95,7 @@ def test_unit_no_and_list_ends_a_loop_body():
 
 def test_unit_outbound_hosts_are_allowlisted():
     allow = {"huggingface.co", "github.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
-             "127.0.0.1", "localhost", "0.0.0.0"}
+             "developer.download.nvidia.com", "127.0.0.1", "localhost", "0.0.0.0"}   # 3.0.0: NVIDIA's CUDA repository (the driver)
     src = "\n".join(_src(p) for p in [*LIB, *sorted((BASE / "py").glob("*.py"))])
     hosts = set(re.findall(r"https?://([A-Za-z0-9.-]+)", src))
     assert hosts <= allow, hosts - allow
@@ -241,7 +241,9 @@ def test_unit_torch_pick_has_no_soak_and_no_fallback():
 def test_unit_python_pick_resolves_pack_requirements_too():
     src = code_only((BASE / "lib" / "30-venv.sh").read_text())
     body = src[src.index("_base_python_pick()"):src.index("_base_torch_pick()")]
-    assert "uv pip compile" in body and "_base_all_reqfiles" in body and "download.pytorch.org/whl/cu130" in body
+    # 3.0.0: the derived set (every upstream pin lifted) and uv's own torch backend, never a hard-coded CUDA index
+    assert "uv pip compile" in body and "_base_reqlift" in body and "derived.txt" in body and "--torch-backend" in body
+    assert "whl/cu1" not in body
     assert "FALLBACK" not in body and "BASE_FAILED" in body                   # no fallback Python
 
 
@@ -344,22 +346,26 @@ def _fake_pack_repo(tmp_path, name, n_commits=2):
     return src, shas
 
 
-def test_unit_packs_pin_to_the_declared_commit_and_latest_prints_new_rows(tmp_path):
+def test_unit_packs_go_to_their_head_and_the_records_are_printed_every_run(tmp_path):
+    """3.0.0: a row's sha is the last-tested record, never a target. Every run clones or moves the pack to its remote's
+    HEAD and prints the record rows, so podctl can write back what a green install measured."""
     c = tmp_path / "ComfyUI"; c.mkdir(); (c / "main.py").write_text("")
     src, shas = _fake_pack_repo(tmp_path, "FakePack")
     row = f"FakePack|{src}|{shas[0]}||test pack"
     r = _bash(f'BASE_PACKS=(); PACKS=("{row}"); base_env_setup; base_discover quiet; base_packs git; git -C "$CN/FakePack" rev-parse HEAD', env={"BASE_FAKE_ROOT": str(tmp_path)})
-    assert shas[0] in r.stdout, r.stdout + r.stderr
-    r = _bash(f'BASE_PACKS=(); PACKS=("{row}"); base_env_setup; base_discover quiet; base_packs git; printf "%s\\n" "${{BASE_PACKS_LATEST_ROWS[@]}}"', env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_LATEST": "1"})
-    assert f"FakePack|{src}|{shas[1]}||test pack" in r.stdout, r.stdout + r.stderr
+    assert r.stdout.strip().endswith(shas[1]), r.stdout + r.stderr
+    assert f'"FakePack|{src}|{shas[1]}||test pack"' in r.stdout, r.stdout
 
 
-def test_unit_an_unreachable_pin_is_a_failure_not_a_warning(tmp_path):
-    c = tmp_path / "ComfyUI"; c.mkdir(); (c / "main.py").write_text("")
+def test_unit_a_pack_that_cannot_reach_its_head_is_a_failure_not_a_warning(tmp_path):
+    c = tmp_path / "ComfyUI"; (c / "custom_nodes").mkdir(parents=True); (c / "main.py").write_text("")
     src, shas = _fake_pack_repo(tmp_path, "FakePack")
-    row = f"FakePack|{src}|{'0' * 40}||test pack"
+    subprocess.run(["git", "clone", "-q", str(src), str(c / "custom_nodes" / "FakePack")], check=True)
+    gone = tmp_path / "gone.git"
+    subprocess.run(["git", "-C", str(c / "custom_nodes" / "FakePack"), "remote", "set-url", "origin", str(gone)], check=True)
+    row = f"FakePack|{gone}|{'0' * 40}||test pack"
     r = _bash(f'BASE_PACKS=(); PACKS=("{row}"); base_env_setup; base_discover quiet; base_packs git || true; echo FAILED=${{#BASE_FAILED[@]}}', env={"BASE_FAKE_ROOT": str(tmp_path)})
-    assert "FAILED=1" in r.stdout, r.stdout + r.stderr
+    assert "FAILED=1" in r.stdout and "not at its newest" in r.stdout, r.stdout + r.stderr
 
 
 def test_unit_a_package_may_not_redeclare_a_base_pack():
@@ -399,7 +405,10 @@ def test_unit_list_packs_merges_and_dedupes_across_package_dirs(tmp_path):
     assert r.returncode == 0 and sum(1 for ln in r.stdout.splitlines() if ln.startswith("Shared|")) == 1 and "rgthree-comfy|" in r.stdout, r.stdout + r.stderr
     s = tmp_path / "B Pkg" / "B Pkg-script.sh"; s.write_text(s.read_text().replace("1" * 40, "2" * 40))
     r = subprocess.run(["bash", str(BASE / "base.sh"), "list-packs", str(tmp_path / "A Pkg"), str(tmp_path / "B Pkg")], capture_output=True, text=True)
-    assert r.returncode == 1 and "Shared" in r.stderr, r.stdout + r.stderr
+    assert r.returncode == 0 and "Shared: records differ" in r.stderr, r.stdout + r.stderr       # 3.0.0: records, not pins
+    s.write_text(s.read_text().replace("github.com/x/Shared", "github.com/y/Shared"))
+    r = subprocess.run(["bash", str(BASE / "base.sh"), "list-packs", str(tmp_path / "A Pkg"), str(tmp_path / "B Pkg")], capture_output=True, text=True)
+    assert r.returncode == 1 and "Shared comes from two URLs" in r.stderr, r.stdout + r.stderr
 
 
 def test_unit_all_reqfiles_covers_comfyui_and_every_located_pack(tmp_path):
@@ -1117,8 +1126,12 @@ def test_unit_sageattention_builder_is_dry_run_aware_and_idempotent(tmp_path):
     assert "would build SageAttention" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
     r = _bash(base + 'BASE_DRY=0; BASE_NO_NET=1; base_build_sageattention; echo F=${#BASE_FAILED[@]}')
     assert "SageAttention: skipped" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
-    r = _bash(base + 'BASE_DRY=0; BASE_NO_NET=0; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env={"SAGE_STUB_RC": "0"})
-    assert "already in" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
+    # 3.0.0: "imports" is not enough; it must be built from main's newest commit for this venv (the stamped cache key)
+    gitbin = tmp_path / "gitbin"; gitbin.mkdir()
+    (gitbin / "git").write_text('#!/bin/bash\n[ "$1" = ls-remote ] && { echo "abcdef1234567890abcdef1234567890abcdef12\trefs/heads/main"; exit 0; }\nexec /usr/bin/git "$@"\n'); (gitbin / "git").chmod(0o755)
+    (v / ".comfy-base-sageattention").write_text("sageattention-abcdef123456-cp-torch0-sm\n")
+    r = _bash(base + 'BASE_DRY=0; BASE_NO_NET=0; BASE_GPU_SM=""; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env={"SAGE_STUB_RC": "0", "PATH": f"{gitbin}:{os.environ['PATH']}"})
+    assert "already built from SageAttention abcdef123456" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
     r = _bash(base + 'BASE_DRY=0; BASE_NO_NET=0; BASE_GPU_SM=""; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env={"SAGE_STUB_RC": "1"})
     assert "no CUDA device visible" in r.stdout and "F=1" in r.stdout, r.stdout + r.stderr
     # torch 2.14's headers demand C++20 and upstream's setup.py hardcodes -std=c++17: every kernel failed at the first include
@@ -1338,9 +1351,11 @@ def test_unit_pip_extra_is_installed_every_run_not_only_on_a_rebuild():
     """A venv the base built for another package (or before any package) has never seen this package's PIP_EXTRA."""
     body = code_only(_src(BASE / "lib" / "40-packs.sh"))
     pip_half = body[body.index('hdr "NODE PACKS · requirements'):]
-    assert 'PIP_EXTRA[@]' in pip_half and "--extra-index-url https://pypi.nvidia.com" in pip_half, "the pip stage must install PIP_EXTRA"
-    tail = pip_half[pip_half.index("extras="):][:900]
-    assert "BASE_DRY" in tail and "BASE_NO_NET" in tail, "dry-run and fake runs must not pip"
+    assert "_base_reqlift" in pip_half and "_base_derived_install" in pip_half, "the pip stage installs the derived set every run"
+    assert "BASE_DRY" in pip_half and "BASE_NO_NET" in pip_half, "dry-run and fake runs must not pip"
+    latest = code_only(_src(BASE / "lib" / "47-latest.sh"))
+    lift = latest[latest.index("_base_reqlift(){"):latest.index("_base_lift_who(){")]
+    assert 'PIP_EXTRA[@]' in lift and "https://pypi.nvidia.com" in latest, "PIP_EXTRA goes into the derived set, NVIDIA's index with it"
 
 
 def test_unit_sync_rewrites_a_bypassed_loader_whose_file_has_a_row_and_keeps_a_compact_file(tmp_path):
@@ -1811,12 +1826,12 @@ def test_unit_uv_is_installed_into_the_tools_venv_on_the_volume_never_the_system
     uv comes from PyPI into the base's tools venv on the volume ($BASE_HOME/tools, made with the system python's venv
     module); the system interpreter is never written to; the second run finds it."""
     c = _pod(tmp_path); bin_ = tmp_path / "bin"; bin_.mkdir(); log = tmp_path / "calls.log"
-    tools = tmp_path / "comfy-base" / "tools"
-    # one stub python: as the SYSTEM interpreter it refuses `-m pip` (PEP 668); copied into the tools venv by `-m venv`
+    tools = tmp_path / "comfy-base" / "tools-bootstrap"                                  # 3.0.0: only to fetch uv; uv itself is $BASE_HOME/bin/uv
+    # one stub python: as the SYSTEM interpreter it refuses `-m pip` (PEP 668); copied into the bootstrap venv by `-m venv`
     # it becomes that venv's python, whose `-m pip install … uv` creates bin/uv. Every call logs "$0 $*".
     py = bin_ / "python3"
     py.write_text('#!/bin/bash\necho "$0 $*" >> "%s"\n'
-                  'case "$0" in */tools/bin/python)\n'
+                  'case "$0" in */tools-bootstrap/bin/python)\n'
                   '  case "$*" in "-m pip --version") echo "pip 99 (stub)"; exit 0;; *"-m pip install"*uv*) printf "#!/bin/bash\\necho uv 9.9-stub\\n" > "$(dirname "$0")/uv"; chmod +x "$(dirname "$0")/uv"; exit 0;; esac; exit 0;;\n'
                   'esac\n'
                   'if [ "$1 $2" = "-m venv" ]; then d="$3"; mkdir -p "$d/bin"; cp "$0" "$d/bin/python"; exit 0; fi\n'
@@ -1824,7 +1839,7 @@ def test_unit_uv_is_installed_into_the_tools_venv_on_the_volume_never_the_system
     py.chmod(0o755)
     env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_, "SYS_PY": str(py)}
     r = _bash('base_env_setup; _base_ensure_uv && echo UV=$(command -v uv)', env=env)
-    assert ("UV=%s" % (tools / "bin" / "uv")) in r.stdout, r.stdout + r.stderr
+    assert ("UV=%s" % (tmp_path / "comfy-base" / "bin" / "uv")) in r.stdout, r.stdout + r.stderr
     calls = log.read_text()
     assert ("%s -m venv %s" % (py, tools)) in calls and ("%s/bin/python -m pip install" % tools) in calls and "uv" in calls.split("-m pip install")[1]
     assert ("%s -m pip" % py) not in calls                                                 # the system interpreter is never touched
@@ -1850,7 +1865,7 @@ exit 0
 
 def _uv_stub(tmp_path, fail=False):
     """A uv 0.12-shaped stub in the tools venv (so _base_ensure_uv finds it) that logs argv and either resolves or not."""
-    t = tmp_path / "comfy-base" / "tools" / "bin"; t.mkdir(parents=True, exist_ok=True); log = tmp_path / "calls.log"
+    t = tmp_path / "comfy-base" / "bin"; t.mkdir(parents=True, exist_ok=True); log = tmp_path / "calls.log"   # 3.0.0: the base's own uv
     (t / "uv").write_text(UV_STUB.replace("__LOG__", str(log)).replace("__FAIL__", "1" if fail else "")); (t / "uv").chmod(0o755)
     return log
 
@@ -1886,58 +1901,18 @@ def test_unit_pip_extra_step_is_safe_when_a_package_declares_none(tmp_path):
     assert "RC=0" in r.stdout and "nvidia-vfx sageattention" in r.stdout and "-c /dev/null" in r.stdout, r.stdout + r.stderr
 
 
-PIP_CHECK_CONFLICT = (
-    "transformers 5.17.0 has requirement huggingface-hub<2.0,>=1.5.0, but you have huggingface-hub 2.0.0.\n"
-    "comfyui-frontend-package 1.54.7 requires comfyui-workflow-templates, which is not installed.\n")
-PIP_CHECK_CLEAN = "No broken requirements found.\n"
-
-
-def _reconcile(d, first, second, extra=""):
-    """_base_venv_reconcile against a fake _base_pip whose `check` answers `first`, then `second` ((text, rc) each)."""
-    d.mkdir(parents=True, exist_ok=True)
-    for n, (text, rc) in enumerate((first, second), 1):
-        (d / f"check{n}.txt").write_text(text, encoding="utf-8")
-        (d / f"check{n}.rc").write_text(str(rc), encoding="utf-8")
-    fake = ('_base_pip(){ if [ "$1" = check ]; then n=$(cat "{d}/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{d}/n"; '
-            'cat "{d}/check$n.txt"; return $(cat "{d}/check$n.rc"); fi; echo "PIP $*"; }').replace("{d}", str(d))
-    return _bash("set -u; %s; CONSTRAINTS=/dev/null; BASE_DRY=0; BASE_NO_NET=0; %s _base_venv_reconcile; echo RC=$?" % (fake, extra))
-
-
-def test_unit_reconcile_names_both_sides_of_every_pip_check_conflict(tmp_path):
-    """2.12.3: both of pip's conflict shapes, parsed portably (a sed replacement's "\\n" is a literal n on the Mac)."""
-    (tmp_path / "check.txt").write_text(PIP_CHECK_CONFLICT, encoding="utf-8")
-    r = _bash('_base_venv_reconcile_names < "%s"' % (tmp_path / "check.txt"))
-    assert r.stdout.split() == ["comfyui-frontend-package", "comfyui-workflow-templates", "huggingface-hub", "transformers"], r.stdout + r.stderr
-
-
-def test_unit_reconcile_re_resolves_a_conflict_in_one_call_at_the_newest(tmp_path):
-    """Verda, 2026-09-25: a reused venv's per-pack `pip install --upgrade -r` took huggingface-hub to 2.0.0 past the newest
-    transformers' <2.0 cap, and main.py died at import. Both sides go to pip TOGETHER, under the torch constraint, unpinned."""
-    r = _reconcile(tmp_path, (PIP_CHECK_CONFLICT, 1), (PIP_CHECK_CLEAN, 0))
-    out = r.stdout + r.stderr
-    call = "PIP install -q --upgrade -c /dev/null comfyui-frontend-package comfyui-workflow-templates huggingface-hub transformers"
-    assert call in out and "conflicts re-resolved" in out and "RC=0" in out, out
-    assert out.count("PIP install") == 1 and "==" not in out, out           # one resolve, and no pin written
-
-
-def test_unit_reconcile_leaves_a_clean_venv_alone_and_never_fails_a_run(tmp_path):
-    r = _reconcile(tmp_path / "clean", (PIP_CHECK_CLEAN, 0), ("", 0))
-    assert "every requirement in the venv agrees" in r.stdout + r.stderr and "PIP " not in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
-    r = _reconcile(tmp_path / "stuck", (PIP_CHECK_CONFLICT, 1), (PIP_CHECK_CONFLICT, 1))
-    assert "left to the import check" in r.stdout + r.stderr and "RC=0" in r.stdout, r.stdout + r.stderr   # the import check stays the gate
-    r = _reconcile(tmp_path / "dry", (PIP_CHECK_CONFLICT, 1), ("", 0), extra="BASE_DRY=1;")
-    assert "PIP " not in r.stdout and not (tmp_path / "dry" / "n").exists() and "RC=0" in r.stdout, r.stdout + r.stderr
-
-
-def test_unit_reconcile_follows_every_pip_half():
-    """Both places the venv takes requirements call it after their installs: the per-pack loop, which runs on EVERY run
-    (a reused venv included, which is where it broke), and the build."""
-    packs = code_only(_src(BASE / "lib" / "40-packs.sh"))
-    loop = packs.index('-r "$rf"')
-    assert loop < packs.index("_base_venv_reconcile", loop) < packs.index("_base_pack_imports_report ${probe"), "reconcile after the pack loop"
-    venv = code_only(_src(BASE / "lib" / "30-venv.sh"))
-    hub = venv.index('"huggingface_hub[hf-xet]"')
-    assert hub < venv.index("_base_venv_reconcile", hub) < venv.index('_base_venv_verify "$pymm"', hub), "reconcile before the build's verify"
+def test_unit_no_upstream_file_is_installed_on_its_own_so_nothing_overshoots_a_cap():
+    """2.12.3, measured on a Verda machine: transformers 5.17.0 (its newest) "has requirement huggingface-hub<2.0,>=1.5.0,
+    but you have huggingface-hub 2.0.0", because `pip install --upgrade -r <pack file>` took a bare huggingface_hub to
+    its newest outside any resolve with transformers. 2.12.3 repaired it afterwards with `pip check`. 3.0.0 removes the
+    cause: every requirement is installed in ONE uv resolve of the derived set (the newest set that agrees: transformers
+    5.17.0 with hub 1.33.0), and a force past a cap is kept only if the package that set the cap still imports
+    (py/holders.py), so hub 2.0.0 is taken back and named instead of breaking ComfyUI's startup."""
+    src = code_only("\n".join(_src(p) for p in LIB))
+    assert "_base_venv_reconcile" not in src                                   # superseded, and it would undo a deliberate force
+    assert not re.search(r"(pip|uvpip)[^\n]*install[^\n]*-r \"\$(f|rf|COMFY/requirements\.txt)\"", src)   # no upstream file on its own
+    latest = code_only(_src(BASE / "lib" / "47-latest.sh"))
+    assert "_base_revert_forced" in latest and "py/holders.py" in latest
 
 
 def test_unit_optional_declarations_are_never_counted_unguarded():
@@ -2008,7 +1983,7 @@ def test_unit_the_test_command_runs_the_suite_with_the_base_s_own_uv_when_none_i
     """On the pod `…-script.sh test` said "no pytest in the venv and no uv": uv lives in the base's tools venv on the
     volume (2.0.1), which the install path puts on PATH and the test command, run on its own, did not (2.0.5)."""
     _pod(tmp_path)
-    tools = tmp_path / "comfy-base" / "tools" / "bin"; tools.mkdir(parents=True)
+    tools = tmp_path / "comfy-base" / "bin"; tools.mkdir(parents=True)                  # 3.0.0: the base's own uv lives here
     uv = tools / "uv"; uv.write_text('#!/bin/bash\necho "uv $*" >> "$(dirname "$0")/calls.log"\necho "1 passed"\n'); uv.chmod(0o755)
     r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; base_test unit; echo "RESULT=$BASE_TEST_RESULT RC=$BASE_TEST_RC"',
               env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})   # HOME too: base_env_setup adds ~/.local/bin, where the Mac's real uv lives (a real uv here re-runs the whole suite inside this test)
@@ -2143,7 +2118,8 @@ def test_unit_pytest_is_installed_into_our_venv_so_the_suite_runs_inside_it(tmp_
     r = _bash('set -u; _base_venv_pytest(){ echo INSTALL; }; PY="%s"; _base_venv_ensure_pytest; PY="%s"; _base_venv_ensure_pytest; echo RC=$?' % (bin_ / "py-with", bin_ / "py-without"))
     assert r.stdout.count("INSTALL") == 1 and "RC=0" in r.stdout, r.stdout + r.stderr
     src30 = code_only((BASE / "lib" / "30-venv.sh").read_text()); src95 = code_only((BASE / "lib" / "95-summary.sh").read_text())
-    assert "_base_venv_pytest || step_fail=1" in src30 and "_base_venv_ensure_pytest" in src30[src30.index("base_venv()"):]
+    src47 = code_only((BASE / "lib" / "47-latest.sh").read_text())
+    assert " pytest " in src47[src47.index("_base_derived_install(){"):] and "_base_venv_ensure_pytest" in src30[src30.index("base_venv()"):]   # 3.0.0: in the one resolve
     assert "_base_venv_pytest" in src95[src95.index("base_test()"):]
     assert '-c "$CONSTRAINTS" pytest "huggingface_hub' not in src30     # the one-line install whose pytest half silently never happened
 
@@ -2238,16 +2214,12 @@ def test_unit_the_disk_gate_uses_the_volume_size_podctl_recorded_on_a_pooled_fil
     assert "RC=0 W=1" in r.stdout and "not verifiable" in r.stdout and "podctl" in r.stdout, r.stdout + r.stderr                # honest, and tells how to fix it
 
 
-def test_unit_a_green_latest_run_settles_its_warning_into_a_note():
-    """`--latest` warns that packs are off their pins and untested — true until the run's own suite proves them. A green
-    run settles the warning into a note (save the printed pins); a red one keeps it."""
-    entry = "--latest: packs are off their pinned commits; the suites have not been run against these"
-    r = _bash('BASE_WARN=("%s" "other"); BASE_FAILED=(); BASE_TEST_RC=0; BASE_LATEST=1; _base_warn_settle; echo N=${#BASE_WARN[@]}' % entry)
-    assert "N=1" in r.stdout and "green" in r.stdout and "pin" in r.stdout, r.stdout + r.stderr
-    r = _bash('BASE_WARN=("%s"); BASE_FAILED=(); BASE_TEST_RC=1; BASE_LATEST=1; _base_warn_settle; echo N=${#BASE_WARN[@]}' % entry)
-    assert "N=1" in r.stdout and "green" not in r.stdout, r.stdout + r.stderr
+def test_unit_latest_is_a_plain_run_and_nothing_is_left_to_settle():
+    """3.0.0: every run takes everything to its newest, so `--latest` is the same as a plain run and there is no "off its
+    pins" warning to settle any more: the packs are always at their HEAD and their records are printed every run."""
     src = code_only((BASE / "lib" / "95-summary.sh").read_text())
-    assert src.index("_base_warn_settle") < src.index('warnings   ${#BASE_WARN[@]}')          # settled before the summary counts them
+    assert "--latest)  base_run" in src and "_base_warn_settle" not in src and "BASE_LATEST=1" not in src
+    assert "BASE_LATEST" not in code_only((BASE / "lib" / "40-packs.sh").read_text())
 
 
 def test_unit_snapshot_console_errors_are_classified_not_counted(tmp_path):
@@ -2296,7 +2268,7 @@ def test_unit_the_suite_never_inherits_the_runs_tokens_and_a_red_suite_fails_the
     The runner strips every Hub token name from the suite's environment. And the step reported STEP RC=0 with
     "suite: 2 failed": a red suite is a failed run, not a warning."""
     _pod(tmp_path)
-    tools = tmp_path / "comfy-base" / "tools" / "bin"; tools.mkdir(parents=True)
+    tools = tmp_path / "comfy-base" / "bin"; tools.mkdir(parents=True)
     uv = tools / "uv"; uv.write_text('#!/bin/bash\necho "uv env HF_TOKEN=${HF_TOKEN:-unset} HF_HUB_TOKEN=${HF_HUB_TOKEN:-unset}" >> "$(dirname "$0")/calls.log"\necho "2 failed, 3 passed"\nexit 1\n'); uv.chmod(0o755)
     r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; export HF_TOKEN=hf_real HF_HUB_TOKEN=hub_real; base_test unit; echo "RC=$BASE_TEST_RC FAILED=${#BASE_FAILED[@]} WARN=${#BASE_WARN[@]}"',
               env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
@@ -2373,41 +2345,22 @@ def test_unit_noninteractive_means_no_tty_and_every_prompt_takes_its_default():
     assert "NI=1 PIN=1" in r3.stdout and "child NI=1 PIN=1" in r3.stdout, r3.stdout   # exported: a package script the boot runs inherits them
 
 
-def test_unit_pinned_mode_fetches_nothing_checks_out_nothing_and_refuses_latest(tmp_path):
+def test_unit_the_retired_pinned_mode_freezes_nothing(tmp_path):
+    """3.0.0 retired BASE_PINNED and COMFY_TAG: a machine that sets them still moves ComfyUI to its newest release, and
+    says the variables are retired; `--latest` is never refused (it is a plain run)."""
     work = _fake_comfy_repo(tmp_path)
-    before = subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True).stdout
     r = _bash('base_env_setup; base_discover quiet; base_update_comfyui; echo OLD=$COMFY_OLD NEW=$COMFY_NEW', env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_PINNED": "1", "COMFY_TAG": "v0.34.0"})
-    assert "pinned at v0.34.0" in r.stdout and "image tag v0.34.0" in r.stdout and "OLD=0.34.0 NEW=0.34.0" in r.stdout, r.stdout + r.stderr
-    assert before == subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True).stdout
-    quiet = r.stdout.replace("no fetch, no checkout", "")
-    assert "fetch" not in quiet and "checkout" not in quiet, r.stdout
-    # the gate still applies: a seed below a package's floor fails there, loudly
-    r2 = _bash("COMFY_MIN=9.9.9; base_env_setup; base_discover quiet; base_update_comfyui; base_comfy_gate || echo GATE=$?", env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_PINNED": "1"})
-    assert "GATE=1" in r2.stdout, r2.stdout + r2.stderr
-    # --latest is refused before anything runs, in both entries
-    r3 = _bash('PKG_ID=t; PKG_NAME=t; PKG_VERSION=1; BASE_MIN=1; COMFY_MIN=0.1.0; PACKS=(); MODELS=(); (base_main --latest); echo RC=$?', env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_PINNED": "1"})
-    assert "refused in pinned mode" in r3.stderr and "RC=2" in r3.stdout, r3.stdout + r3.stderr
-    r4 = subprocess.run(["bash", str(BASE / "base.sh"), "latest"], capture_output=True, text=True, env={**os.environ, "BASE_FAKE_ROOT": str(tmp_path), "BASE_PINNED": "1"})
-    assert r4.returncode == 2 and "refused in pinned mode" in r4.stderr, r4.stdout + r4.stderr
-    r5 = _bash('base_env_setup; base_discover quiet; base_update_comfyui; echo OLD=$COMFY_OLD NEW=$COMFY_NEW', env={"BASE_FAKE_ROOT": str(tmp_path)})
-    assert "OLD=0.34.0 NEW=0.35.0" in r5.stdout, r5.stdout + r5.stderr                    # unpinned (a hand-installed pod): unchanged behaviour
+    assert "OLD=0.34.0 NEW=0.35.0" in r.stdout and "retired" in r.stdout + r.stderr, r.stdout + r.stderr
+    src = code_only((BASE / "lib" / "95-summary.sh").read_text())
+    assert "_base_refuse_latest_if_pinned" not in src and "refused in pinned mode" not in src
 
 
-def test_unit_pinned_venv_needs_the_seed_stamp_reuses_it_and_never_rebuilds(tmp_path):
+def test_unit_a_retired_pinned_flag_builds_the_venv_like_any_run(tmp_path):
     c = tmp_path / "ComfyUI"; c.mkdir(); (c / "main.py").write_text(""); (c / "requirements.txt").write_text("")
     env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_PINNED": "1"}
-    r = _bash('PKG_ID=t; base_env_setup; base_discover quiet; base_venv || echo VENV_RC=$?; echo RESULT=$BASE_VENV_RESULT FAILED=${#BASE_FAILED[@]}', env=env)
-    assert "VENV_RC=1" in r.stdout and "RESULT=failed-pinned" in r.stdout and "FAILED=1" in r.stdout and "no .comfy-base-venv stamp" in r.stdout, r.stdout + r.stderr
-    assert not (c / ".venv-cu130" / "bin" / "python").exists()                          # nothing is built in pinned mode
-    # the seed arrives (an unpinned fake run writes the stamp), then pinned reuses it
-    r2 = _bash('PKG_ID=t; base_env_setup; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT', env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1"})
-    assert "RESULT=fake" in r2.stdout, r2.stdout + r2.stderr
-    r3 = _bash('PKG_ID=t; base_env_setup; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT', env=env)
-    assert "RESULT=reused" in r3.stdout, r3.stdout + r3.stderr
-    # the real (networked) path reads the picks from the stamp and never calls the pickers
-    src = code_only(_src(BASE / "lib" / "30-venv.sh"))
-    pinned = src[src.index('if [ "$BASE_PINNED" = "1" ]; then\n    local stamp;'):src.index("owner=\"$(_base_venv_owner)\"")]
-    assert "_base_python_pick" not in pinned.split("else")[0] and "torch=" in pinned and "no rebuild in pinned mode" in src
+    r = _bash('PKG_ID=t; base_env_setup; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT FAILED=${#BASE_FAILED[@]}', env=env)
+    assert "RESULT=fake FAILED=0" in r.stdout and "retired" in r.stdout, r.stdout + r.stderr
+    assert (c / ".venv-cu130" / "bin" / "python").exists()
 
 
 def test_unit_tokens_export_the_button_names_and_never_a_value(tmp_path):
@@ -2694,20 +2647,18 @@ def test_unit_the_mcp_stage_runs_after_the_packs_and_before_the_import_check():
     run = src[src.index("base_run(){"):]
     run = run[:run.index("\n}")]
     assert "base_mcp" in run, "base_mcp is never called"
-    assert run.index("base_packs pip") < run.index("base_mcp") < run.index("base_import_check"), run
+    assert run.index("base_packs pip") < run.index("base_mcp") < run.index("base_venv_latest") < run.index("base_import_check"), run
+    assert run.index("base_system") < run.index("_base_driver_gate") < run.index("_base_install_lock") < run.index("base_venv_snapshot") < run.index("if ! base_venv"), run
 
 
-def test_unit_sageattention_takes_a_commit_as_well_as_a_branch():
-    """SAGE_REF has been documented as the way to pin SageAttention, but `git clone --depth 1 --branch <sha>`
-    refuses a commit ("Remote branch <sha> not found in upstream origin"), so passing one failed at the clone
-    for as long as the knob existed. A commit is fetched by object name now. The DEFAULT stays main on
-    purpose: the wheel cache is keyed on the resolved upstream commit precisely so tracking upstream costs
-    nothing, and a version-keyed cache would be the stale pin this repo refuses."""
+def test_unit_sageattention_follows_main_and_a_commit_is_no_longer_a_pin():
+    """3.0.0: SAGE_REF names a branch or a tag (default main); a 40-hex SAGE_REF and SAGE_WHEEL are retired, because each
+    held SageAttention below its newest. It is rebuilt whenever its full cache key (commit, Python, torch, sm) moves."""
     body = (BASE / "lib" / "40-packs.sh").read_text()
-    assert "[0-9a-f]{40}" in body, "a 40-hex SAGE_REF must be recognised as a commit"
-    assert "fetch -q --depth 1 origin" in body, "a commit is fetched by object name, not --branch"
-    assert '--branch "$ref"' in body, "a branch or a tag still takes the clone fast path"
-    assert "SAGE_REF:-main" in body, "the default stays main deliberately"
+    sage = body[body.index("base_build_sageattention()"):body.index("base_consolidate()")]
+    assert "SAGE_REF:-main" in sage and '--branch "$ref"' in sage and "retired in 3.0.0" in sage
+    assert "SAGE_WHEEL=<url-or-path>" not in sage and '_base_pip install -q "$SAGE_WHEEL"' not in sage
+    assert ".comfy-base-sageattention" in sage and '"$key" > "$stampf"' in sage
 
 
 def test_unit_the_testbed_finds_a_consumer_repositorys_packages(tmp_path):

@@ -95,6 +95,7 @@ class FakeVerda:
         self.polls = {}
         self.counter = 0
         self.token = token
+        self.delete_fails = False
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -234,6 +235,19 @@ class FakeVerda:
                     elif body.get("action") == "attach":
                         vol["status"], vol["instance_id"] = "attached", body.get("instance_id")
                     return self._send(202, {})
+                self._send(404, {"code": "not_found"})
+
+            def do_DELETE(self):
+                self._record("DELETE", self._body())
+                if not self._authed():
+                    return
+                if self.path.startswith("/scripts/"):
+                    sid = self.path.split("/")[2]
+                    if srv.delete_fails:
+                        return self._send(500, {"code": "internal"})
+                    before = len(srv.scripts)
+                    srv.scripts = [x for x in srv.scripts if x.get("id") != sid]
+                    return self._send(200 if len(srv.scripts) < before else 404, {})
                 self._send(404, {"code": "not_found"})
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -537,7 +551,7 @@ def test_unit_verda_deploy_like_refuses_a_running_source_and_moves_the_data_volu
         assert seq[1][:2] == ("POST", "/instances") and len(seq) == 2         # the key and the script were already registered
         body = seq[1][2]
         assert body["existing_volumes"] == [DATA_VOL] and body["image"] == IMAGE and body["instance_type"] == ITYPE
-        assert body["location_code"] == "FIN-01" and body["ssh_key_ids"] == ["key-1"] and body["startup_script_id"] == "script-7"
+        assert body["location_code"] == "FIN-01" and body["ssh_key_ids"] == ["key-1"] and "startup_script_id" not in body   # 3.0.0: ensure configures it over ssh
         assert body["hostname"] == "comfy-base-2" and body["is_spot"] is False
         assert new_id in fake.instances and fake.instances[new_id]["status"] == "running"
         assert fake.volumes[DATA_VOL]["instance_id"] == new_id
@@ -885,3 +899,58 @@ def test_unit_a_machine_with_no_data_volume_does_not_block_for_ten_minutes():
     assert 'DISK_PROBE:-30' in body and '-z "$(candidates)"' in body, body[:600]
     assert "--workspace-shared" in body, "it must name the fix rather than only the symptom"
     assert "$DISK_WAIT" in body, "a disk that IS attached and slow must still get the full wait"
+
+
+# ---------------------------------------------------------------- 3.0.0: the registered startup script is kept at its newest
+
+def test_unit_verda_ensure_replaces_a_stale_registered_script_and_start_never_attaches_one(tmp_path):
+    """The live account on 2026-09-25 still had the pre-2.4.0 startup.sh registered under the same name. It was matched by
+    name, attached to every redeploy, and its host.env writer dropped BASE_VOLUME_SHARED=1 for the whole store."""
+    podctl = _load()
+    fake = FakeVerda(scripts=[{"id": "old-1", "name": "comfy-base-startup", "script": "#!/bin/bash\necho old\n"}])
+    said = []
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        assert prov.script_id(register=False, log=said.append) is None and "NOT attached" in said[-1]
+        sid = prov.script_id(register=True, log=said.append)
+        posts = fake.calls("POST", "/scripts"); dels = fake.calls("DELETE")
+        assert sid and posts and dels and dels[0][1] == "/scripts/old-1"
+        assert fake.requests.index(("POST", "/scripts", posts[0][2])) < fake.requests.index(dels[0])   # the new one first
+        assert [x["id"] for x in fake.scripts] == [sid] and fake.scripts[0]["script"] == STARTUP.read_text(encoding="utf-8")
+        assert prov.script_id(register=False) == sid                                                   # current: attached
+    finally:
+        fake.close()
+
+
+def test_unit_verda_a_failed_delete_leaves_the_stale_script_registered_but_unused(tmp_path):
+    podctl = _load()
+    fake = FakeVerda(scripts=[{"id": "old-1", "name": "comfy-base-startup", "script": "#!/bin/bash\necho old\n"}])
+    fake.delete_fails = True
+    said = []
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        sid = prov.script_id(register=True, log=said.append)
+        assert sid and sid != "old-1" and any("stays registered and unused" in m for m in said)
+        assert prov.script_id(register=False) == sid                                                   # matched by TEXT, never the stale one
+    finally:
+        fake.close()
+
+
+def test_unit_verda_host_env_reads_whether_the_workspace_is_the_store(tmp_path, monkeypatch):
+    """Measured on FIN-03 (2026-09-25): host.env was right after `ensure --workspace-shared` and wrong 23 s later, because
+    `podctl install` wrote it again from a fresh provider that only knew a shared volume was ATTACHED: it recorded a
+    library at /mnt/comfy-library that does not exist and dropped BASE_VOLUME_SHARED=1 for the whole store. It asks
+    the machine now: an NFS mount AT /workspace is the shared root."""
+    podctl = _load()
+    fake = FakeVerda(instances=[_instance()], volumes=[_volume(OS_VOL, "comfy-base-os", True), _shared()])
+    try:
+        prov = _prov(podctl, fake, tmp_path)
+        prov._last_pod = INST_ID
+        monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: types.SimpleNamespace(returncode=0, stdout="nfs4\n" if "findmnt" in cmd else "", stderr=""))
+        assert prov.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\nBASE_VOLUME_SHARED=1\n"
+        prov2 = _prov(podctl, fake, tmp_path)
+        prov2._last_pod = INST_ID
+        monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None: types.SimpleNamespace(returncode=0, stdout="ext4\n", stderr=""))
+        assert prov2.host_env() == "BASE_HOST=verda\nBASE_VOLUME=/workspace\nBASE_LIBRARY=/mnt/comfy-library\n"   # a library beside a local root
+    finally:
+        fake.close()

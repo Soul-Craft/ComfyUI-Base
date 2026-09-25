@@ -195,6 +195,9 @@ class Api:
     def put(self, path, body=None):
         return self._call("PUT", path, body)
 
+    def delete(self, path, body=None):
+        return self._call("DELETE", path, body)
+
 
 # ---------------------------------------------------------------- record helpers
 
@@ -443,24 +446,48 @@ class VerdaProvider(Provider):
             return [str(k["id"]) for k in (self.api.get("/sshkeys") or []) if key_matches(k.get("key"), pub) and k.get("id")]
 
     def script_id(self, register=True, log=None):
-        """The id of the registered comfy-base-startup script; registers hosts/verda/startup.sh (once) when absent."""
-        scripts = [s for s in (self.api.get("/scripts") or []) if isinstance(s, dict)]
+        """The id of the registered comfy-base-startup script whose TEXT is this base's hosts/verda/startup.sh.
+
+        3.0.0: a registered script is a copy of a tool, so it is kept at its newest like every other tool. It is matched
+        by text, never by name alone: an older copy under the same name (the pre-2.4.0 script, still registered on the
+        live account on 2026-09-25) would otherwise be attached to every redeploy and rewrite state/host.env without
+        BASE_VOLUME_SHARED=1, for every machine on a shared store.
+          register=True  (ensure, a command a person approves): POST the current text, then DELETE every stale copy
+                         (Verda's API has no PUT for scripts: DELETE /v1/scripts/{scriptId}). A DELETE that fails
+                         leaves the stale copy registered but never matched, so it is never used.
+          register=False (start): a stale copy is OMITTED (None), and `ensure` configures the machine over ssh."""
         text = startup_script_text()
-        for s in scripts:
-            if s.get("name") == STARTUP_SCRIPT_NAME and s.get("id"):
-                if log and (s.get("script") or "").strip() != text.strip():
-                    log("ensure: the registered %s script differs from hosts/verda/startup.sh (a redeploy uses the registered one; "
-                        "delete it in the console to re-register)" % STARTUP_SCRIPT_NAME)
-                return str(s["id"])
+        scripts = [s for s in (self.api.get("/scripts") or []) if isinstance(s, dict)]
+        mine = [s for s in scripts if s.get("name") == STARTUP_SCRIPT_NAME and s.get("id")]
+        current = next((str(s["id"]) for s in mine if (s.get("script") or "").strip() == text.strip()), None)
+        stale = [str(s["id"]) for s in mine if (s.get("script") or "").strip() != text.strip()]
         if not register:
-            return None
-        if log:
-            log("ensure: registering hosts/verda/startup.sh as %s (POST /scripts)" % STARTUP_SCRIPT_NAME)
-        r = self.api.post("/scripts", {"name": STARTUP_SCRIPT_NAME, "script": text})
-        try:
-            return new_id(r)
-        except PodctlError:
-            return next((str(s["id"]) for s in (self.api.get("/scripts") or []) if s.get("name") == STARTUP_SCRIPT_NAME), None)
+            if not current and stale and log:
+                log("the registered %s script differs from this base's hosts/verda/startup.sh: it is NOT attached "
+                    "(podctl ensure replaces it and configures the machine over ssh)" % STARTUP_SCRIPT_NAME)
+            return current
+        if not current:
+            if log:
+                log("ensure: registering hosts/verda/startup.sh as %s (POST /scripts)" % STARTUP_SCRIPT_NAME)
+            r = self.api.post("/scripts", {"name": STARTUP_SCRIPT_NAME, "script": text})
+            try:
+                current = new_id(r)
+            except PodctlError:
+                current = next((str(s["id"]) for s in (self.api.get("/scripts") or [])
+                                if isinstance(s, dict) and s.get("name") == STARTUP_SCRIPT_NAME
+                                and (s.get("script") or "").strip() == text.strip()), None)
+            if log and current:
+                log("ensure: %s registered as %s" % (STARTUP_SCRIPT_NAME, current))
+        if current:
+            for sid in stale:
+                try:
+                    self.api.delete("/scripts/%s" % sid)
+                    if log:
+                        log("ensure: the stale %s script %s deleted (DELETE /scripts/%s)" % (STARTUP_SCRIPT_NAME, sid, sid))
+                except PodctlError as e:
+                    if log:
+                        log("ensure: could not delete the stale %s script %s (%s): it stays registered and unused" % (STARTUP_SCRIPT_NAME, sid, e))
+        return current
 
     # -- the interface: listing and facts
     def pods(self):
@@ -626,7 +653,7 @@ class VerdaProvider(Provider):
             body = {"hostname": hostname_for(volume_stem(vol.get("name")) or vol.get("name")), "image": str(vol["id"]), "instance_type": itype,
                     "location_code": location, "ssh_key_ids": self.key_ids(register=True), "existing_volumes": attached,
                     "description": "ComfyUI Base, redeployed from OS volume %s by podctl" % vol["id"]}
-            sid = self.script_id(register=False)
+            sid = self.script_id(register=False, log=lambda m: print(m))
             if sid:
                 body["startup_script_id"] = sid
             new_id_ = new_id(self.api.post("/instances", body))
@@ -747,9 +774,9 @@ class VerdaProvider(Provider):
         body = {"hostname": hostname_for(name or "%s-2" % (src.get("hostname") or "comfy-base")), "image": src["image"], "instance_type": itype,
                 "location_code": src.get("location") or "", "ssh_key_ids": self.key_ids(register=True), "existing_volumes": data + shared,
                 "description": "ComfyUI Base, cloned from %s by podctl" % like, "is_spot": bool(src.get("is_spot"))}
-        sid = self.script_id(register=True)
-        if sid:
-            body["startup_script_id"] = sid
+        # 3.0.0: no startup script at create time (root docs: a fresh OS volume has no /etc/fstab entry for the
+        # workspace, so the registered script waits ten minutes at first boot); `ensure` configures it over ssh
+        sid = None
         pod_id = new_id(self.api.post("/instances", body))
         say("deployed %s (%s): %s on %s in %s, data volumes %s (detached from %s), startup script %s" % (
             pod_id, body["hostname"], body["image"], itype, body["location_code"], ", ".join(data) or "none", like, sid or "none"))
@@ -777,9 +804,23 @@ class VerdaProvider(Provider):
                 on = self._library_for(self._last_pod) is not None
             except Exception:
                 on = False
+        if on and self._workspace_is_the_store():
+            # 3.0.0: an attached shared volume that IS /workspace (ensure --workspace-shared, in an earlier process) is
+            # the shared root, not a library beside it. `podctl install` wrote BASE_LIBRARY=/mnt/comfy-library here and
+            # dropped BASE_VOLUME_SHARED=1 on every install (measured on FIN-03, 2026-09-25). Read from the machine.
+            self._workspace_shared = True
+            return text + "BASE_VOLUME_SHARED=1\n"
         if on:
             text += "BASE_LIBRARY=%s\n" % self.library_mount
         return text
+
+    def _workspace_is_the_store(self):
+        """True when the machine's /workspace is an NFS mount (the shared store itself); False when it cannot tell."""
+        try:
+            r = _c().ssh_run("findmnt -n -o FSTYPE /workspace", timeout=30)
+        except Exception:
+            return False
+        return getattr(r, "returncode", 1) == 0 and (getattr(r, "stdout", "") or "").strip().startswith("nfs")
 
     def record_volume(self, pod, env=None):
         """With a SHARED library, record ITS size in state/volume.env; with only a block volume, record nothing.

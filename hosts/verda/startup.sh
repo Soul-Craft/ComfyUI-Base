@@ -78,18 +78,13 @@ ensure_packages() {
   # it is genuinely missing.
   # python3-venv: the image ships python3 without ensurepip, so `python3 -m venv` fails and the base's
   # venv step dies on a machine that looks fine. Both are installed once and persist on the OS volume.
-  local need=() out
-  command -v mount.nfs >/dev/null 2>&1 || need+=(nfs-common)
-  python3 -c 'import ensurepip' >/dev/null 2>&1 || need+=(python3-venv)
   # ffmpeg: the image ships none, and VideoHelperSuite's bundled binary has no nvenc encoders, so a video
   # package's h264_nvenc format fails at the last node after the whole sample is paid for. Ubuntu's build has
   # h264_nvenc; lib/85-launch.sh finds it and sets VHS_FORCE_FFMPEG_PATH.
-  command -v ffmpeg >/dev/null 2>&1 || need+=(ffmpeg)
-  if [ "${#need[@]}" = "0" ]; then
-    PACKAGES=present
-    return 0
-  fi
-  log "installing ${need[*]}"
+  # 3.0.0: install OR UPGRADE, every time: `apt-get install` of a present package moves it to its newest. The whole
+  # OS (and the NVIDIA driver) goes to its newest in the base's own first stage (lib/15-system.sh) at every install.
+  local need=(nfs-common python3-venv ffmpeg) out
+  log "installing or upgrading ${need[*]}"
   export DEBIAN_FRONTEND=noninteractive
   # -o DPkg::Lock::Timeout: unattended-upgrades often holds the dpkg lock on a first boot
   if ! out=$(apt-get -o DPkg::Lock::Timeout=300 update 2>&1); then

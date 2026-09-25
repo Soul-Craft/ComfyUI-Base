@@ -8,8 +8,10 @@ on RunPod, Verda, Crusoe Cloud or a box under your desk. MIT, maintained by Soul
 
 ## Two ways to use it
 
-**Just the base.** `comfyui-base-script.sh` on its own installs ComfyUI at its newest release tag plus six node
-packs pinned to commits, among them **ComfyUI-Manager** and **ComfyUI-advanced-model-manager**. It ships no model
+**Just the base.** `comfyui-base-script.sh` on its own installs ComfyUI at its newest release plus six node packs at
+their newest, among them **ComfyUI-Manager** and **ComfyUI-advanced-model-manager**, and keeps everything it installs
+at its newest on every run: Python, torch on the newest CUDA your driver runs, every Python package (upstream pins
+lifted), the tools, and the OS packages and NVIDIA driver. It ships no model
 weights: bring your own, or add them with the managers it just installed. For most people that is the whole of
 it, a current ComfyUI you did not have to assemble, on a GPU you rented an hour ago. Run whatever workflow you
 like on it: your own, Comfy's templates, something from CivitAI or Hugging Face.
@@ -62,7 +64,7 @@ it runs the same way. `bash _build/verify.sh` does both, for the base and for ev
 around it, and is what CI runs on every push.
 
 The `comfyui` tier needs a local ComfyUI to test against. `bash testbed.sh --server` provisions one — upstream at its
-newest release tag, plus the base's own pinned packs — and starts it on CPU, so a clone of this repository can run
+newest release, plus the base's own packs at their HEAD and every requirement at its newest: and starts it on CPU, so a clone of this repository can run
 that tier on its own. It is several GB and gitignored. Tiers that need a GPU or a pod skip by name.
 
 ## Comfy MCP

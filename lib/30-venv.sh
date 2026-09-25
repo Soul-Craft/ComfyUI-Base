@@ -10,38 +10,61 @@ _base_uvpip(){ uv pip install --python "$PY" "$@"; }   # uv is faster and hardli
 # baked packs, this package's packs, every ledger-installed package's packs); the stub keeps 30 self-contained.
 _base_all_reqfiles(){ if [ -f "$COMFY/requirements.txt" ]; then echo "$COMFY/requirements.txt"; fi; }
 
-_base_tools_venv(){ # the base's tools venv on the volume: $BASE_HOME/tools, made with the system python's own venv module.
-  # It holds uv and JupyterLab. The system interpreter is never written to (PEP 668 refuses that on Ubuntu 24.04
-  # images, and it is container disk anyway); no installer script is piped into a shell — PyPI is the one source.
-  local t="$BASE_HOME/tools"
+_base_bootstrap_venv(){ # $BASE_HOME/tools-bootstrap, made with the system python's own venv module, only to fetch uv from PyPI.
+  # The system interpreter is never written to (PEP 668 refuses that on Ubuntu 24.04 images, and it is container disk
+  # anyway); no installer script is piped into a shell: PyPI is the one source.
+  local t="$BASE_HOME/tools-bootstrap"
   [ -x "$t/bin/python" ] && "$t/bin/python" -m pip --version >/dev/null 2>&1 && return 0
   [ -n "$SYS_PY" ] || return 1
-  if [ "$BASE_DRY" = "1" ]; then would "create the tools venv $t with $SYS_PY -m venv"; return 0; fi
-  note "creating the tools venv $t (uv and JupyterLab live here; the system interpreter is never touched)"
+  if [ "$BASE_DRY" = "1" ]; then would "create $t with $SYS_PY -m venv (only to fetch uv)"; return 0; fi
   if ! "$SYS_PY" -m venv "$t" 2>&1 | tail -2; then err "$SYS_PY -m venv $t failed — the image lacks the venv module"; return 1; fi
   "$t/bin/python" -m pip --version >/dev/null 2>&1 || { err "$t has no pip after python -m venv (ensurepip missing on this image)"; return 1; }
   return 0
 }
-_base_ensure_uv(){ # uv is how the newest Python arrives: from PyPI into the tools venv on the volume, never into the system interpreter
-  local t="$BASE_HOME/tools"
-  if [ -x "$t/bin/uv" ]; then export PATH="$t/bin:$PATH"; hash -r; return 0; fi
-  if [ "$BASE_DRY" = "1" ]; then command -v uv >/dev/null 2>&1 || would "install uv into the tools venv $t (its python -m pip, from PyPI)"; return 0; fi
-  _base_tools_venv || return 1
-  note "installing uv into $t (needed to choose the Python and resolve against it)"
-  "$t/bin/python" -m pip install -q --disable-pip-version-check uv 2>&1 | tail -2 || true
-  export PATH="$t/bin:$PATH"; hash -r
-  [ -x "$t/bin/uv" ]
+_base_uv_refresh(){ # 3.0.0: uv at its newest on every run, as a standalone copy at $BASE_HOME/bin/uv. It is copied out of the
+  # bootstrap venv so that nothing uv builds (the tools venv, the main venv) is ever the thing uv itself lives in.
+  local t="$BASE_HOME/tools-bootstrap" b="$BASE_HOME/bin"
+  _base_bootstrap_venv || return 1
+  "$t/bin/python" -m pip install -q --disable-pip-version-check --upgrade pip uv 2>&1 | tail -2 || true
+  [ -x "$t/bin/uv" ] || return 1
+  mkdir -p "$b" && cp "$t/bin/uv" "$b/uv.new" && chmod 755 "$b/uv.new" && mv -f "$b/uv.new" "$b/uv"
+  if [ -x "$t/bin/uvx" ]; then cp "$t/bin/uvx" "$b/uvx.new" && chmod 755 "$b/uvx.new" && mv -f "$b/uvx.new" "$b/uvx"; fi
+  return 0
+}
+_base_ensure_uv(){ # uv is how the newest Python, torch and every package arrive: $BASE_HOME/bin/uv, refreshed once per run
+  local b="$BASE_HOME/bin"
+  if [ "$BASE_DRY" = "1" ]; then
+    if [ -x "$b/uv" ]; then export PATH="$b:$PATH"; hash -r; else command -v uv >/dev/null 2>&1 || would "install uv at $b/uv (from PyPI, through $BASE_HOME/tools-bootstrap)"; fi
+    return 0
+  fi
+  if [ -x "$b/uv" ] && { [ -n "$BASE_FAKE_ROOT" ] || [ "$BASE_NO_NET" = "1" ]; }; then _BASE_UV_REFRESHED=1; fi   # a fake run never reaches PyPI
+  if [ -z "${_BASE_UV_REFRESHED:-}" ]; then
+    _BASE_UV_REFRESHED=1
+    local was=""; [ -x "$b/uv" ] && was="$("$b/uv" --version 2>/dev/null | awk '{print $2}')"
+    if _base_uv_refresh; then
+      local now; now="$("$b/uv" --version 2>/dev/null | awk '{print $2}')"
+      if [ -n "$was" ] && [ "$was" != "$now" ]; then BASE_CHANGED+=("uv $was → $now"); fi
+    elif [ ! -x "$b/uv" ]; then return 1
+    else warn "uv could not be refreshed from PyPI this run: using $("$b/uv" --version 2>/dev/null)"; BASE_WARN+=("uv not refreshed this run"); fi
+  fi
+  export PATH="$b:$PATH"; hash -r
+  [ -x "$b/uv" ]
+}
+_base_newest_python_minor(){ # → the newest stable CPython minor uv can provide (no pre-release, no free-threaded build)
+  uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV | head -1 || true
 }
 
 # ---------------------------------------------------------------- picks: genuine latest, no fallback
-_base_python_pick(){ # → newest CPython minor whose uv pip compile resolves ComfyUI + every pack requirements file
+_base_python_pick(){ # → newest CPython minor whose uv pip compile resolves the derived set (every upstream pin lifted) + torch
   # The resolve output must go to a real file: `uv pip compile -o /dev/null` fails because uv writes its
   # temp file beside the output path. `|| true` on the greps: an empty grep exits 1 and pipefail would
   # fire the ERR trap inside the substitution.
-  local mm tmp list cands f reqargs=() errf
+  local mm tmp list cands f reqargs=() errf backend="${BASE_TORCH_BACKEND:-auto}"
   _base_tmp; tmp="$BASE_TMPD/resolve.txt"; errf="$BASE_TMPD/resolve.err"
-  # requirement files are POSITIONAL for `uv pip compile` (uv 0.12 rejects `-r`: "unexpected argument", 2026-09-05)
-  while IFS= read -r f; do if [ -n "$f" ]; then reqargs+=("$f"); fi; done < <(_base_all_reqfiles)
+  # 3.0.0: the DERIVED set, so no upstream == pin caps the Python either. Requirement files are POSITIONAL for
+  # `uv pip compile` (uv 0.12 rejects `-r`: "unexpected argument", 2026-09-05).
+  if _base_reqlift >/dev/null 2>"$errf" && [ -s "$BASE_LIFT_DIR/derived.txt" ]; then reqargs=("$BASE_LIFT_DIR/derived.txt")
+  else while IFS= read -r f; do if [ -n "$f" ]; then reqargs+=("$f"); fi; done < <(_base_all_reqfiles); fi
   list="$(uv python list 2>/dev/null || true)"
   cands="$(printf '%s\n' "$list" | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true)"   # -rV, not tac: no tac on macOS
   if [ -z "$cands" ]; then
@@ -51,9 +74,9 @@ _base_python_pick(){ # → newest CPython minor whose uv pip compile resolves Co
   if [ ${#reqargs[@]} -eq 0 ]; then printf '%s\n' "$cands" | head -1; return 0; fi     # nothing to resolve against: take newest
   for mm in $cands; do
     printf '    trying Python %s ... ' "$mm" >&2
-    if uv pip compile --quiet --python-version "$mm" --python-platform x86_64-unknown-linux-gnu \
-         --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match \
-         "${reqargs[@]}" -o "$tmp" >/dev/null 2>"$errf"; then
+    if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" --python-platform "$(_base_uv_platform)" \
+         --torch-backend "$backend" --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match \
+         - "${reqargs[@]}" -o "$tmp" >/dev/null 2>"$errf"; then
       rm -f "$tmp"; echo "resolves" >&2; echo "$mm"; return 0
     fi
     echo "no (the requirement set does not resolve)" >&2
@@ -63,18 +86,19 @@ _base_python_pick(){ # → newest CPython minor whose uv pip compile resolves Co
   err "no CPython minor resolves ComfyUI + pack requirements (tried: $(printf '%s ' $cands))"
   return 1
 }
-_base_torch_pick(){ "$SYS_PY" "$BASE_DIR/py/torch_pick.py" "$1"; }   # <cpXY> → newest +cu130 wheel version
+_base_uv_platform(){ case "$(uname -m)" in aarch64|arm64) echo aarch64-unknown-linux-gnu;; *) echo x86_64-unknown-linux-gnu;; esac; }
+_base_torch_pick(){ "$SYS_PY" "$BASE_DIR/py/torch_pick.py" "$1" "${2:-}"; }   # <x.y> [venv backend] → "<torch version> <backend>" (uv --torch-backend=auto)
 
 # ---------------------------------------------------------------- ownership and stamps
 _base_venv_owner(){ # → base | none
   [ -f "$VENV/.comfy-base-venv" ] && { echo base; return 0; }
   echo none
 }
-_base_venv_stamp_write(){ # <python x.y.z> <torch>
-  echo "python=$1 torch=$2 base=$BASE_VERSION ts=$(_base_ts) by=${PKG_ID:-base}" > "$VENV/.comfy-base-venv"
+_base_venv_stamp_write(){ # <python x.y.z> <torch> [backend]
+  echo "python=$1 torch=$2 backend=${3:-${BASE_TORCH_BACKEND:-?}} base=$BASE_VERSION ts=$(_base_ts) by=${PKG_ID:-base}" > "$VENV/.comfy-base-venv"
 }
 _base_venv_probe(){ # [python-mm] [torch] → 0 reusable, 1 rebuild (py/venv_probe.py)
-  BASE_WANT_PY="${1:-}" BASE_WANT_TORCH="${2:-}" BASE_WANT_SM="${BASE_GPU_SM:-}" BASE_PERSIST_ROOT="$BASE_PERSIST_ROOT" VENV="$VENV" \
+  BASE_WANT_PY="${1:-}" BASE_WANT_TORCH="${2:-}" BASE_WANT_BACKEND="${BASE_TORCH_BACKEND:-}" BASE_WANT_PATCH="${BASE_WANT_PATCH:-}" BASE_WANT_SM="${BASE_GPU_SM:-}" BASE_PERSIST_ROOT="$BASE_PERSIST_ROOT" VENV="$VENV" \
     "$PY" "$BASE_DIR/py/venv_probe.py" 2>/dev/null
 }
 
@@ -171,7 +195,7 @@ _base_venv_swap_aside(){ # <ts> — move $VENV out of the way and arm the rollba
   else BASE_VENV_BACKUP=""; miss "no bootable venv to roll back to — if this build fails the path is left empty, which start.sh rebuilds on the next boot"; fi
 }
 _base_venv_verify(){ # [python-mm] — prints the facts, non-zero on any miss (py/venv_verify.py)
-  BASE_TORCH_INFO="$(VENV="$VENV" BASE_PERSIST_ROOT="$BASE_PERSIST_ROOT" BASE_WANT_PY="${1:-}" BASE_WANT_SM="${BASE_GPU_SM:-}" \
+  BASE_TORCH_INFO="$(VENV="$VENV" BASE_PERSIST_ROOT="$BASE_PERSIST_ROOT" BASE_WANT_PY="${1:-}" BASE_WANT_BACKEND="${BASE_TORCH_BACKEND:-}" BASE_WANT_SM="${BASE_GPU_SM:-}" \
     BASE_EXTRA_IMPORTS="${PKG_IMPORT_CHECK:-}" "$PY" "$BASE_DIR/py/venv_verify.py" 2>&1)"; local rc=$?
   echo "$BASE_TORCH_INFO" | sed 's/^/  /'
   return $rc
@@ -194,55 +218,26 @@ _base_venv_pytest(){ # pytest into OUR venv, proven by import — so base_test's
   ok "pytest $v in the venv — the suite runs inside it"
   return 0
 }
-_base_venv_reconcile_names(){ # stdin: `pip check` output -> the distribution names on both sides of every conflict, one per line
-  # pip's two shapes: "A 1.0 has requirement B<2,>=1, but you have B 2.0." and "A 1.0 requires B, which is not installed."
-  # a pair per line, split by tr: "\n" in a sed replacement is a newline in GNU sed and a literal n in BSD sed (the Mac)
-  sed -n -e 's/^\([A-Za-z0-9._-]*\) [^ ]* has requirement \([A-Za-z0-9._-]*\).*/\1 \2/p' \
-         -e 's/^\([A-Za-z0-9._-]*\) [^ ]* requires \([A-Za-z0-9._-]*\), which is not installed.*/\1 \2/p' | tr ' ' '\n' | sort -u
-}
-_base_venv_reconcile(){ # every run, after the pip half: the venv's requirements must agree with each other, at their newest
-  # 2.12.3, measured on a Verda machine: a REUSED venv held transformers 5.17.0 (the newest release, which requires
-  # huggingface-hub<2.0) and the per-pack loop took huggingface-hub to 2.0.0, because `pip install --upgrade -r` always takes a
-  # requirement the file NAMES (several packs name a bare huggingface_hub) to its newest, and pip does not resolve against
-  # what is installed outside the request; it only warns. main.py then died in transformers' import-time version check.
-  # The answer is not a pin: re-resolve both sides of each conflict in ONE call, so the resolver sees them together and
-  # lands on the newest set that agrees (that night: transformers 5.17.0 with huggingface-hub 1.33.0). A conflict pip
-  # cannot resolve is reported and left to the import check, which stays the gate; this step never fails a run by itself.
-  local out names
-  if [ "$BASE_DRY" = "1" ]; then would "pip check the venv and re-resolve any conflicting requirements together"; return 0; fi
-  out="$(_base_pip check 2>&1)" && { ok "pip check: every requirement in the venv agrees"; return 0; }
-  names="$(printf '%s\n' "$out" | _base_venv_reconcile_names | tr '\n' ' ')"
-  names="${names% }"
-  if [ -z "$names" ]; then note "pip check reported something it did not name as a conflict: $(printf '%s' "$out" | tail -1)"; return 0; fi
-  if [ "$BASE_NO_NET" = "1" ]; then note "pip check found conflicts ($names); not re-resolved (BASE_NO_NET)"; return 0; fi
-  note "pip check found conflicts; re-resolving together: $names"
-  # shellcheck disable=SC2086  # the names are word-split on purpose: one argument per distribution
-  _base_pip install -q --upgrade ${CONSTRAINTS:+-c "$CONSTRAINTS"} $names 2>&1 | tail -2 || true
-  if out="$(_base_pip check 2>&1)"; then ok "pip check: conflicts re-resolved ($names)"
-  else note "pip check still reports, left to the import check: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; fi
-  return 0
-}
 _base_venv_ensure_pytest(){ # every run, reuse included: a venv without pytest is a venv the suite cannot run in
   "$PY" -c 'import pytest' >/dev/null 2>&1 && return 0
   if [ "$BASE_DRY" = "1" ]; then would "install pytest into the venv (the suite runs inside it)"; return 0; fi
   _base_venv_pytest
 }
 _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | rebuilt | failed-* | rolled-back
-  local pymm="$1" tv="$2" ts cp rv f reqargs=() step_fail=0 had=0
-  ts="$(_base_ts)"; cp="cp${pymm/./}"
+  local pymm="$1" tv="$2" ts rv step_fail=0 had=0 backend="${BASE_TORCH_BACKEND:?the torch backend is picked first}"
+  ts="$(_base_ts)"
   [ -d "$VENV" ] && had=1 || true
   CONSTRAINTS="$BASE_STATE/constraints-torch.txt"
-  while IFS= read -r f; do if [ -n "$f" ]; then reqargs+=(-r "$f"); fi; done < <(_base_all_reqfiles)
+  _base_reqlift >/dev/null 2>&1 || true
   # (0) prove the whole set resolves BEFORE the old venv is touched — a throwaway venv in a temp dir
   rv="$(_base_mktemp_d)/resolve"
-  echo "  resolvability dry-run for Python $pymm over ${#reqargs[@]} requirement file(s)…"
+  echo "  resolvability dry-run for Python $pymm, torch $tv on $backend, the derived requirement set (every upstream pin lifted)…"
   if ! uv venv -q --python "$pymm" "$rv" 2>&1 | tail -3; then
     err "uv cannot provide Python $pymm"; BASE_FAILED+=("venv: uv venv --python $pymm failed"); BASE_VENV_RESULT="failed-python"; return 1
   fi
-  if ! uv pip install --python "$rv/bin/python" --dry-run -q \
-        --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple --extra-index-url https://pypi.nvidia.com \
-        --index-strategy unsafe-best-match \
-        "torch==$tv" torchvision torchaudio ${reqargs[@]+"${reqargs[@]}"} ${PIP_EXTRA[@]+"${PIP_EXTRA[@]}"} pytest "huggingface_hub[hf-xet]" 2>&1 | tail -15; then
+  if ! uv pip install --python "$rv/bin/python" --dry-run -q --torch-backend "$backend" \
+        --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match \
+        "torch==$tv" torchvision torchaudio -r "$BASE_LIFT_DIR/derived.txt" pytest "huggingface_hub[hf-xet]" 2>&1 | tail -15; then
     err "the requirement set does NOT resolve for Python $pymm — nothing was changed (the offending name is above)"
     BASE_FAILED+=("venv: resolvability dry-run failed for $pymm"); BASE_VENV_RESULT="failed-resolve"; return 1
   fi
@@ -252,24 +247,16 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   if ! uv venv -q --python "$pymm" --seed "$VENV" 2>&1 | tail -3; then
     err "uv venv failed"; BASE_FAILED+=("venv: uv venv failed"); BASE_VENV_RESULT="failed-uv-venv"; _base_venv_rollback || true; return 1
   fi
-  # (a) torch trio FIRST from the cu130 index (requirements first once pulled a cu12 torch)
-  if ! _base_run_watched "torch $tv+cu130 · torchvision · torchaudio" \
-         _base_uvpip "torch==$tv" torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130; then
-    err "torch install failed"; BASE_FAILED+=("venv: torch $tv+cu130 install failed"); BASE_VENV_RESULT="failed-torch"; _base_venv_rollback || true; return 1
+  # (a) the torch family FIRST, on the picked CUDA backend (requirements first once pulled a cu12 torch)
+  if ! _base_run_watched "torch $tv+$backend · torchvision · torchaudio" \
+         _base_uvpip "torch==$tv" torchvision torchaudio --torch-backend "$backend"; then
+    err "torch install failed"; BASE_FAILED+=("venv: torch $tv+$backend install failed"); BASE_VENV_RESULT="failed-torch"; _base_venv_rollback || true; return 1
   fi
-  # (b) pin what is installed, then everything else under that pin — only-if-needed, never eager
-  _base_pip freeze 2>/dev/null | grep -E '^(torch|torchvision|torchaudio|triton)==' > "$CONSTRAINTS" || true
-  if [ ! -s "$CONSTRAINTS" ]; then err "no torch in the venv to pin"; BASE_FAILED+=("venv: torch missing after install"); BASE_VENV_RESULT="failed-torch"; _base_venv_rollback || true; return 1; fi
-  echo "  constraints: $(tr '\n' ' ' < "$CONSTRAINTS")"
-  for f in $(_base_all_reqfiles); do
-    _base_run_watched "requirements $(basename "$(dirname "$f")")/$(basename "$f")" \
-      _base_pip install -q --upgrade --upgrade-strategy only-if-needed -c "$CONSTRAINTS" -r "$f" || { miss "$f failed"; step_fail=1; }
-  done
-  # (c) what the packages asked for, the suite's runner, the download tool
-  _base_venv_pip_extra || step_fail=1
-  _base_venv_pytest || step_fail=1
-  _base_pip install -q --upgrade -c "$CONSTRAINTS" "huggingface_hub[hf-xet]" 2>&1 | tail -2 || { miss "huggingface_hub install failed"; step_fail=1; }
-  _base_venv_reconcile            # 2.12.3: the upgrades above can overshoot a cap another installed package declares
+  # (b) the torch family and its whole dependency closure held, then everything else newest in one resolve
+  base_torch_constraints
+  if [ ! -s "$CONSTRAINTS" ]; then err "no torch in the venv to hold"; BASE_FAILED+=("venv: torch missing after install"); BASE_VENV_RESULT="failed-torch"; _base_venv_rollback || true; return 1; fi
+  echo "  constraints: $(wc -l < "$CONSTRAINTS" | tr -d ' ') package(s) of torch's closure held ($(grep -E '^torch==' "$CONSTRAINTS" | head -1))"
+  _base_run_watched "requirements (the derived set, one resolve)" _base_derived_install || { miss "the derived requirement set failed"; step_fail=1; }
   # (d) verify inside the venv → stamp, else roll back
   if ! _base_venv_verify "$pymm" || [ "$step_fail" = "1" ]; then
     err "venv verify failed — rolling back"
@@ -281,10 +268,19 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   local t0 t1; t0=$(date +%s); _base_pip --version >/dev/null 2>&1 || true; t1=$(date +%s)
   echo "  warm-up: python -m pip --version $((t1 - t0)) s (ComfyUI-Manager allows 5 s)"
   if [ -n "$BASE_PERSIST_ROOT" ]; then note "venv interpreter: $(_base_venv_base_home "$VENV") ($(_base_venv_base_verdict "$VENV"))"; fi
-  _base_venv_stamp_write "$("$PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')" "$tv"
-  if [ "$had" = "1" ]; then BASE_VENV_RESULT="rebuilt"; BASE_CHANGED+=("venv rebuilt on Python $pymm / torch $tv (previous at ${BASE_VENV_BACKUP:-quarantine})")
-  else BASE_VENV_RESULT="built"; BASE_CHANGED+=("venv built on Python $pymm / torch $tv"); fi
+  _base_venv_stamp_write "$("$PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')" "$tv" "$backend"
+  if [ "$had" = "1" ]; then BASE_VENV_RESULT="rebuilt"; BASE_CHANGED+=("venv rebuilt on Python $pymm / torch $tv+$backend (previous at ${BASE_VENV_BACKUP:-quarantine})")
+  else BASE_VENV_RESULT="built"; BASE_CHANGED+=("venv built on Python $pymm / torch $tv+$backend"); fi
   ok "venv ready: $BASE_TORCH_INFO"
+}
+_base_torch_family_upgrade(){ # <torch> <backend>: on a reused venv: torchvision, torchaudio and triton to the builds that match torch
+  local tv="$1" backend="$2" out
+  if out="$(_base_uvpip -q --upgrade --torch-backend "$backend" "torch==$tv" torchvision torchaudio 2>&1)"; then
+    base_torch_constraints; return 0
+  fi
+  warn "the torch family could not be brought to the newest builds for torch $tv on $backend: $(printf '%s' "$out" | tail -1)"
+  BASE_WARN+=("torch family: torchvision/torchaudio not moved with torch $tv ($backend)")
+  return 0
 }
 _base_xet_check_soft(){ # a silent fall back to plain HTTPS is several times slower and reports no error at all
   local xv; xv="$("$PY" -c 'import hf_xet; print(getattr(hf_xet, "__version__", "present"))' 2>/dev/null || true)"
@@ -296,12 +292,7 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
   hdr "VENV · $VENV"
   CONSTRAINTS="$BASE_STATE/constraints-torch.txt"
   local ts owner pymm tv cp; ts="$(_base_ts)"
-  # ---- 2.1.0, pinned: the seed's venv is the venv. No stamp means the seed never reached this volume; nothing is built here.
-  if [ "$BASE_PINNED" = "1" ] && [ ! -f "$VENV/.comfy-base-venv" ]; then
-    err "BASE_PINNED=1 but $VENV carries no .comfy-base-venv stamp — the seed is missing or incomplete; nothing is built in pinned mode"
-    echo "      fix: re-copy the seed (the image's /opt/comfy-seed) onto the volume, or run the base unpinned once"
-    BASE_FAILED+=("venv: pinned, no seed stamp at $VENV"); BASE_VENV_RESULT="failed-pinned"; return 1
-  fi
+  if [ -n "${BASE_PINNED:-}" ] && [ "${BASE_PINNED}" != "0" ]; then note "BASE_PINNED is retired in 3.0.0 and ignored: the venv takes the newest Python and torch like every run"; fi
   # ---- fake / offline: a venv-shaped directory so every later step exercises its real code path
   if [ "$BASE_NO_NET" = "1" ]; then
     if [ -f "$VENV/.comfy-base-venv" ] && _base_venv_base_is_persistent; then ok "reusing our venv (stamp: $(cat "$VENV/.comfy-base-venv"))"; BASE_VENV_RESULT="reused"; BASE_TORCH_INFO="(fake venv)"
@@ -336,23 +327,29 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
     BASE_TORCH_INFO="(not computed — the dry run has no uv yet)"
     return 0
   fi
-  if [ "$BASE_PINNED" = "1" ]; then
-    # ---- 2.1.0, pinned: the picks are the seed's stamp (python=x.y.z torch=t ...), never the newest anything
-    local stamp; stamp="$(cat "$VENV/.comfy-base-venv")"
-    pymm="$(printf '%s' "$stamp" | sed -n 's/.*python=\([0-9][0-9]*\.[0-9][0-9]*\)[^ ]*.*/\1/p')"
-    tv="$(printf '%s' "$stamp" | sed -n 's/.*torch=\([^ ]*\).*/\1/p')"
-    if [ -z "$pymm" ] || [ -z "$tv" ]; then
-      err "BASE_PINNED=1 but the seed's stamp names no python/torch ($stamp)"; BASE_FAILED+=("venv: pinned, unreadable stamp"); BASE_VENV_RESULT="failed-pinned"; return 1
-    fi
-    echo "  pinned: Python $pymm · torch $tv (the seed's stamp; no pick)${BASE_GPU_SM:+ · $BASE_GPU_SM}"
-  else
-  # ---- the picks: newest Python that resolves, newest torch for it. No fallback.
+  # ---- the picks: the torch backend (uv, from this machine's driver; never backwards on a shared venv), the newest
+  # Python that resolves the derived set on it, then the newest torch for that Python. No fallback.
+  local have_backend="" pick why
+  have_backend="$( [ -x "$PY" ] && _base_venv_backend )"
+  case "$have_backend" in cu*) ;; *) have_backend="";; esac
+  BASE_TORCH_BACKEND="$have_backend"
+  if [ -z "$BASE_TORCH_BACKEND" ]; then
+    local newest; newest="$(_base_newest_python_minor)"
+    if [ -n "$newest" ] && pick="$(_base_torch_pick "$newest" "" 2>/dev/null)"; then BASE_TORCH_BACKEND="${pick#* }"; fi
+  fi
   # the pick runs in a command substitution: anything it appends to BASE_FAILED is lost — the caller records the failure
   if ! pymm="$(_base_python_pick)"; then BASE_FAILED+=("venv: no Python resolves the requirement set (uv's reason is above)"); BASE_VENV_RESULT="failed-pick"; return 1; fi
-  cp="cp${pymm/./}"
-  if ! tv="$(_base_torch_pick "$cp" 2>&1)"; then err "torch pick failed: $tv"; BASE_FAILED+=("venv: torch pick failed ($tv)"); BASE_VENV_RESULT="failed-pick"; return 1; fi
-  echo "  target: Python $pymm · torch $tv+cu130 (newest wheel for $cp on the cu130 index)${BASE_GPU_SM:+ · $BASE_GPU_SM}"
+  _base_tmp
+  if ! pick="$(_base_torch_pick "$pymm" "$have_backend" 2>"$BASE_TMPD/torch_pick.why")"; then
+    err "torch pick failed: $(cat "$BASE_TMPD/torch_pick.why")"; BASE_FAILED+=("venv: torch pick failed ($(tail -1 "$BASE_TMPD/torch_pick.why"))"); BASE_VENV_RESULT="failed-pick"; return 1
   fi
+  tv="${pick%% *}"; BASE_TORCH_BACKEND="${pick#* }"; why="$(tail -1 "$BASE_TMPD/torch_pick.why" 2>/dev/null)"
+  echo "  target: Python $pymm · torch $tv+$BASE_TORCH_BACKEND (${why:-uv --torch-backend=auto})${BASE_GPU_SM:+ · $BASE_GPU_SM}"
+  case "$why" in *"OLDER CUDA major"*) BASE_WARN+=("torch: $why");; *"newer CUDA major"*) BASE_CHANGED+=("torch: $why");;
+    *"held by the torch family"*) BASE_UPSTREAM+=("CUDA: $why");; esac
+  # the newest patch of the chosen minor: uv keeps the old patch (a venv elsewhere may still use it) and moves venvs
+  # created through its minor-version directory to the new one without a rebuild
+  if [ "$BASE_DRY" != "1" ]; then uv python upgrade "$pymm" >/dev/null 2>&1 || uv python install "$pymm" >/dev/null 2>&1 || true; fi
   owner="$(_base_venv_owner)"
   # ---- reuse when the probe passes (the probe is HARD on a runtime-written interpreter, so a poisoned venv never reuses)
   if [ -x "$PY" ] && _base_venv_probe "$pymm" "$tv"; then
@@ -361,21 +358,19 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
       none)   BASE_VENV_RESULT="adopted"; ok "adopting the existing venv — it passes every check"; BASE_CHANGED+=("venv adopted");;
     esac
     _base_venv_ensure_pytest || warn "pytest could not be installed into $VENV — the suite cannot run inside it"
-    if [ "$BASE_DRY" = "1" ]; then would "refresh the venv stamp (base $BASE_VERSION, by ${PKG_ID:-base})"      # 2.0.18: a --check restamped the pod's venv
-    else _base_venv_stamp_write "$("$PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')" "$tv"; fi
+    if [ "$BASE_DRY" = "1" ]; then would "bring torchvision/torchaudio/triton to the builds for torch $tv on $BASE_TORCH_BACKEND; refresh the venv stamp"      # 2.0.18: a --check restamped the pod's venv
+    else
+      _base_torch_family_upgrade "$tv" "$BASE_TORCH_BACKEND"
+      _base_venv_stamp_write "$("$PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')" "$tv" "$BASE_TORCH_BACKEND"
+    fi
     BASE_TORCH_INFO="$("$PY" -c 'import torch; print("torch %s · CUDA %s" % (torch.__version__, torch.version.cuda))' 2>/dev/null || echo "?")"
     return 0
   fi
-  if [ "$BASE_PINNED" = "1" ]; then   # 2.1.0: a rebuild is the slow path pinned mode exists to avoid, and it would not be the tested set
-    err "the seed's venv at $VENV does not pass the probe (details above) — no rebuild in pinned mode"
-    echo "      fix: bash '<package>-script.sh' rescue, re-copy the seed, or run the base unpinned once"
-    BASE_FAILED+=("venv: pinned seed fails the probe"); BASE_VENV_RESULT="failed-pinned"; return 1
-  fi
   if [ -x "$PY" ]; then miss "the venv at $VENV does not pass the probe (details above) — rebuilding"; else note "no venv at $VENV — building"; fi
   if [ "$BASE_DRY" = "1" ]; then
-    would "uv dry-run the whole requirement set for Python $pymm ($(_base_all_reqfiles | wc -l | tr -d ' ') requirement files + torch trio + extras)"
+    would "uv dry-run the derived requirement set for Python $pymm ($(_base_all_reqfiles | wc -l | tr -d ' ') requirement file(s), every upstream pin lifted, + the torch family on $BASE_TORCH_BACKEND)"
     [ -d "$VENV" ] && would "mv $VENV → $VENV.pre-comfy-base-<ts> (or quarantine it if it cannot boot)"
-    would "uv venv --python $pymm --seed $VENV; install torch==$tv from cu130, ComfyUI + pack requirements under a torch constraint, extras, pytest, huggingface_hub[hf-xet]; verify; stamp"
+    would "uv venv --python $pymm --seed $VENV; install torch==$tv on $BASE_TORCH_BACKEND, hold its closure, the derived set in one resolve; verify; stamp"
     BASE_VENV_RESULT="$([ -d "$VENV" ] && echo would-rebuild || echo would-build)"; return 0
   fi
   _base_venv_build "$pymm" "$tv" || return 1

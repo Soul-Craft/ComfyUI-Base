@@ -62,8 +62,8 @@ _base_host_status(){ # 2.2.0: which host the driver recorded for this volume (st
   [ -f "$BASE_STATE/host.env" ] || return 0
   hdr "HOST · state/host.env"; sed 's/^/  /' "$BASE_STATE/host.env"
 }
-base_latest(){ # every installed package's packs + the base packs: what their remotes' HEAD is now
-  hdr "LATEST · pinned commit vs remote HEAD"
+base_latest(){ # every installed package's packs + the base packs: each last-tested record against its remote's HEAD now (read-only)
+  hdr "LATEST · last-tested record vs remote HEAD (every install moves each pack to its HEAD)"
   local row dir url sha rest new m kind path
   { printf '%s\n' "${BASE_PACKS[@]}" | awk -F'|' '{print "base\t"$1"\t"$3"\t-\t"$2}'
     for m in "${BASE_STATE:-/nonexistent}"/packages/*.manifest; do [ -f "$m" ] && grep '^pack	' "$m" | sed "s/^pack/$(basename "$m" .manifest)/" || true; done

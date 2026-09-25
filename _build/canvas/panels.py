@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["playwright==1.62.0"]
+# dependencies = ["playwright"]
 # ///
 """Click every row of every rgthree panel in the REAL frontend and report what lights.
 
-    uv run "base/comfyui-base/_build/canvas/panels.py" --pkg "<package dir>"      # needs: bash testbed.sh --server
+    uv run --upgrade "base/comfyui-base/_build/canvas/panels.py" --pkg "<package dir>"      # needs: bash testbed.sh --server
 
 The suite emulates rgthree (membership by node centre, "always one" = others off then the chosen
 on, muters recurse into subgraph nodes). This runs the real thing: loads the workflow into the
@@ -26,7 +26,7 @@ from pathlib import Path
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "py"))
-from snapshot import JS_LOAD, need_server, route_settings                      # noqa: E402
+from snapshot import JS_LOAD, need_server, route_settings, ensure_browser      # noqa: E402
 from canvas import membership, load_spec                                       # noqa: E402
 
 PANEL_TYPES = ("Fast Groups Bypasser (rgthree)", "Fast Groups Muter (rgthree)", "Fast Muter (rgthree)")
@@ -81,6 +81,7 @@ def main():
 
     def off_mode(p): return 2 if "Muter" in p["type"] else 4
 
+    ensure_browser()                                   # 3.0.0: the browser for this (newest) Playwright
     with sync_playwright() as p:
         b = p.chromium.launch(headless=True)
         ctx = b.new_context(viewport={"width": 1512, "height": 982}, device_scale_factor=1, color_scheme="dark")

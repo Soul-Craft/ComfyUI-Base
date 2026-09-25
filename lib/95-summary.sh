@@ -45,7 +45,7 @@ base_init(){
   if ! _base_validate_tables; then err "the package's declarations are invalid (see above)"; exit 2; fi
   _base_library_link          # 2.4.0: models/ IS the shared library, before anything imports, downloads or renders
   _base_tmp
-  if ! base_banner; then base_summary; fi    # the driver gate failed: the summary exits 1
+  base_banner || true            # in a || list, as it was in the `if` it used to sit in: its df probes must not fire the ERR trap
 }
 base_require_workflow(){ # the workflow beside the script must carry this script's version under extra.<WF_VERSION_KEY>
   [ -n "${WF_NAME:-}" ] || return 0
@@ -62,21 +62,30 @@ base_require_workflow(){ # the workflow beside the script must carry this script
 
 base_run(){ # the install, in the order the spec fixes; hooks run where a package declares them
   base_init
-  # 2.5.0: on a SHARED workspace only, one installer at a time. Nothing above this line writes to the volume.
+  # 3.0.0: the OS and the NVIDIA driver at their newest FIRST: they are the machine's, not the store's, so this runs
+  # before the store's lock, and before the driver gate so an upgrade can lift a driver below DRIVER_MIN. A new driver
+  # stops the run here, before anything touches the GPU: the machine must restart first (a person approves it).
+  local src=0; base_system || src=$?
+  if [ "$src" = 10 ]; then base_summary; fi
+  if ! _base_driver_gate; then base_summary; fi
+  # 2.5.0: on a SHARED workspace only, one installer at a time. Nothing above this line writes to the store.
   if ! _base_install_lock; then base_summary; fi
   base_require_workflow
+  local nfail="${#BASE_FAILED[@]}"      # the OS stage may have recorded a failure that does not stop the run; tokens are judged alone
   base_tokens || true
-  if [ "${#BASE_FAILED[@]}" -gt 0 ]; then err "a token was rejected — stopping before anything downloads"; base_summary; fi
+  if [ "${#BASE_FAILED[@]}" -gt "$nfail" ]; then err "a token was rejected: stopping before anything downloads"; base_summary; fi
   base_update_comfyui || true
   if ! base_comfy_gate; then base_summary; fi
   base_consolidate || true
   base_packs git || true
+  base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
   _base_hook pkg_pre_venv
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi
   base_cuda_toolchain || true          # before the hook that builds, so a broken toolkit is named (and fixed) up front
   _base_hook pkg_post_venv
   base_packs pip || true
   base_mcp || true                     # the venv and the packs exist; models do not yet, and MCP needs none
+  base_venv_latest || true             # 3.0.0: everything still behind is forced to its newest; the import check judges it
   if [ "${BASE_SEED:-0}" = "1" ]; then
     # 2.1.0: the template image's seed build (dockerize.py): the toolchain and the packs, never a model, a server or a suite
     hdr "SEED · BASE_SEED=1: no models, no prune, no restart, no smoke, no suite — the image carries the toolchain, the volume gets the models at boot"
@@ -128,16 +137,6 @@ _base_use_testbed(){ # only from `test`: the shared ComfyUI testbed. Since 2.6.0
   done
   return 0
 }
-_base_warn_settle(){ # a --latest run's "untested" warning is true until the run's own suite proves the packs: green → a note
-  local keep=() w
-  if [ "${BASE_LATEST:-0}" = "1" ] && [ "${#BASE_FAILED[@]}" -eq 0 ] && [ "${BASE_TEST_RC:-1}" = "0" ]; then
-    for w in ${BASE_WARN[@]+"${BASE_WARN[@]}"}; do
-      case "$w" in "--latest: "*) note "packs at HEAD (--latest) and the suite is green: save the printed pin rows (podctl install does)";; *) keep+=("$w");; esac
-    done
-    BASE_WARN=(${keep[@]+"${keep[@]}"})
-  fi
-  return 0
-}
 base_test(){ # [tier] — the package's suite.py beside the script (the base's own suite/ when PKG_ID=base); sets BASE_TEST_RESULT / BASE_TEST_RC
   local tier="${1:-}" suite ini runner=() out rc=0 on_pod=0 tiers cargs=()
   hdr "TEST SUITE${tier:+ · tier $tier}"
@@ -157,13 +156,13 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
   # the venv's pytest, else uv with its own; never pip-installed into an interpreter that is not our venv;
   # and never "skipped" with exit 0 when nothing ran
   local tbpy=""
-  if [ -x "$BASE_HOME/tools/bin/uv" ]; then export PATH="$BASE_HOME/tools/bin:$PATH"; hash -r; fi   # the base's own uv on the volume (2.0.1): the install path had it on PATH, `test` on its own did not (2.0.5)
+  if [ -x "$BASE_HOME/bin/uv" ]; then export PATH="$BASE_HOME/bin:$PATH"; hash -r; fi   # the base's own uv on the volume (3.0.0: $BASE_HOME/bin): the install path had it on PATH, `test` on its own did not (2.0.5)
   if [ -n "${BASE_NODE_SRC:-}" ]; then for tbpy in "$BASE_NODE_SRC"/.venv*/bin/python; do [ -x "$tbpy" ] && break || tbpy=""; done; fi
   if [ -x "${PY:-}" ] && "$PY" -c "import pytest" 2>/dev/null; then runner=("$PY" -m pytest)
   elif [ -x "${PY:-}" ] && [ -z "$BASE_FAKE_ROOT" ] && _base_venv_pytest; then runner=("$PY" -m pytest)       # 2.0.10: into OUR venv, not a fallback interpreter that cannot see the packs
   elif [ -n "$tbpy" ] && "$tbpy" -c "import pytest" 2>/dev/null; then note "running the suite with the testbed venv ($tbpy) — it can import ComfyUI"; runner=("$tbpy" -m pytest)
-  elif command -v uv >/dev/null 2>&1; then note "pytest not importable by ${PY:-the venv} — running the suite through uv"; runner=(uv run --quiet --no-project --python 3.12 --with pytest python -m pytest)
-  else miss "the suite did NOT run: no pytest in the venv and no uv (not on PATH, not in $BASE_HOME/tools/bin)"; BASE_TEST_RESULT="NOT RUN (no pytest, no uv)"; BASE_WARN+=("suite not run: no pytest and no uv"); BASE_TEST_RC=1; return 0; fi
+  elif command -v uv >/dev/null 2>&1; then note "pytest not importable by ${PY:-the venv}: running the suite through uv, on the newest Python it has"; runner=(uv run --quiet --no-project --python "$(env $(env | sed -n 's/^\(BASE_[A-Za-z0-9_]*\)=.*/-u \1/p') uv python list --only-installed 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV | head -1 || true)" --with pytest python -m pytest)   # the lookup sees no BASE_* either
+  else miss "the suite did NOT run: no pytest in the venv and no uv (not on PATH, not in $BASE_HOME/bin)"; BASE_TEST_RESULT="NOT RUN (no pytest, no uv)"; BASE_WARN+=("suite not run: no pytest and no uv"); BASE_TEST_RC=1; return 0; fi
   if [ -z "$BASE_FAKE_ROOT" ] && _base_on_pod && [ -d "${CN:-/nonexistent}" ]; then on_pod=1; fi
   _base_tmp; out="$BASE_TMPD/pytest.out"
   # The suite gets the documented hand-over (BASE_WF … BASE_ON_POD, set below) and NO other BASE_* the run exported: the
@@ -207,7 +206,7 @@ ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION}  ·  runs on ComfyUI Ba
   bash "$s"                ONE COMMAND: toolchain via the base, $npacks node pack(s), $nmodels model row(s), workflow paths,
                              import check, hygiene, then the exact launch line. Prompts only for tokens and deletion.
   bash "$s" --check        dry run: the same report, nothing changed
-  bash "$s" --latest       move every pinned pack to its remote HEAD and print the rows to paste back
+  bash "$s" --latest       the same as a plain run (3.0.0: every run takes everything to its newest)
   bash "$s" test [tier]    run the package's suite (tiers: its pytest.ini markers); auto-detects the repo testbed
   bash "$s" rescue         repair a venv that cannot boot after a pod restart (never runs the interpreter it repairs)
   bash "$s" help
@@ -237,7 +236,8 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
       case ",$hooks," in *,pkg_post_venv,*) [ "$pkg" != "${PKG_ID:-base}" ] && echo -e "${YEL}             the venv was rebuilt: $pkg has a post-venv hook whose work is gone — re-run:  bash \"$script\"${NC}" || true;; esac
     done;;
   esac
-  echo "  ComfyUI    $COMFY_OLD → $COMFY_NEW   (${COMFY:-?})"
+  echo "  ComfyUI    $COMFY_OLD → $COMFY_NEW   (${COMFY_REF_INFO:+$COMFY_REF_INFO · }${COMFY:-?})"
+  _base_versions_block
   if [ -n "${BASE_LIBRARY:-}" ]; then echo "  library    shared: $BASE_LIBRARY (models, output, input): every machine on this volume sees the same files"; fi
   echo "  packs      present ${#PACK_PRESENT[@]} · updated ${#PACK_UPDATED[@]} · cloned ${#PACK_CLONED[@]} · local edits ${#PACK_DIRTY[@]}"
   [ "${#PACK_UPDATED[@]}" -gt 0 ] && _base_list "${PACK_UPDATED[@]}" || true
@@ -261,7 +261,6 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
   echo "  suite      $BASE_TEST_RESULT"; [ -n "${BASE_TEST_TABLE:-}" ] && echo "$BASE_TEST_TABLE" | sed 's/^/           /' || true
   echo "  log        ${BASE_LOG:-—}"
   [ -n "$BASE_STASH_CMD" ] && echo -e "${YEL}  stash      local ComfyUI edits were stashed — restore with: $BASE_STASH_CMD${NC}" || true
-  _base_warn_settle
   if [ "${#BASE_WARN[@]}" -gt 0 ]; then echo -e "${YEL}  warnings   ${#BASE_WARN[@]}${NC}"; _base_list "${BASE_WARN[@]}"; fi
   if [ "${#BASE_FAILED[@]}" -gt 0 ]; then echo -e "${RED}  FAILED     ${#BASE_FAILED[@]} — this run is not complete:${NC}"; _base_list "${BASE_FAILED[@]}"; fi
   if [ "${#BASE_FAILED[@]}" -eq 0 ] && [ "$BASE_RESTART_NEEDED" = "1" ] && [ "$BASE_DRY" != "1" ]; then
@@ -277,12 +276,44 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
   exit 1
 }
 
-_base_refuse_latest_if_pinned(){ # 2.1.0: on a pinned pod the pins ARE the image; moving them is a new image, not a run
-  if [ "$BASE_PINNED" = "1" ]; then
-    echo "ERROR: --latest is refused in pinned mode (BASE_PINNED=1${COMFY_TAG:+, image tag $COMFY_TAG}): the packs and ComfyUI on this pod are the set the image was tested with." >&2
-    echo "  A newer set is a newer image; on your own pods, run without BASE_PINNED." >&2
-    exit 2
+_base_versions_block(){ # 3.0.0: what this install put in place, newest everything, said once in one place
+  echo "  VERSIONS   base $BASE_VERSION · ComfyUI ${COMFY_NEW:-?}${COMFY_REF_INFO:+ ($COMFY_REF_INFO)}"
+  local py tinfo uvv
+  py="$("$PY" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || true)"
+  tinfo="$("$PY" -c 'import torch; print("torch %s" % torch.__version__)' 2>/dev/null || true)"
+  uvv="$(uv --version 2>/dev/null | awk '{print $2}' || true)"
+  echo "             Python ${py:-?} · ${tinfo:-torch ?}${BASE_TORCH_BACKEND:+ ($BASE_TORCH_BACKEND)} · uv ${uvv:-?}"
+  [ -n "${BASE_FRONTEND_INFO:-}" ] && echo "             $BASE_FRONTEND_INFO" || true
+  echo "             driver ${BASE_DRIVER_AFTER:-${DRIVER:-?}}${BASE_KERNEL_INFO:+ · kernel $BASE_KERNEL_INFO} · system: ${BASE_SYSTEM_RESULT:-not run}   (this machine's)"
+  [ "${#BASE_SYSTEM_ROWS[@]}" -gt 0 ] && _base_list "${BASE_SYSTEM_ROWS[@]}" || true
+  echo "             newest: ${BASE_LIFT_RESULT:-not run}"
+  [ "${#BASE_LIFT_ROWS[@]}" -gt 0 ] && _base_list "${BASE_LIFT_ROWS[@]}" || true
+  if [ "${#BASE_UPSTREAM[@]}" -gt 0 ]; then echo -e "${YEL}  UPSTREAM   ${#BASE_UPSTREAM[@]}: needs upgrading upstream (named, not blocking):${NC}"; _base_list "${BASE_UPSTREAM[@]}"; fi
+  _base_machines_behind
+  if [ "$BASE_DRY" != "1" ] && [ -d "${BASE_STATE:-/nonexistent}" ]; then   # the ledger's copy: what the store holds now
+    { echo "base=$BASE_VERSION"; echo "comfyui=${COMFY_NEW:-?}"; echo "comfyui_ref=${COMFY_REF_INFO:-}"; echo "python=${py:-}"
+      echo "torch=${tinfo#torch }"; echo "backend=${BASE_TORCH_BACKEND:-}"; echo "frontend=${BASE_FRONTEND_INFO:-}"; echo "uv=${uvv:-}"
+      echo "by=${PKG_ID:-base}"; echo "host=$(hostname -s 2>/dev/null)"; echo "ts=$(_base_ts)"; } > "$BASE_STATE/versions.env" 2>/dev/null || true
   fi
+  if [ "${BASE_VOLUME_SHARED:-0}" = "1" ]; then
+    echo -e "${YEL}  STORE      shared: the venv, ComfyUI and the packs above changed for EVERY machine on this store. Code already${NC}"
+    echo -e "${YEL}             loaded keeps running until its restart; anything imported later sees the new files.${NC}"
+  fi
+}
+_base_machines_behind(){ # the store's per-machine records (lib/15-system.sh): machines whose driver cannot run this venv's CUDA major
+  local d="${BASE_STATE:-/nonexistent}/machines" f h cuda vmaj="" me
+  [ -d "$d" ] || return 0
+  case "${BASE_TORCH_BACKEND:-}" in cu*) vmaj="${BASE_TORCH_BACKEND#cu}"; vmaj="${vmaj%?}";; *) return 0;; esac
+  me="$(hostname -s 2>/dev/null || echo machine)"
+  for f in "$d"/*.env; do
+    [ -f "$f" ] || continue
+    h="$(sed -n 's/^host=//p' "$f")"; cuda="$(sed -n 's/^cuda=//p' "$f")"
+    [ "$h" = "$me" ] && continue
+    if [ -n "$cuda" ] && [ "${cuda%%.*}" -lt "$vmaj" ] 2>/dev/null; then
+      echo -e "${YEL}  MACHINES   $h runs a driver for CUDA $cuda; this venv needs CUDA $vmaj: run its install (driver upgrade, an approved restart) before it renders${NC}"
+      BASE_WARN+=("machine $h must run its own install before it renders (driver CUDA $cuda < the venv's CUDA $vmaj)")
+    fi
+  done
 }
 base_main(){ # the six forms every package shares, plus the package's own PKG_COMMANDS
   if [ -z "${PKG_SCRIPT:-}" ] && [ -f "$0" ]; then PKG_SCRIPT="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"; fi
@@ -293,7 +324,7 @@ base_main(){ # the six forms every package shares, plus the package's own PKG_CO
   case "${1:-}" in
     "")        base_run ;;
     --check)   BASE_DRY=1; base_run ;;
-    --latest)  _base_refuse_latest_if_pinned; BASE_LATEST=1; base_run ;;
+    --latest)  base_run ;;              # 3.0.0: every run takes everything to its newest; kept so older callers still work
     test)      shift; base_env_setup; base_discover quiet || true; _base_use_testbed; base_test "${1:-}"; exit "$BASE_TEST_RC" ;;
     rescue)    base_env_setup; _base_logging; if ! base_discover; then exit 3; fi; base_rescue; exit "${BASE_RESCUE_RC:-0}" ;;
     help|-h|--help) base_help ;;
@@ -311,7 +342,7 @@ base_cli(){ # the developer's entry (`bash base.sh test …`): a package script 
     gen-models)   shift; base_env_setup; base_gen_models "$@" ;;
     stamp-models) shift; "$SYS_PY" "$BASE_DIR/py/stamp_models.py" "$@" ;;                    # 2.1.0: the workflow's own `models` array, from the rows
     status)       base_env_setup; base_status ;;
-    latest)       _base_refuse_latest_if_pinned; base_env_setup; base_latest ;;
+    latest)       base_env_setup; base_latest ;;
     install-self) shift; base_install_self "$@" ;;
     test|rescue|help|-h|--help) base_main "$@" ;;
     *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> | stamp-models <dir> [--check] | test [tier] | rescue | help)" >&2; exit 2 ;;
@@ -325,10 +356,11 @@ base_install_self(){ # copy this base to $BASE_HOME (the volume) unless it alrea
   mkdir -p "$dest" 2>/dev/null || { err "cannot create $dest"; exit 3; }
   if [ "$(cd "$dest" && pwd -P)" = "$(cd "$here" && pwd -P)" ]; then return 0; fi   # already the installed copy
   [ -f "$dest/VERSION" ] && have="$(tr -d '[:space:]' < "$dest/VERSION")"
-  if [ -n "$have" ] && [ "${BASE_FORCE_SELF:-0}" != "1" ] && ! _base_vge "$BASE_VERSION" "$have"; then
-    err "a newer base ($have) is already installed at $dest; this copy is $BASE_VERSION. BASE_FORCE_SELF=1 to replace it anyway."; exit 3
+  # 3.0.0: always the newest; an older base never replaces a newer one (BASE_FORCE_SELF is retired)
+  if [ -n "$have" ] && ! _base_vge "$BASE_VERSION" "$have"; then
+    err "a newer base ($have) is already installed at $dest; this copy is $BASE_VERSION: use the newer one"; exit 3
   fi
-  if [ "$have" = "$BASE_VERSION" ] && [ "${BASE_FORCE_SELF:-0}" != "1" ] && [ -f "$dest/MANIFEST.sha256" ] && cmp -s "$here/MANIFEST.sha256" "$dest/MANIFEST.sha256" \
+  if [ "$have" = "$BASE_VERSION" ] && [ -f "$dest/MANIFEST.sha256" ] && cmp -s "$here/MANIFEST.sha256" "$dest/MANIFEST.sha256" \
      && (cd "$dest" && _base_sha256 -c MANIFEST.sha256 >/dev/null 2>&1); then   # 2.0.30: same version AND the same manifest — an amended zip under one version refreshes
     note "base $BASE_VERSION already installed at $dest (same manifest)"
   else

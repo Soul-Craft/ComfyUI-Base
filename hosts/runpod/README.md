@@ -51,7 +51,7 @@ mechanism; `BASE_HOST` is detected on the pod itself from PID 1's `RUNPOD_POD_ID
     uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
     uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
     uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
-    uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run with --latest, poll, logs, pins
+    uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run (everything newest), poll, logs, pack records
     uv run "_build/pod/podctl.py" stop|start|restart <pod> --wait
     uv run "_build/pod/podctl.py" deploy --like <pod> --wait    # a NEW pod cloned onto the same volume (a machine whose GPU is not ours)
     uv run "_build/pod/podctl.py" lease <pod> [--take|--release] [--minutes N] [--purpose ...]   # who holds the GPU; advisory, expires

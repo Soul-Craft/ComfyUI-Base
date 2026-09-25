@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rehearse an upload from the shipped zips, the way the pod will see it — offline, on a fake pod.
 
-    cd <repo> && uv run --no-project --python 3.12 --with pytest python base/comfyui-base/_build/rehearse.py <brand>/packages/<name> [--layout official|community|bare|volume]
-    cd <base>  && uv run --no-project --python 3.12 --with pytest python _build/rehearse.py stub --layout volume      # standalone: the fixture package
+    cd <repo> && uv run --no-project --with pytest python base/comfyui-base/_build/rehearse.py <brand>/packages/<name> [--layout official|community|bare|volume]
+    cd <base>  && uv run --no-project --with pytest python _build/rehearse.py stub --layout volume      # standalone: the fixture package
 
 Unpacks the base zip (comfyui-base.zip) and the package zip into a scratch /workspace/packages, builds a fake pod
 of the chosen layout beside it (basetest.fake_pod), then runs exactly the two commands the handbook gives:

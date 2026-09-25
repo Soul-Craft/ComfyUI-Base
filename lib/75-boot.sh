@@ -1,4 +1,4 @@
-# 75-boot.sh — the base owns the machine's boot: boot.sh + the launch lib on the volume, the tools venv (JupyterLab),
+# 75-boot.sh: the base owns the machine's boot: boot.sh + the launch lib on the volume, the tools venv (JupyterLab, newest),
 # state/boot.env (what boot.sh starts). On RunPod podctl points the pod's start command at <volume>/comfy-base/boot.sh;
 # on a VM host (2.2.0) the base installs comfy-base-boot.service, which runs it at every boot. From then on every boot is
 # the base's: sshd → JupyterLab → ComfyUI from the base's venv, and the script never exits.
@@ -20,20 +20,41 @@ base_boot_env_write(){ # the facts boot.sh needs; written by every real run, sin
     printf "PREVIEW_SIZE='%s'\n" "${BASE_PREVIEW_SIZE:-1024}"; printf "TS='%s'\n" "$(_base_ts)"; } > "$f"
   ok "boot facts written: $f"
 }
-base_boot_tools(){ # JupyterLab into the base's tools venv on the volume (the venv uv already lives in), once
-  local t mm stamp; t="$BASE_HOME/tools"; stamp="$t/.comfy-base-tools"      # two statements: `local a=x b=$a` expands $a before it exists
-  if [ -x "$t/bin/jupyter-lab" ] && [ -f "$stamp" ]; then ok "tools venv present ($(cat "$stamp"))"; BASE_TOOLS_RESULT="present"; return 0; fi
-  if [ "$BASE_DRY" = "1" ]; then would "install JupyterLab into the tools venv $t (its python -m pip, from PyPI)"; BASE_TOOLS_RESULT="would-build"; return 0; fi
+base_boot_tools(){ # JupyterLab in the base's tools venv, on the newest Python, at its newest (3.0.0: every run, never "present")
+  # $BASE_HOME/tools (the path boot.sh starts JupyterLab from) is a SYMLINK to tools.<python minor>.<ts>. A new Python
+  # minor builds a new venv beside the old and swaps the link in one rename, so a JupyterLab another machine on the
+  # store is running keeps its files; otherwise JupyterLab is upgraded in place. The newest two are kept.
+  local link="$BASE_HOME/tools" mm cur_mm target ts stamp
+  if [ "$BASE_DRY" = "1" ]; then would "JupyterLab at its newest in the tools venv $link, on the newest Python uv provides"; BASE_TOOLS_RESULT="would-upgrade"; return 0; fi
   if [ "$BASE_NO_NET" = "1" ]; then
-    mkdir -p "$t/bin"; printf '#!/bin/bash\necho "fake jupyter-lab $*"\n' > "$t/bin/jupyter-lab"; chmod +x "$t/bin/jupyter-lab"
+    stamp="$link/.comfy-base-tools"
+    if [ -x "$link/bin/jupyter-lab" ] && [ -f "$stamp" ]; then ok "tools venv present (fake)"; BASE_TOOLS_RESULT="present (fake)"; return 0; fi
+    mkdir -p "$link/bin"; printf '#!/bin/bash\necho "fake jupyter-lab $*"\n' > "$link/bin/jupyter-lab"; chmod +x "$link/bin/jupyter-lab"
     echo "fake ts=$(_base_ts)" > "$stamp"; ok "fake tools venv (BASE_NO_NET)"; BASE_TOOLS_RESULT="built (fake)"; BASE_CHANGED+=("tools venv built (fake)"); return 0
   fi
-  if ! _base_tools_venv; then warn "tools venv: could not be created — the boot starts without JupyterLab"; BASE_TOOLS_RESULT="failed"; return 0; fi
-  if "$t/bin/python" -m pip install -q --disable-pip-version-check jupyterlab 2>&1 | tail -3 && [ -x "$t/bin/jupyter-lab" ]; then
-    mm="$("$t/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo ?)"
-    echo "python=$mm jupyterlab ts=$(_base_ts)" > "$stamp"; ok "tools venv: JupyterLab installed at $t (Python $mm)"
-    BASE_CHANGED+=("tools venv: JupyterLab"); BASE_TOOLS_RESULT="built"
-  else warn "tools venv: JupyterLab could not be installed — the boot starts without it"; BASE_TOOLS_RESULT="failed"; fi
+  command -v uv >/dev/null 2>&1 || _base_ensure_uv || { warn "tools venv: no uv: the boot starts without JupyterLab"; BASE_TOOLS_RESULT="failed (no uv)"; return 0; }
+  mm="$(_base_newest_python_minor)"
+  [ -n "$mm" ] || { warn "tools venv: uv lists no Python: JupyterLab not upgraded"; BASE_TOOLS_RESULT="failed (no python)"; return 0; }
+  cur_mm="$("$link/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  if [ -L "$link" ] && [ "$cur_mm" = "$mm" ] && [ -x "$link/bin/jupyter-lab" ]; then
+    if uv pip install -q --python "$link/bin/python" --upgrade jupyterlab 2>&1 | tail -2; then
+      echo "python=$mm jupyterlab=$("$link/bin/python" -c 'import importlib.metadata as m; print(m.version("jupyterlab"))' 2>/dev/null) ts=$(_base_ts)" > "$link/.comfy-base-tools"
+      ok "tools venv: $(cat "$link/.comfy-base-tools")"; BASE_TOOLS_RESULT="newest"
+    else warn "tools venv: JupyterLab could not be upgraded"; BASE_TOOLS_RESULT="failed (upgrade)"; fi
+    return 0
+  fi
+  ts="$(_base_ts)"; target="$BASE_HOME/tools.$mm.$ts"
+  uv python install "$mm" >/dev/null 2>&1 || true
+  if ! uv venv -q --python "$mm" --seed "$target" 2>&1 | tail -2 || ! uv pip install -q --python "$target/bin/python" jupyterlab 2>&1 | tail -2 || [ ! -x "$target/bin/jupyter-lab" ]; then
+    rm -rf "$target"; warn "tools venv: could not build JupyterLab on Python $mm: the previous one stays"; BASE_TOOLS_RESULT="failed (build)"; return 0
+  fi
+  echo "python=$mm jupyterlab=$("$target/bin/python" -c 'import importlib.metadata as m; print(m.version("jupyterlab"))' 2>/dev/null) ts=$ts" > "$target/.comfy-base-tools"
+  if [ -d "$link" ] && [ ! -L "$link" ]; then mv "$link" "$BASE_HOME/tools.pre-$ts" || true; fi    # the 2.x directory, kept for a running JupyterLab
+  # one rename replaces the link (a plain `mv` onto a symlink to a directory would move INTO the directory)
+  ln -sfn "$(basename "$target")" "$link.new" && "${SYS_PY:-python3}" -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$link.new" "$link"
+  ok "tools venv: $(cat "$link/.comfy-base-tools") at $target"; BASE_CHANGED+=("tools venv: JupyterLab on Python $mm"); BASE_TOOLS_RESULT="built (Python $mm)"
+  # keep the newest two (the one the link names, and the one before it)
+  ls -dt "$BASE_HOME"/tools.[0-9]* "$BASE_HOME"/tools.pre-* 2>/dev/null | sed -n '3,$p' | while IFS= read -r old; do rm -rf "$old"; done
   return 0
 }
 _base_boot_unit_text(){ # the systemd unit that runs the base's boot at every boot of a VM host (Verda, Crusoe, an owned box)

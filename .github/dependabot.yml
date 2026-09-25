@@ -1,0 +1,8 @@
+# Always the newest (ComfyUI Base 3.0.0): the CI's actions move to their newest release through a pull request,
+# which is merged once its own verify run is green.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

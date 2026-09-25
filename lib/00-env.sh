@@ -20,8 +20,15 @@
 # BASE_FAKE_NO_VOLUME=1       the pod has no network volume: discovery must refuse
 # BASE_NONINTERACTIVE=1  2.1.0: a run nobody is watching (the boot on a customer pod): every prompt takes its default,
 #                        no TTY is assumed even when one is attached; BASE_YES still answers the deletion prompt
-# BASE_PINNED=1          2.1.0: the seed's ComfyUI tag, Python and torch are the truth: no fetch, no re-pick, no rebuild,
-#                        --latest refused (a baked image sets it; a hand-installed pod never does)
+# COMFY_REF=<ref>        3.0.0: ComfyUI at a ref NEWER than the newest release (master, a branch, a newer tag, a full 40-hex
+#                        commit), for a fix not yet released. Refused when it is an ancestor of the newest release. Per
+#                        run: the next run without it returns to the newest release. `podctl install --comfy-ref` sets it.
+# BASE_FAKE_APT=<dir>    3.0.0: the suite's stand-ins for apt-get, apt-cache, apt-mark, dpkg-query, dkms, modinfo,
+#                        systemctl, nvidia-smi and uname (and <dir>/root for /lib/modules); without it a fake run leaves
+#                        the OS alone
+# BASE_FAKE_HOLDERS=<file>  3.0.0: the suite's stand-in for py/holders.py (the packages that refuse a forced version)
+# RETIRED in 3.0.0 (every run takes everything to its newest; each is noted and ignored when set):
+#   BASE_PINNED  COMFY_TAG  BASE_LATEST (--latest is a plain run)  SAGE_WHEEL  a 40-hex SAGE_REF  BASE_FORCE_SELF
 # BASE_HOST              2.2.0: runpod | verda | crusoe | local | vm. Explicit, else RunPod's own RUNPOD_POD_ID in PID 1's
 #                        environment, else the driver's <volume>/comfy-base/state/host.env, else vm (a VM whose host is unknown)
 # BASE_VOLUME            2.2.0: the persistent root (/workspace on RunPod, Verda and Crusoe; a directory of your choosing on
@@ -50,11 +57,9 @@
 # BASE_NO_SUITE=1        2.1.0: the package's suite does not run at the end of the install (a baked image's first boot:
 #                        the suite ran when the image was built; a customer's first boot is not the place for pytest)
 # BASE_SEED=1            2.1.0: a baked image's seed build (a brand's image generator): toolchain and packs only; base_run
-#                        stops after the ledger (no models, no restart, no smoke, no suite). COMFY_TAG=vX.Y.Z makes
-#                        base_comfy_materialize check out that tag instead of the newest; SAGE_ARCHS="9.0;12.0" builds
+#                        stops after the ledger (no models, no restart, no smoke, no suite). SAGE_ARCHS="9.0;12.0" builds
 #                        SageAttention for those architectures with no GPU present.
 BASE_DRY="${BASE_DRY:-0}"                 # --check
-BASE_LATEST="${BASE_LATEST:-0}"           # --latest: packs to their remote HEAD instead of the pinned commit
 BASE_FAKE_ROOT="${BASE_FAKE_ROOT:-}"
 BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk — a code tree the base must never adopt or scan
 BASE_FAKE_PID1_ENV="${BASE_FAKE_PID1_ENV:-}"       # fake: the file that stands in for /proc/1/environ
@@ -79,8 +84,7 @@ BASE_NO_NET="${BASE_NO_NET:-0}"
 BASE_YES="${BASE_YES:-0}"
 BASE_RESTART="${BASE_RESTART:-0}"
 BASE_NONINTERACTIVE="${BASE_NONINTERACTIVE:-0}"
-BASE_PINNED="${BASE_PINNED:-0}"
-export BASE_NONINTERACTIVE BASE_PINNED   # a package script the boot runs inherits the mode it was started in
+export BASE_NONINTERACTIVE              # a package script the boot runs inherits the mode it was started in
 BASE_HOST="${BASE_HOST:-}"; BASE_VOLUME="${BASE_VOLUME:-/workspace}"; BASE_VOLUME="${BASE_VOLUME%/}"; [ -n "$BASE_VOLUME" ] || BASE_VOLUME=/
 BASE_VOLUME_KIND="${BASE_VOLUME_KIND:-}"; BASE_LISTEN="${BASE_LISTEN:-}"   # resolved by _base_host_resolve once every lib is loaded
 # The ONE filesystem a pod stop/start keeps. Empty off the pod, which makes every persistence check
