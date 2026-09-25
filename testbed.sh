@@ -202,7 +202,7 @@ provision_server() {
   note "installing torch (CPU) + every requirement at its newest: this is the slow part …"
   uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
   # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
-  local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$HERE/.testbed-derived.txt"
+  local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$COMFY/.testbed-derived.txt"   # inside the ignored testbed tree
   for row in "${PACKS[@]}"; do
     dir="${row%%|*}"
     [ -f "$CN/$dir/requirements.txt" ] && files+=("$dir=$CN/$dir/requirements.txt")
