@@ -550,7 +550,8 @@ def test_unit_podctl_records_the_volume_size_for_the_disk_gate(tmp_path):
 STUB_SCRIPT = '''#!/bin/bash
 R="$(cd "$(dirname "$0")/%s" && pwd)"
 echo "$(basename "$0") $*" >> "$R/calls.log"
-if [ "$1" = "--check" ]; then exit "$(cat "$R/check_rc" 2>/dev/null || echo 0)"; fi
+if [ "$1" = "preflight" ] && [ -f "$R/no_preflight" ]; then echo "usage: bash x [--check | --latest]" >&2; exit 2; fi
+if [ "$1" = "--check" ] || [ "$1" = "preflight" ]; then exit "$(cat "$R/check_rc" 2>/dev/null || echo 0)"; fi
 echo "══ NODE PACKS · locate / clone / pin ══"
 echo '  "PackA|https://github.com/x/PackA|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb||the pack"'
 echo '  "PackB|https://github.com/x/PackB|cccccccccccccccccccccccccccccccccccccccc|packb|another"'
@@ -558,6 +559,18 @@ echo "══ SUMMARY · %s ══"
 echo "  suite      3 passed"
 echo "  restart    restarted"
 exit "$(cat "$R/run_rc" 2>/dev/null || echo 0)"
+'''
+
+
+# 3.2.0: `base.sh install-self` as the pod sees it: logs the call and installs the base onto the volume (a VERSION,
+# a manifest, the step-one script), which is all a package run needs from step one when both are installed together
+BASE_SH_STUB = '''#!/bin/bash
+R="$(cd "$(dirname "$0")/../.." && pwd)"
+echo "base.sh $*" >> "$R/calls.log"
+mkdir -p "$R/comfy-base/state"; echo "9.9.9" > "$R/comfy-base/VERSION"; echo "0000  lib/x.sh" > "$R/comfy-base/MANIFEST.sha256"
+cat > "$R/comfy-base/comfyui-base-script.sh" <<'STUBEOF'
+%s
+STUBEOF
 '''
 
 
@@ -599,6 +612,7 @@ def _local_packages(tmp_path):
     base = tmp_path / "local" / "comfyui-base"; base.mkdir(parents=True); (base / "base.sh").write_text("# base\n")
     with zipfile.ZipFile(base / "comfyui-base.zip", "w") as z:
         z.writestr("comfyui-base/comfyui-base-script.sh", STUB_SCRIPT % ("../..", "base"))
+        z.writestr("comfyui-base/base.sh", BASE_SH_STUB % (STUB_SCRIPT % ("..", "base")))
     pkg = tmp_path / "local" / "My Pkg"; pkg.mkdir()
     (pkg / "My Pkg-script.sh").write_text('PACKS=(\n "PackA|https://github.com/x/PackA|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa||the pack"\n "PackB|https://github.com/x/PackB|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1|packb|another"\n)\n')
     with zipfile.ZipFile(pkg / "My Pkg-runpod.zip", "w") as z:
@@ -618,15 +632,19 @@ def test_unit_podctl_install_runs_the_documented_sequence_and_stops_at_the_first
     assert rc == 0, out
     cmds = io.cmds
     assert [u[0][0].split("/")[-1] for u in io.uploads] == ["comfyui-base.zip", "My Pkg-runpod.zip"]
-    extract = [c for c in cmds if "zipfile -e" in c]; checks = [c for c in cmds if "--check" in c]; runs = [c for c in cmds if "STEP RC=" in c and "nohup" in c]
-    assert len(extract) == 2 and len(checks) == 2 and len(runs) == 2
-    assert cmds.index(extract[0]) < cmds.index(checks[0]) < cmds.index(runs[0]) < cmds.index(extract[1]) < cmds.index(checks[1]) < cmds.index(runs[1])
-    assert 'bash "comfyui-base/comfyui-base-script.sh";' in runs[0] and "BASE_RESTART" not in runs[0] and "--latest" not in runs[0]   # 3.0.0: every run is newest
+    # 3.2.0: with a package after it, the base is INSTALLED (and its suite run once per base version), never run as a
+    # second whole pipeline: the package's run already does everything the base's own run did
+    extract = [c for c in cmds if "zipfile -e" in c]; selfs = [c for c in cmds if "install-self" in c and "nohup" not in c]
+    checks = [c for c in cmds if " preflight" in c]; runs = [c for c in cmds if "STEP RC=" in c and "nohup" in c]
+    assert len(extract) == 2 and len(selfs) == 1 and len(checks) == 1 and len(runs) == 2, cmds
+    assert cmds.index(extract[0]) < cmds.index(selfs[0]) < cmds.index(runs[0]) < cmds.index(extract[1]) < cmds.index(checks[0]) < cmds.index(runs[1])
+    assert "BASE_REEXEC=1 bash comfyui-base/base.sh install-self" in selfs[0]
+    assert "comfyui-base-script.sh test" in runs[0] and "base-suite.ok" in runs[0]            # the base's suite, once per base version
     assert 'BASE_RESTART=1 bash "My Pkg/My Pkg-script.sh";' in runs[1]        # 2.0.17: a package runs from its own folder
     assert 'mkdir -p ' in extract[1] and "'My Pkg'" in extract[1] and extract[1].rstrip().endswith("'My Pkg'"), extract[1]
     assert extract[0].rstrip().endswith(" .")                                                  # the base zip carries its own folder
     calls = (io.root / "calls.log").read_text().splitlines()
-    assert [c.rstrip() for c in calls] == ["comfyui-base-script.sh --check", "comfyui-base-script.sh", "My Pkg-script.sh --check", "My Pkg-script.sh"]
+    assert [c.rstrip() for c in calls] == ["base.sh install-self", "comfyui-base-script.sh test", "My Pkg-script.sh preflight", "My Pkg-script.sh"]
     assert (io.root / "packages" / "My Pkg" / "My Pkg-script.sh").exists() and not (io.root / "packages" / "My Pkg-script.sh").exists()
     # the pod's logs land beside each item, the console among them; the summary is printed; the pins are saved and the zip rebuilt
     for d in (base, pkg):
@@ -635,10 +653,10 @@ def test_unit_podctl_install_runs_the_documented_sequence_and_stops_at_the_first
     s = (pkg / "My Pkg-script.sh").read_text()
     assert "PackA|https://github.com/x/PackA|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|" in s and "PackB|https://github.com/x/PackB|cccccccccccccccccccccccccccccccccccccccc|packb" in s and "aaaaaaaa" not in s
     assert io.rebuilt == [str(pkg)] and "pins" in out
-    # a --check that fails stops the item before its run, and the whole install
-    (io.root / "check_rc").write_text("2"); io.cmds.clear(); (io.root / "calls.log").unlink()
+    # a preflight that fails stops the item before its run, and the whole install
+    (io.root / "check_rc").write_text("1"); io.cmds.clear(); (io.root / "calls.log").unlink()
     rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06"); out = capsys.readouterr().out
-    assert rc == 1 and "STOP" in out and "--check" in out and not [c for c in io.cmds if "nohup" in c]
+    assert rc == 1 and "STOP" in out and "preflight" in out and not [c for c in io.cmds if "nohup" in c]
     # a red run stops with the console path, its logs copied
     (io.root / "check_rc").write_text("0"); (io.root / "run_rc").write_text("1"); io.cmds.clear()
     rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06"); out = capsys.readouterr().out
@@ -1328,8 +1346,9 @@ def test_unit_podctl_install_sends_no_latest_and_carries_comfy_ref_on_check_and_
     base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
     rc = podctl.install("pod1", [base], io, every=1, timeout=60, today="2026-09-25", comfy_ref="master")
     assert rc == 0, capsys.readouterr().out
-    check = [c for c in io.cmds if "--check" in c][0]; run = [c for c in io.cmds if "nohup" in c][0]
+    check = [c for c in io.cmds if " preflight" in c][0]; run = [c for c in io.cmds if "nohup" in c][0]
     assert "COMFY_REF=master" in check and "COMFY_REF=master" in run and "--latest" not in run
+    assert 'bash "comfyui-base/comfyui-base-script.sh";' in run and "BASE_RESTART" not in run      # --base alone: step one, whole
     io.cmds.clear()
     podctl.install("pod1", [base], io, every=1, timeout=60, today="2026-09-25")
     assert not [c for c in io.cmds if "COMFY_REF" in c]                                        # per install, never sticky
@@ -1366,6 +1385,7 @@ def _buyer_zips(tmp_path):
     d = tmp_path / "bought"; d.mkdir()
     with zipfile.ZipFile(d / "comfyui-base.zip", "w") as z:
         z.writestr("comfyui-base/comfyui-base-script.sh", STUB_SCRIPT % ("../..", "base"))
+        z.writestr("comfyui-base/base.sh", BASE_SH_STUB % (STUB_SCRIPT % ("..", "base")))
     with zipfile.ZipFile(d / "my-pkg-verda.zip", "w") as z:
         z.writestr("my-pkg-script.sh", STUB_SCRIPT % ("../..", "my-pkg"))
     rt = tmp_path / "rt"; rt.mkdir(); part = rt / "runtime.tar.gz.000"; part.write_bytes(b"part")
@@ -1396,8 +1416,14 @@ def test_unit_buyer_install_applies_the_runtime_then_installs_staged_with_no_gat
     assert rc == 0, out
     calls = [c.rstrip() for c in (io.root / "calls.log").read_text().splitlines()]
     assert calls[0].startswith("comfyui-base-script.sh runtime-apply ") and calls[0].endswith("/.comfy-base-runtime-src/runtime.json")
-    assert calls[1:] == ["comfyui-base-script.sh --check", "comfyui-base-script.sh", "my-pkg-script.sh --check", "my-pkg-script.sh"]
+    # 3.2.0: the base is installed (never a second whole pipeline), no base suite on a buyer's machine (BASE_NO_SUITE),
+    # and each package gets the seconds-long preflight, carrying the same runtime environment as its run
+    assert calls[1:] == ["base.sh install-self", "my-pkg-script.sh preflight", "my-pkg-script.sh"], calls
+    assert not [c for c in io.cmds if "comfyui-base-script.sh test" in c]
+    pre = [c for c in io.cmds if " preflight" in c]
+    assert len(pre) == 1 and "BASE_RUNTIME=" in pre[0] and "BASE_STAGED=" in pre[0], pre
     runs = [c for c in io.cmds if "STEP RC=" in c and "nohup" in c and "runtime-apply" not in c]
+    assert len(runs) == 1, runs
     for r in runs:
         assert "BASE_RUNTIME=" in r and "BASE_STAGED=" in r and re.search(r"BASE_FETCH_JOBS=\W{0,12}3\W", r), r   # the whole line is quoted once more
     uploaded = [pathlib.Path(f).name for u in io.uploads for f in u[0]]
@@ -1443,3 +1469,63 @@ def test_unit_the_buyer_verbs_parse_and_a_host_without_them_says_so():
     with pytest.raises(podctl.PodctlError) as e:
         podctl.cmd_balance(Bare(), ap.parse_args(["balance"]))
     assert "not offered by host bare" in str(e.value)
+
+
+# ---------------------------------------------------------------- 3.2.0: one pass per install
+
+def test_unit_podctl_install_runs_the_base_suite_once_per_base_version(tmp_path, capsys):
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    assert podctl.install("pod1", [base, pkg], io, every=1, timeout=60, today="2026-09-25", save_pins=False) == 0, capsys.readouterr().out
+    assert (io.root / "comfy-base" / "state" / "base-suite.ok").exists()
+    (io.root / "calls.log").unlink(); capsys.readouterr()
+    assert podctl.install("pod1", [base, pkg], io, every=1, timeout=60, today="2026-09-25", save_pins=False) == 0
+    out = capsys.readouterr().out
+    calls = [c.rstrip() for c in (io.root / "calls.log").read_text().splitlines()]
+    assert calls == ["base.sh install-self", "My Pkg-script.sh preflight", "My Pkg-script.sh"], calls   # same base: its suite is not rerun
+    assert "already green on this machine" in out
+
+
+def test_unit_podctl_install_falls_back_to_check_on_a_base_without_preflight(tmp_path, capsys):
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    (io.root / "no_preflight").write_text("1")                   # a machine whose installed base predates preflight
+    assert podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-25", save_pins=False) == 0, capsys.readouterr().out
+    calls = [c.rstrip() for c in (io.root / "calls.log").read_text().splitlines()]
+    assert calls == ["My Pkg-script.sh preflight", "My Pkg-script.sh --check", "My Pkg-script.sh"], calls
+
+
+def test_unit_podctl_polls_every_five_seconds_by_default():
+    podctl = _load()
+    import inspect
+    assert inspect.signature(podctl.install).parameters["every"].default == 5
+    a = podctl.build_parser().parse_args(["install", "pod1", "--pkg", "x"])
+    assert a.every == 5
+
+
+def test_unit_podctl_gate_is_not_rerun_for_a_zip_that_already_passed(tmp_path):
+    # a retry after a machine-side failure uploads the SAME zip: its suite already passed from that zip, against the
+    # same base, so it is not run again. A different zip (or base) runs it, and a red run never enters the cache.
+    podctl = _load()
+    pkg = tmp_path / "Fake Package"; pkg.mkdir()
+    script = pkg / "Fake Package-script.sh"
+    script.write_text('#!/bin/bash\ncase "${1:-}" in test) echo run >> "$GATE_LOG"; echo "  ✔ suite: 3 passed"; exit "${FAKE_RC:-0}";; esac\n')
+    import zipfile as _zf
+    def build(extra):
+        with _zf.ZipFile(pkg / "Fake Package-runpod.zip", "w") as zf:
+            zf.writestr("Fake Package-script.sh", script.read_text()); zf.writestr("extra.txt", extra)
+    log = tmp_path / "gate.log"; cache = tmp_path / "cache"
+
+    class IO(podctl.PodIO):
+        def __init__(self): self.env = dict(os.environ, BASE_NODE_SRC=str(tmp_path), COMFY_BASE=str(tmp_path), GATE_LOG=str(log), PODCTL_GATE_CACHE=str(cache)); self.said = []
+        def say(self, m): self.said.append(m)
+    io = IO()
+    build("1"); io.gate(pkg, io.say); assert log.read_text().count("run") == 1
+    io.env["FAKE_RC"] = "1"
+    io.gate(pkg, io.say)                                    # same zip, same base: cached green, the suite is not run
+    assert log.read_text().count("run") == 1 and any("already passed" in m for m in io.said), io.said
+    build("2")                                              # a different zip runs, and red is red
+    with pytest.raises(podctl.PodctlError):
+        io.gate(pkg, io.say)
+    io.env.pop("FAKE_RC")
+    io.gate(pkg, io.say); assert log.read_text().count("run") == 3   # the red run was not cached

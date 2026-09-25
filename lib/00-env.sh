@@ -117,7 +117,16 @@ ok(){    echo -e "${GREEN}  ✔ $*${NC}"; }
 miss(){  echo -e "${YEL}  ✖ $*${NC}"; }
 err(){   echo -e "${RED}  ‼ $*${NC}"; }
 note(){  echo "  ○ $*"; }
-hdr(){   echo -e "\n${CYA}══ $* ══${NC}"; }
+hdr(){   _base_stage_mark "$*"; echo -e "\n${CYA}══ $* ══${NC}"; }
+# 3.2.0: every header closes the stage before it with its seconds (bash's own SECONDS: no fork, bash 3.2 too).
+# The summary prints them slowest first and the store keeps them, so where an install spends its minutes is read
+# from the run itself, never estimated.
+BASE_STAGE_NAME=""; BASE_STAGE_T0=0; BASE_STAGE_TIMES=()
+_base_stage_mark(){
+  local now="$SECONDS"
+  if [ -n "$BASE_STAGE_NAME" ]; then BASE_STAGE_TIMES+=("$(( now - BASE_STAGE_T0 ))|$BASE_STAGE_NAME"); fi
+  BASE_STAGE_NAME="$1"; BASE_STAGE_T0="$now"
+}
 would(){ echo -e "${CYA}  → would $*${NC}"; }   # --check wording
 todo(){  echo -e "${CYA}  → $*${NC}"; }          # queued work, not a fault: this run is about to do it
 warn(){  echo -e "${YEL}  ! $*${NC}"; BASE_WARN+=("$*"); }   # reported in the summary, never blocks

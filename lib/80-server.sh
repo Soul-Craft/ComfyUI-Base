@@ -37,7 +37,7 @@ base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.
   case "$BASE_VENV_RESULT" in failed*|rolled*) note "skipped — the venv step failed"; BASE_IMPORT_RESULT="skipped (venv failed)"; BASE_BLOCK_RESTART=1; return 0;; esac
   if [ ! -x "$PY" ]; then note "skipped — no interpreter at $PY"; BASE_IMPORT_RESULT="skipped (no venv)"; return 0; fi
   _base_tmp; local log="$BASE_TMPD/import_check.log" rc=0 name failed=() diag
-  _base_quick_test "$log" || rc=$?
+  _base_quick_test_scoped "$log" || rc=$?            # 3.2.0: just the own packs when nothing else changed (lib/62-own-packs.sh)
   # ---- ComfyUI itself did not start: that stops every machine on the store, so the newest set is rolled back
   if _base_core_failed "$log" "$rc"; then
     miss "ComfyUI itself did not start (exit $rc): last lines:"; tail -12 "$log" | sed 's/^/     /'

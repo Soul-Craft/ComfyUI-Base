@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.1.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.2.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -309,10 +309,21 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   checked for shape only, so no zip carries the list. A brand without the file skips the check.
 - Optional: `WF_VERSION_KEY` (the `extra` key carrying the workflow's version; default `package_version`),
   `DRIVER_MIN SUPERSEDED LEGACY_DIRS DROPPED_PACKS TOKENS PIP_EXTRA HYGIENE_ARGS HYGIENE_ARGS_REMOVE LOADER_CATS
-  PKG_COMMANDS PKG_IMPORT_CHECK PKG_NO_SUITE ZIP_EXTRA`. `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
+  PKG_COMMANDS PKG_IMPORT_CHECK PKG_NO_SUITE ZIP_EXTRA VENDORED_PACKS`. `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
   says so: the run's test stage notes it, and `verify.sh` passes the package as "no suite, declared". `LOADER_CATS`
   rows (`NodeType|library category`) extend the base's map of loader node types to library folders (`lib/60-sync.sh`
   covers ComfyUI's core loaders and the shared packs'); a package whose own pack loads models declares its loaders here.
+- `VENDORED_PACKS=( dir ... )` (3.2.0): the package's own node packs, folders beside the script that ship in its zip
+  (their files listed in `ZIP_EXTRA`). The base mirrors each into `custom_nodes` on every install, right after
+  `pkg_post_venv` and before the requirements resolve: the installed folder becomes exactly what the zip carries (a file
+  the pack dropped is gone), and a pack whose content did not change is not touched. Each installed copy carries a stamp,
+  `.comfy-base-own` (package, version, content digest). On a shared store two packages may ship the same pack: the newest
+  `pyproject.toml` version wins and is never moved backwards, and the same version with different content is installed
+  and named (one of the two missed a version bump). An own pack that fails the import check is put back to its previous
+  copy (kept in `state/own/prev/`) and the restart is blocked, so the live server keeps the code that worked. The ledger
+  records `own <dir> <version> <digest>`; `BASE_DECLARE_ONLY=1` prints `OWNROW dir|version|digest`. A package no longer
+  needs its own copy loop in a hook; one that still has it is harmless (the base saves the live copy before the hooks and
+  mirrors after them).
 - Hooks, called if defined, dry-run aware via `$BASE_DRY`: `pkg_pre_venv pkg_post_venv pkg_pre_models
   pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`, and `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
@@ -364,13 +375,25 @@ init (env · log · volume check · discover, or materialise the tree · declara
 (the OS and the NVIDIA driver at their newest; a new driver stops here with "restart required") → driver gate → the
 store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
 consolidate strays (the volume only) → packs git (every pack to its HEAD) → the venv snapshot → `pkg_pre_venv` → venv →
-`pkg_post_venv` → packs pip (the derived, pin-free set) → Comfy MCP → newest (every package still behind forced to its
-newest) → `pkg_pre_models` →
+`pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
+MCP → newest (every package still behind forced to its newest) → `pkg_pre_models` →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
 smoke → combos → the later stage handed to a detached `fetch-later` (a staged run) → the package's suite →
 `pkg_post_install` → summary (exit 0, or 1 when anything failed; the verdict kept in `state/last-run/<id>`).
+
+**One pass, and its clock** (3.2.0). Every stage header closes the stage before it with its seconds; the summary prints
+them slowest first and `state/logs/<pkg>_<ts>.timings.tsv` keeps them, which podctl fetches with the console. When the
+only change a run makes is the package's own packs (ComfyUI, every other pack and the venv's package list unchanged), the
+import check loads ComfyUI with just those packs (`--disable-all-custom-nodes --whitelist-custom-nodes`); anything short
+of a pass there is judged again by the full check. `<script> preflight` is what podctl runs before an install: seconds,
+nothing changed, and it stops only on what would stop the real run before that run changes anything (declarations,
+`BASE_MIN`, the volume, a workflow whose version is not the script's). `--check` stays the full dry report, without the
+suite, which would only test the server the real run is about to replace. `podctl install --base --pkg <dir>` installs
+the base and runs ONE pipeline, the package's (it already covers every stage the base's own run would); the base's suite
+runs on a machine once per base version (`state/base-suite.ok`). A retry of the same zip against the same base skips the
+Mac gate, and podctl polls every 5 s.
 
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
@@ -531,6 +554,21 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.2.0: an install does each piece of work once, and says what each stage cost. Paul, 2026-09-25: a two-file change to
+  a package's own node pack took a full install (about 10 minutes), and he asked for installs that always take everything
+  to its newest while doing only the work that changed. Traced from the code and the consoles of 2026-09-24/25, nothing
+  was ever reinstalled: the minutes were work done twice. `podctl install --base --pkg` ran two whole pipelines, the
+  base's step one (with its restart and a 75 to 82 s suite) and then the package's, which repeats every stage of it; now
+  the base is installed and the package's run is the one pipeline, with the base suite once per base version. podctl's
+  full `--check` pass before each run is now `preflight`, seconds long (a machine whose base predates it gets `--check`
+  as before), and a dry run no longer runs the suite. A package's own node packs (`VENDORED_PACKS`) are the base's to
+  install: mirrored from the zip, untouched when unchanged, newest version first on a shared store, and put back when
+  they fail to import; the import check loads only them when nothing else changed. Every stage is timed. The buyer flow
+  takes the same preflight and single pipeline (no base suite there, `BASE_NO_SUITE=1`). Where own packs live was
+  decided with Paul the same day: in the zip (buyers' machines have no git and no GitHub credentials, the published
+  runtime must never carry them, and Comfy's own build tool takes a local folder as a pack's source). Exercised on fake
+  pods only; no live host yet.
 
 - 3.1.1: a runtime never carries a package's vendored packs. `runtime-capture` archived everything under
   `custom_nodes/`, which on a machine holds each package's own plain-folder packs beside the git checkouts; a runtime

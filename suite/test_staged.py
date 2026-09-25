@@ -165,7 +165,7 @@ def test_unit_the_launch_is_detached_and_the_run_goes_on(tmp_path):
     """base_run hands the queue to a detached `base.sh fetch-later` after the server started, never waiting for it."""
     body = (BASE / "lib" / "95-summary.sh").read_text()
     run = body[body.index("base_run(){"):body.index("_base_use_testbed(){")]
-    assert run.index("base_combos") < run.index("_base_later_launch") < run.index('base_test ""')
+    assert run.index("base_combos") < run.index("_base_later_launch") < run.index("_base_run_suite")   # 3.2.0: the suite stage (never in a dry run)
     launch = (BASE / "lib" / "50-models.sh").read_text()
     launch = launch[launch.index("_base_later_launch(){"):launch.index("base_fetch_later(){")]
     assert 'nohup setsid bash "$BASE_DIR/base.sh" fetch-later </dev/null' in launch and launch.rstrip().endswith("}")

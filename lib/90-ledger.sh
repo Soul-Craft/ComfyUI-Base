@@ -31,6 +31,10 @@ base_ledger_write(){ # after the install stages, before the summary; never under
       printf 'model\t%s\t%s\n' "$rel" "$bytes"
     done < <(_base_model_rows 2>/dev/null || true)
     for row in ${SUPERSEDED[@]+"${SUPERSEDED[@]}"}; do printf 'superseded\t%s\n' "$row"; done
+    for name in ${VENDORED_PACKS[@]+"${VENDORED_PACKS[@]}"}; do      # 3.2.0: what is installed, read from the copy's own stamp
+      dir="${CN:-/nonexistent}/$name"
+      if [ -f "$dir/.comfy-base-own" ]; then printf 'own\t%s\t%s\t%s\n' "$name" "$(_base_own_stamp "$dir" version)" "$(_base_own_stamp "$dir" digest)"; fi
+    done
   } > "$f.tmp" && mv "$f.tmp" "$f"
   ok "ledger: $f ($status)"
 }

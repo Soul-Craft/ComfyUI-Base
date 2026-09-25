@@ -1893,7 +1893,7 @@ def test_unit_python_pick_passes_requirement_files_positionally_and_a_failed_pic
 
 
 OPTIONAL_DECLS = ("DRIVER_MIN", "SUPERSEDED", "LEGACY_DIRS", "DROPPED_PACKS", "PIP_EXTRA", "HYGIENE_ARGS", "HYGIENE_ARGS_REMOVE",
-                  "LOADER_CATS", "PKG_COMMANDS", "PKG_IMPORT_CHECK", "PKG_NO_SUITE", "ZIP_EXTRA")
+                  "LOADER_CATS", "PKG_COMMANDS", "PKG_IMPORT_CHECK", "PKG_NO_SUITE", "ZIP_EXTRA", "VENDORED_PACKS")
 
 
 def test_unit_pip_extra_step_is_safe_when_a_package_declares_none(tmp_path):

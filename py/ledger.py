@@ -9,6 +9,7 @@ Manifest format (tab-separated):
   pack  <dir>  <sha>  <path>  <url>
   model  <dest rel>  <bytes>
   superseded  <basename>
+  own  <dir>  <version>  <digest>            (3.2.0: a package's own node pack, as installed)
 """
 import glob
 import json
@@ -17,7 +18,7 @@ import sys
 
 
 def parse(path):
-    d = {"packs": [], "models": [], "superseded": []}
+    d = {"packs": [], "models": [], "superseded": [], "own": []}
     for ln in open(path, encoding="utf-8"):
         ln = ln.rstrip("\n")
         if not ln:
@@ -27,6 +28,8 @@ def parse(path):
             d["packs"].append({"dir": f[1], "sha": f[2], "path": f[3], "url": f[4] if len(f) > 4 else ""})
         elif f[0] == "model" and len(f) >= 3:
             d["models"].append({"dest": f[1], "bytes": int(f[2]) if f[2].isdigit() else 0})
+        elif f[0] == "own" and len(f) >= 4:
+            d["own"].append({"dir": f[1], "version": f[2], "digest": f[3]})
         elif f[0] == "superseded" and len(f) >= 2:
             d["superseded"].append(f[1])
         else:

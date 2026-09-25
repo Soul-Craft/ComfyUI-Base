@@ -568,6 +568,12 @@ class PodIO:
         import shutil, subprocess, tempfile
         it = item_for(d)
         say = say or (lambda *_: None)
+        # 3.2.0: a retry uploads the SAME zip; its suite already passed from that zip against the same base, so it is
+        # not run again. The cache is the CLI's (PODCTL_GATE_CACHE, set by `podctl install`); only green enters it.
+        mark = self._gate_mark(it)
+        if mark is not None and mark.exists():
+            say("gate    %s: this zip already passed its suite against this base (%s), not run again" % (it["name"], mark.name[:12]))
+            return
         tmp = tempfile.mkdtemp(prefix="podctl-gate-")
         try:
             root = pathlib.Path(tmp)
@@ -605,8 +611,22 @@ class PodIO:
                 raise PodctlError("%s: its own suite FAILS from the built zip — fix it here, not on the pod:\n%s"
                                   % (it["name"], "\n".join(tail[-25:])))
             say("gate    %s: %s" % (it["name"], summary or "suite green from the zip"))
+            if mark is not None:
+                mark.parent.mkdir(parents=True, exist_ok=True); mark.write_text(summary + "\n", encoding="utf-8")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def _gate_mark(self, it):
+        """The cache entry for this zip against this base: sha256(zip) + sha256(the base's MANIFEST.sha256), or None
+        when no cache is configured."""
+        import hashlib
+        root = self.env.get("PODCTL_GATE_CACHE")
+        if not root:
+            return None
+        base_mf = pathlib.Path(__file__).resolve().parents[2] / "MANIFEST.sha256"
+        h = hashlib.sha256(pathlib.Path(it["zip"]).read_bytes())
+        h.update(base_mf.read_bytes() if base_mf.exists() else b"")
+        return pathlib.Path(root) / h.hexdigest()
 
     def upload(self, files, to):
         line = self.provider.record_volume(self.pod, env=self.env)
@@ -713,7 +733,45 @@ def _run_logged(io, name, slug, inner, every=30, timeout=3 * 3600):
         io.sleep(every); waited += every
 
 
-def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins_after=None, save_pins=True, today=None, comfy_ref=None, provider="verda",
+def _preflight(io, env, script):
+    """The pre-pass before a real run (3.2.0): `<script> preflight`, seconds, only what would stop the run before it
+    changes anything. A machine whose installed base predates it answers with its usage line (exit 2): then the whole
+    `--check`, as before. Returns (rc, out, err, the form that ran)."""
+    rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && %sbash %s preflight" % (env, _sq(script)))
+    if rc == 2 and "usage:" in (out + err):
+        rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && %sbash %s --check" % (env, _sq(script)))
+        return rc, out, err, "--check"
+    return rc, out, err, "preflight"
+
+
+def _install_base_only(io, it, every, timeout, today, suite=True):
+    """Step one when a package install follows (3.2.0): install the base onto the volume, then its own suite only when
+    this base version has not already passed on this machine (state/base-suite.ok: VERSION + the manifest's cksum).
+    suite=False (a buyer's machine, BASE_NO_SUITE=1) installs only."""
+    rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && BASE_REEXEC=1 bash comfyui-base/base.sh install-self")
+    if rc != 0:
+        io.say("STOP: installing %s on the pod failed (exit %d)\n%s" % (it["name"], rc, _tail(out + err))); return False
+    io.say("  installed on the volume (its packs, venv and restart are the package run's)")
+    if not suite:
+        io.say("  base suite: not run (BASE_NO_SUITE=1)"); return True
+    home = VOLUME_ROOT + "/comfy-base"
+    key = '"$(cat %s/VERSION) $(cksum < %s/MANIFEST.sha256)"' % (_sq(home), _sq(home))
+    ok_file = _sq(home + "/state/base-suite.ok")
+    inner = ('K=%s; if [ "$(cat %s 2>/dev/null)" = "$K" ]; then echo "  base suite already green on this machine for this base"; '
+             'echo "STEP RC=0"; else bash %s test; rc=$?; if [ "$rc" = 0 ]; then printf "%%s\\n" "$K" > %s; fi; echo "STEP RC=$rc"; fi'
+             % (key, ok_file, _sq(home + "/comfyui-base-script.sh"), ok_file))
+    step_rc, text, console = _run_logged(io, it["name"] + " suite", it["slug"], inner, every=every, timeout=timeout)
+    if step_rc is None:
+        return False
+    logs_dir = (it["logs"] / today / "pod-logs") if it.get("logs") else (it["dir"] / "_build" / "podruns" / today / "pod-logs")
+    io.fetch(logs_dir_remote(), logs_dir, newer_than=console)
+    io.say(_tail(text, 12))
+    if step_rc != 0:
+        io.say("STOP: the base's own suite is red on this machine: %s" % console); return False
+    return True
+
+
+def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_after=None, save_pins=True, today=None, comfy_ref=None, provider="verda",
             run_env=None, items=None):
     """Run the documented sequence for each directory in order. Returns 0 when every item ended green, 1 at the first
     failure (after printing what stopped it and where the console is). `io` is a PodIO or the suite's stand-in.
@@ -742,11 +800,20 @@ def install(pod_id, dirs, io, every=30, timeout=3 * 3600, latest=True, save_pins
         if rc != 0:
             io.say("STOP: extracting %s on the pod failed (exit %d)\n%s" % (z.name, rc, _tail(out + err))); return 1
         io.say("  extracted %s" % z.name)
+        if it["kind"] == "base" and any(o["kind"] == "pkg" for o in items):
+            # 3.2.0: a package follows, and its run does everything the base's own run would (the base's packs, the
+            # venv, the newest pass, the restart): the base is installed, never run as a second whole pipeline. A buyer's
+            # machine (BASE_NO_SUITE=1: no pytest there) skips the base's suite too.
+            suite = (run_env or {}).get("BASE_NO_SUITE") != "1"
+            if not _install_base_only(io, it, every, timeout, today, suite=suite):
+                return 1
+            io.say("  %s: green" % it["name"])
+            continue
         env = (("COMFY_REF=%s " % _sq(comfy_ref)) if comfy_ref else "") + _env_prefix(run_env)
-        rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && %sbash %s --check" % (env, _sq(it["script"])))
+        rc, out, err, pre = _preflight(io, env, it["script"])     # carries run_env: a buyer's base_init checks the runtime too
         if rc != 0:
-            io.say("STOP: %s --check exited %d on the pod — nothing was run:\n%s" % (it["name"], rc, _tail(out + err))); return 1
-        io.say("  --check ok")
+            io.say("STOP: %s %s exited %d on the pod, nothing was run:\n%s" % (it["name"], pre, rc, _tail(out + err))); return 1
+        io.say("  %s ok" % pre)
         prefix = ("BASE_RESTART=1 " if it["kind"] == "pkg" else "") + (("COMFY_REF=%s " % comfy_ref) if comfy_ref else "") + _env_prefix(run_env)
         inner = '%sbash "%s"; echo "STEP RC=$?"' % (prefix, it["script"])      # double quotes: readable in the log, and _sq wraps the whole line
         step_rc, text, console = _run_logged(io, it["name"], it["slug"], inner, every=every, timeout=timeout)
@@ -799,7 +866,7 @@ def runtime_manifest_remote():
     return VOLUME_ROOT + "/comfy-base/state/runtime.json"
 
 
-def buyer_install(pod_id, base_zip, pkg_zips, runtime, io, jobs=1, every=30, timeout=3 * 3600, logs=None):
+def buyer_install(pod_id, base_zip, pkg_zips, runtime, io, jobs=1, every=5, timeout=3 * 3600, logs=None):
     """A buyer's install, one command: the base zip and the purchased package zips, from the proven runtime, the first
     flow first. `runtime` is the manifest: an https URL the machine fetches itself, or a local runtime.json whose parts
     sit beside it (uploaded; slow over a home line, meant for tests and a maintainer's own sweep). No packager check,
@@ -1220,7 +1287,8 @@ def cmd_install(prov, args):
         print(write_host_env(prov))
         if getattr(args, "comfy_ref", None):
             print("comfyui ref %s (from --comfy-ref; this install only: the next one without it returns the store to the newest release)" % args.comfy_ref)
-        return install(args.pod, dirs, PodIO(prov, pod), every=args.every, timeout=args.timeout, save_pins=args.save_pins,
+        env = dict(os.environ); env.setdefault("PODCTL_GATE_CACHE", str(pathlib.Path.home() / ".cache" / "podctl" / "gate"))
+        return install(args.pod, dirs, PodIO(prov, pod, env=env), every=args.every, timeout=args.timeout, save_pins=args.save_pins,
                        comfy_ref=getattr(args, "comfy_ref", None), provider=getattr(prov, "name", "verda"))
     finally:
         lease_release(me)
@@ -1524,10 +1592,10 @@ def build_parser():
     p.add_argument("--wait", action="store_true")
     p = sub.add_parser("upload", help="scp files to the pod (through Host runpod) and verify size + sha256 on both sides")
     p.add_argument("pod"); p.add_argument("files", nargs="+"); p.add_argument("--to", default=VOLUME_ROOT + "/packages")
-    p = sub.add_parser("install", help="the whole documented sequence, one command: upload, extract, --check, run (everything to its newest), poll, copy logs, save the pack records")
+    p = sub.add_parser("install", help="the whole documented sequence, one command: upload, extract, preflight, run (everything to its newest), poll, copy logs, save the pack records")
     p.add_argument("pod"); p.add_argument("--base", action="store_true", help="ComfyUI Base as step one")
     p.add_argument("--pkg", action="append", help="a package directory (repeatable, in order); relative to the project folder")
-    p.add_argument("--every", type=int, default=30, help="poll interval in seconds"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
+    p.add_argument("--every", type=int, default=5, help="poll interval in seconds (3.2.0: 5; a 30 s poll cost 15 s of dead time per step on average)"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
     p.add_argument("--no-latest", dest="no_latest", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--comfy-ref", metavar="REF", help="ComfyUI at a ref NEWER than the newest release (master, a branch, a newer tag, a full sha), for this install only")
     p.add_argument("--no-save-pins", dest="save_pins", action="store_false", help="do not write the printed pins back after a green run")
@@ -1573,11 +1641,11 @@ def build_parser():
     p.add_argument("--base-zip", dest="base_zip", required=True, help="comfyui-base.zip")
     p.add_argument("--jobs", type=int, default=1, help="model files downloaded at once (BASE_FETCH_JOBS)")
     p.add_argument("--logs", default=None, help="where the machine's logs are copied (default: a podruns/ folder beside the zips)")
-    p.add_argument("--every", type=int, default=30); p.add_argument("--timeout", type=int, default=3 * 3600)
+    p.add_argument("--every", type=int, default=5); p.add_argument("--timeout", type=int, default=3 * 3600)
     p = sub.add_parser("progress", help="the machine's state/progress.json: where a staged install's later files are"); p.add_argument("pod")
     p = sub.add_parser("runtime-capture", help="capture this green machine's runtime (parts + runtime.json) and copy it here")
     p.add_argument("pod"); p.add_argument("--to", required=True); p.add_argument("--url-base", dest="url_base", default="", help="the https prefix the parts will be published under")
-    p.add_argument("--every", type=int, default=30); p.add_argument("--timeout", type=int, default=3 * 3600)
+    p.add_argument("--every", type=int, default=5); p.add_argument("--timeout", type=int, default=3 * 3600)
     for sp in sub.choices.values():                                  # --provider after the verb too (a hook that reads argv sees both forms)
         sp.add_argument("--provider", dest="provider_after", default=None, choices=list(_hosts.NAMES), help=argparse.SUPPRESS)
     return ap

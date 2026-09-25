@@ -16,6 +16,7 @@ _base_validate_tables(){ # every required declaration present and every table ro
   _base_pack_rows >/dev/null || bad=1
   _base_model_rows >/dev/null || bad=1
   _base_later_rows >/dev/null || bad=1
+  _base_own_rows >/dev/null || bad=1      # 3.2.0: each VENDORED_PACKS entry is a node pack beside the script
   return $bad
 }
 _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per line, for list-packs / gen-models / suites
@@ -23,6 +24,7 @@ _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per l
   _base_pack_rows | sed 's/^/PACKROW /' || rc=1
   _base_model_rows | sed 's/^/MODELROW /' || rc=1
   _base_later_rows | sed 's/^/MODELLATER /' || rc=1
+  _base_own_rows | sed 's/^/OWNROW /' || rc=1      # 3.2.0: dir|version|digest, the package's own packs (they ship in its zip)
   return $rc
 }
 _base_hook(){ # run a package hook if the package defines it; a failing hook fails the run (no fallbacks)
@@ -86,10 +88,12 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   if ! base_comfy_gate; then base_summary; fi
   base_consolidate || true
   base_packs git || true               # in runtime mode: located and recorded only; a pack the runtime lacks fails by name
+  _base_own_packs_save || true         # 3.2.0: the live copy of each own pack about to change, kept before any hook writes over it
   if _base_runtime_on; then
     _base_hook pkg_pre_venv
     if ! _base_runtime_venv; then base_summary; fi
     _base_hook pkg_post_venv           # SageAttention accepts only the runtime's own build (lib/40-packs.sh)
+    base_own_packs || true             # 3.2.0: the package's own packs come from its zip, never from the runtime
     _base_runtime_skip "the packs' requirements"; _base_runtime_skip "Comfy MCP"; BASE_MCP_RESULT="skipped (runtime)"
     _base_runtime_skip "the newest-everything pass"; BASE_LIFT_RESULT="runtime (not lifted)"
   else
@@ -98,6 +102,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi
   base_cuda_toolchain || true          # before the hook that builds, so a broken toolkit is named (and fixed) up front
   _base_hook pkg_post_venv
+  base_own_packs || true               # 3.2.0: mirrored before the resolve, so an own pack's requirements file is in it
   base_packs pip || true
   base_mcp || true                     # the venv and the packs exist; models do not yet, and MCP needs none
   base_venv_latest || true             # 3.0.0: everything still behind is forced to its newest; the import check judges it
@@ -106,6 +111,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
     # 2.1.0: the template image's seed build (dockerize.py): the toolchain and the packs, never a model, a server or a suite
     hdr "SEED · BASE_SEED=1: no models, no prune, no restart, no smoke, no suite — the image carries the toolchain, the volume gets the models at boot"
     base_import_check || true
+    _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true
     base_hygiene || true
     base_boot_install || true
     base_ledger_write || true
@@ -118,6 +124,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   base_sync || true
   _base_hook pkg_post_models
   base_import_check || true
+  _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true   # 3.2.0: an own pack that does not import is put back
   base_hygiene || true
   base_boot_install || true
   base_ledger_write || true
@@ -127,7 +134,7 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   _base_later_launch || true           # 3.1.0: a staged install's later files download behind the server that just started
   # the live server is only a valid oracle when it runs the code this run installed
   if [ "$BASE_RESTART_NEEDED" != "1" ] && [ -z "${BASE_SERVER:-}" ] && curl -sf --max-time 3 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then BASE_SERVER="$HOSTPORT"; fi
-  base_test "" || true
+  _base_run_suite || true             # 3.2.0: never in a dry run (lib/92-onepass.sh)
   _base_hook pkg_post_install
   base_summary
 }
@@ -212,7 +219,7 @@ _base_pkg_command(){ # <name> [args] — a package's extra subcommand (PKG_COMMA
   done
   return 1
 }
-_base_usage(){ echo "usage: bash \"$(basename "${PKG_SCRIPT:-$0}")\" [--check | --latest | test [tier] | rescue | help$(_base_pkg_command_names)]" >&2; }
+_base_usage(){ echo "usage: bash \"$(basename "${PKG_SCRIPT:-$0}")\" [--check | preflight | --latest | test [tier] | rescue | help$(_base_pkg_command_names)]" >&2; }
 _base_pkg_command_names(){ local row; for row in ${PKG_COMMANDS[@]+"${PKG_COMMANDS[@]}"}; do printf ' | %s' "${row%%|*}"; done; }
 base_help(){
   local s; s="$(basename "${PKG_SCRIPT:-$0}")"
@@ -223,6 +230,7 @@ ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION}  ·  runs on ComfyUI Ba
   bash "$s"                ONE COMMAND: toolchain via the base, $npacks node pack(s), $nmodels model row(s), workflow paths,
                              import check, hygiene, then the exact launch line. Prompts only for tokens and deletion.
   bash "$s" --check        dry run: the same report, nothing changed
+  bash "$s" preflight      seconds, nothing changed: only what would stop the install before it changes anything
   bash "$s" --latest       the same as a plain run (3.0.0: every run takes everything to its newest)
   bash "$s" test [tier]    run the package's suite (tiers: its pytest.ini markers); auto-detects the repo testbed
   bash "$s" rescue         repair a venv that cannot boot after a pod restart (never runs the interpreter it repairs)
@@ -278,6 +286,7 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
   echo "  smoke      $BASE_SMOKE_RESULT"
   echo "  combos     $BASE_COMBO_RESULT"
   echo "  suite      $BASE_TEST_RESULT"; [ -n "${BASE_TEST_TABLE:-}" ] && echo "$BASE_TEST_TABLE" | sed 's/^/           /' || true
+  _base_timings_block; _base_timings_write      # 3.2.0: where this run spent its time (the SUMMARY header closed the last stage)
   echo "  log        ${BASE_LOG:-—}"
   [ -n "$BASE_STASH_CMD" ] && echo -e "${YEL}  stash      local ComfyUI edits were stashed — restore with: $BASE_STASH_CMD${NC}" || true
   if [ "${#BASE_WARN[@]}" -gt 0 ]; then echo -e "${YEL}  warnings   ${#BASE_WARN[@]}${NC}"; _base_list "${BASE_WARN[@]}"; fi
@@ -347,7 +356,8 @@ base_main(){ # the six forms every package shares, plus the package's own PKG_CO
   case "${1:-}" in
     "")        base_run ;;
     --check)   BASE_DRY=1; base_run ;;
-    --latest)  base_run ;;              # 3.0.0: every run takes everything to its newest; kept so older callers still work
+    preflight) base_preflight ;;        # 3.2.0: podctl's pre-pass, in seconds: only what would stop the real run first
+    --latest)  base_run ;;             # 3.0.0: every run takes everything to its newest; kept so older callers still work
     test)      shift; base_env_setup; base_discover quiet || true; _base_use_testbed; base_test "${1:-}"; exit "$BASE_TEST_RC" ;;
     rescue)    base_env_setup; _base_logging; if ! base_discover; then exit 3; fi; base_rescue; exit "${BASE_RESCUE_RC:-0}" ;;
     help|-h|--help) base_help ;;
