@@ -2,7 +2,8 @@
 """The proven runtime (3.1.0): what a buyer's machine installs instead of building.
 
 A runtime is the part of a green machine that is the same for every buyer: the ComfyUI tree (minus models, inputs,
-outputs, users and temp), the uv-managed Python, the venv inside the tree, every node pack, the base's tools venv
+outputs, users and temp), the uv-managed Python, the venv inside the tree, every node pack that is a git checkout
+(never a package's vendored packs, which come with its zip), the base's tools venv
 (JupyterLab) and its wheel cache (the SageAttention build). It is captured on a machine after a green run, as a
 gzip tar split into parts that fit a GitHub release asset, with a manifest (runtime.json) that is the ONLY place its
 versions are written: the base's lib/ and py/ carry none.
@@ -107,6 +108,11 @@ def _members(root, comfy_rel):
                 if x in EXCLUDE_NAMES:
                     continue
                 if rel == comfy_rel and d == base and x in EXCLUDE_TOP:
+                    continue
+                # 3.1.1: only a pack that is a git checkout is runtime. A package's VENDORED packs (plain folders its
+                # zip installs) are that package's own, often paid, code: they arrive with the zip on every install
+                # and never ride a runtime that may be published.
+                if rel == comfy_rel and d == base / "custom_nodes" and not (d / x).is_symlink() and not (d / x / ".git").exists():
                     continue
                 keep.append(x)
             ds[:] = keep

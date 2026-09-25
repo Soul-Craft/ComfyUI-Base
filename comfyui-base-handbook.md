@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.1.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.1.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -98,7 +98,8 @@ run once per machine as **step one**; then each workflow package is **step two**
     newest like any machine. 3.0.0 retired the frozen mode (`BASE_PINNED`) and `COMFY_TAG`: they held a machine below
     its newest, which §0.3 forbids. The base ships neither the generator nor the extension.
     **A proven runtime is not a freeze** (3.1.0): `runtime-capture` packs a green machine's code (the tree minus its
-    data, the uv Python, the venv, the packs, JupyterLab, the wheel cache) into parts under 2 GiB with `runtime.json`,
+    data, the uv Python, the venv, the git-checkout packs, JupyterLab, the wheel cache; never a package's vendored
+    packs, which its zip brings) into parts under 2 GiB with `runtime.json`,
     the only place its versions are written; `runtime-apply <manifest>` unpacks it on a buyer's machine, and
     `BASE_RUNTIME=<state/runtime.json>` installs from it with no OS, git, pip or uv step, each skip noted, the driver
     gate held at the manifest's floor. A package that needs a pack the runtime lacks fails by name ("needs a newer
@@ -530,6 +531,12 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.1.1: a runtime never carries a package's vendored packs. `runtime-capture` archived everything under
+  `custom_nodes/`, which on a machine holds each package's own plain-folder packs beside the git checkouts; a runtime
+  meant for publishing would have carried that code. Only a git checkout is runtime now (the manifest's `packs` were
+  already exactly those); a vendored pack arrives with its package's zip on every install, which is also why an
+  Update (a newer `runtime-apply`) is followed by the packages' installs.
 
 - 3.1.0: a buyer's machine, opt-in end to end, with every plain run unchanged. A proven runtime: `runtime-capture` on
   a green machine (parts under GitHub's 2 GiB and `runtime.json`, `py/runtime.py`), `runtime-apply` on a buyer's, and

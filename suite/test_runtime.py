@@ -42,6 +42,8 @@ def _green_tree(root):
     for d in ("models/loras", "output", "input", "user", "temp"):
         (c / d).mkdir(parents=True, exist_ok=True)
     (c / "models" / "loras" / "big.safetensors").write_bytes(b"\0" * 64)
+    vend = c / "custom_nodes" / "ComfyUI-Paid-Vendored"; vend.mkdir(parents=True)          # a package's own pack: no .git
+    (vend / "__init__.py").write_text("# paid code\n")
     (c / "output" / "mine.png").write_bytes(b"png")
     v = c / ".venv-cu130" / "bin"; v.mkdir(parents=True)
     (v / "python").write_text(FAKE_PY); (v / "python").chmod(0o755)
@@ -89,6 +91,7 @@ def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     for never in ("ComfyUI/models", "ComfyUI/output", "ComfyUI/input", "ComfyUI/user", "ComfyUI/temp", "comfy-base/state/tokens.env"):
         assert not any(n == never or n.startswith(never + "/") for n in names), never
     assert not any("__pycache__" in n for n in names)
+    assert not any("ComfyUI-Paid-Vendored" in n for n in names)             # 3.1.1: vendored packs come with their zip, never a runtime
     assert man["comfyui"]["version"] == "0.99.0" and man["driver_min"] == "580" and man["sageattention"]["key"].endswith("sm_120")
     packa = [p for p in man["packs"] if p["dir"] == "PackA"]
     assert len(packa) == 1 and packa[0]["url"] == "https://github.com/o/PackA.git" and len(man["packs"]) == 1 + len(__import__("basetest").base_packs())
