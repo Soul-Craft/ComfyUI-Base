@@ -3,31 +3,6 @@
 # By default nothing here stops a server: on a shared pod that process may be mid-render, so restarting is the
 # user's call. BASE_RESTART=1 opts in.
 
-_base_pids_from_table(){ # stdin: pid|ppid|cwd|argv → the pids of ComfyUI servers. A python running main.py from $COMFY
-  # (by cwd), or one naming a …/ComfyUI/main.py path (an image's own launch, whatever its cwd). PID 1 is reported, never printed.
-  local pid ppid cwd argv script dir
-  while IFS='|' read -r pid ppid cwd argv; do
-    [ -n "$pid" ] || continue
-    set -- $argv; [ $# -ge 2 ] || continue
-    case "$1" in *python*) ;; *) continue;; esac
-    script="$2"; dir=""
-    case "$script" in main.py) ;; */main.py) dir="${script%/main.py}";; *) continue;; esac
-    if [ "$cwd" = "$COMFY" ] || { [ -n "$dir" ] && { [ "$dir" = "$COMFY" ] || [ "$(basename "$dir")" = "ComfyUI" ]; }; }; then
-      if [ "$pid" = "1" ]; then echo "  ! PID 1 is ComfyUI itself ($argv) — never killed: stopping it would stop the pod" >&2; continue; fi
-      echo "$pid"
-    fi
-  done
-  return 0
-}
-_base_comfy_pids(){ # pids of ComfyUI servers on this pod: /proc → the one matcher above
-  local pid
-  [ -d /proc ] || return 0
-  for pid in $(pgrep -f 'main\.py' 2>/dev/null || true); do
-    [ -r "/proc/$pid/cmdline" ] || continue
-    printf '%s|%s|%s|%s\n' "$pid" "$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 0)" "$(readlink "/proc/$pid/cwd" 2>/dev/null || true)" "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
-  done | _base_pids_from_table
-  return 0
-}
 _base_preview_effective(){ # what preview method is ACTUALLY in effect: the UI setting overrides the CLI flag per queue
   local flag="" setting="" cfg="$(_base_user_dir)/default/comfy.settings.json"
   if [ -n "$RUN_PID" ] && [ -r "/proc/$RUN_PID/cmdline" ]; then tr '\0' '\n' < "/proc/$RUN_PID/cmdline" 2>/dev/null | grep -qx -- '--preview-method' && flag=1 || true
@@ -106,6 +81,37 @@ base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.
   fi
 }
 
+_base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactly ONE up, wait for it; 0 when it answers
+  # MEASURED on a Verda machine: the install's restart started ComfyUI as a detached process (ppid 1) outside the boot
+  # unit's cgroup, so a later `systemctl restart comfy-base-boot` started a SECOND one beside it: two main.py, the old
+  # one holding :8188 and 34 GB of VRAM. Where the unit owns ComfyUI the restart goes through the unit, so the server
+  # is always the unit's and a unit restart replaces it. BASE_RESTART_VIA says which way it went (unit | direct).
+  BASE_RESTART_VIA=direct
+  if _base_boot_unit_owns; then
+    echo "  through the boot unit: systemctl stop, then start, comfy-base-boot (JupyterLab restarts with it)"
+    if _base_root systemctl stop comfy-base-boot.service; then
+      BASE_RESTART_VIA=unit
+      _base_stop_comfy || return 1                 # one the unit never owned: an earlier install's detached start
+      if ! _base_root systemctl start comfy-base-boot.service; then echo "  systemctl start comfy-base-boot failed"; return 1; fi
+      _base_wait_comfy 180                         # the boot starts sshd, JupyterLab and its extensions before ComfyUI
+      return
+    fi
+    echo "  could not stop comfy-base-boot: starting ComfyUI directly (the unit's next start replaces it)"
+  fi
+  _base_stop_comfy || return 1
+  _base_start_comfy
+}
+_base_restart_hint(){ # the exact commands that restart ComfyUI by hand, for the hand-off
+  local pids
+  if _base_boot_unit_enabled; then
+    echo "        $([ "$(id -u 2>/dev/null)" = 0 ] || echo 'sudo ')systemctl restart comfy-base-boot"
+    return 0
+  fi
+  pids="$(_base_comfy_pids 2>/dev/null | tr '\n' ' ' || true)"
+  if [ -n "${pids// /}" ]; then echo "        kill ${pids% }"; fi
+  echo "        cd $COMFY && nohup $(_base_start_cmd) >> $COMFY_LOG 2>&1 &"
+}
+
 base_restart(){ # reports what needs a restart and prints the exact launch line; BASE_RESTART=1 actually does it
   hdr "COMFYUI RESTART"
   if [ "$BASE_DRY" = "1" ] || [ "$BASE_NO_NET" = "1" ]; then note "skipped"; BASE_RESTART_RESULT="skipped"; return 0; fi
@@ -126,26 +132,20 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   if [ "$live" = 0 ]; then
     if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "do NOT start ComfyUI — the import check failed; fix that first"; BASE_RESTART_RESULT="do not start (import check failed)"; BASE_RESTART_NEEDED=1; return 0; fi
     if [ "$BASE_RESTART" = "1" ]; then       # opting in means a running server at the end, whether or not one was running before (2.0.11)
-      if _base_start_comfy; then ok "ComfyUI started (BASE_RESTART=1)"; BASE_RESTART_RESULT="started"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
+      if _base_restart_comfy; then ok "ComfyUI started (BASE_RESTART=1, $BASE_RESTART_VIA)"; BASE_RESTART_RESULT="started"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
       else err "ComfyUI did not answer within ${BASE_START_WAIT:-600} s — last 40 lines of $COMFY_LOG:"; tail -40 "$COMFY_LOG" 2>/dev/null | sed 's/^/     /'; BASE_RESTART_RESULT="FAILED"; BASE_FAILED+=("ComfyUI did not come up"); fi
       return 0
     fi
     BASE_RESTART_NEEDED=1; BASE_RESTART_RESULT="ComfyUI is not running"
     todo "ComfyUI is not running on $HOSTPORT — start it:"
-    echo ""; echo "        cd $COMFY && nohup $(_base_start_cmd) >> $COMFY_LOG 2>&1 &"; echo ""
+    echo ""; _base_restart_hint; echo ""
     echo "      Then verify:  bash \"$(basename "${PKG_SCRIPT:-$0}")\" test"
     return 0
   fi
   if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "do NOT restart — the import check failed; the running server is still healthy"; BASE_RESTART_RESULT="do not restart (import check failed)"; return 0; fi
   if [ "${#BASE_RESTART_WHY[@]}" -eq 0 ]; then ok "nothing changed that needs a restart"; BASE_RESTART_RESULT="not needed"; _base_preview_effective; return 0; fi
   if [ "$BASE_RESTART" = "1" ]; then
-    local pids; pids="$(_base_comfy_pids || true)"
-    if [ -n "$pids" ]; then
-      echo "  stopping $pids"; kill $pids 2>/dev/null || true
-      local i; for i in $(seq 1 20); do sleep 1; if [ -z "$(_base_comfy_pids || true)" ]; then break; fi; done
-      if [ -n "$(_base_comfy_pids || true)" ]; then kill -9 $(_base_comfy_pids) 2>/dev/null || true; sleep 2; fi
-    fi
-    if _base_start_comfy; then ok "ComfyUI restarted (BASE_RESTART=1)"; BASE_RESTART_RESULT="restarted"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
+    if _base_restart_comfy; then ok "ComfyUI restarted (BASE_RESTART=1, $BASE_RESTART_VIA)"; BASE_RESTART_RESULT="restarted"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
     else err "ComfyUI did not answer within ${BASE_START_WAIT:-600} s — last 40 lines of $COMFY_LOG:"; tail -40 "$COMFY_LOG" 2>/dev/null | sed 's/^/     /'; BASE_RESTART_RESULT="FAILED"; BASE_FAILED+=("ComfyUI did not come back up"); fi
     return 0
   fi
@@ -153,10 +153,8 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   todo "ComfyUI needs a restart before it can see this:"
   local r; for r in "${BASE_RESTART_WHY[@]}"; do echo "        - $r"; done
   echo "      Nothing has been stopped — the server you had running is untouched."
-  local pids; pids="$(_base_comfy_pids 2>/dev/null | tr '\n' ' ' || true)"
   echo "      From this shell that would be:"; echo ""
-  if [ -n "${pids// /}" ]; then echo "        kill ${pids% }"; fi
-  echo "        cd $COMFY && nohup $(_base_start_cmd) >> $COMFY_LOG 2>&1 &"; echo ""
+  _base_restart_hint; echo ""
   echo "      Then verify:  bash \"$(basename "${PKG_SCRIPT:-$0}")\" test"
 }
 

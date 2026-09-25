@@ -1721,10 +1721,14 @@ def test_unit_restart_uses_the_same_launch_function_as_boot():
     defs = {p.name: code_only(p.read_text()) for p in lib.glob("*.sh")}
     assert sum("_base_start_cmd()" in t for t in defs.values()) == 1 and "_base_start_cmd()" in defs["85-launch.sh"]
     assert sum("_base_start_comfy()" in t for t in defs.values()) == 1 and "_base_start_comfy()" in defs["85-launch.sh"]
-    assert "_base_start_comfy" in defs["80-server.sh"][defs["80-server.sh"].index("base_restart()"):]
+    # 3.0.3: base_restart goes through _base_restart_comfy, which starts with the same _base_start_comfy when no unit owns ComfyUI
+    restart = defs["80-server.sh"][defs["80-server.sh"].index("_base_restart_comfy()"):defs["80-server.sh"].index("base_smoke()")]
+    assert "_base_start_comfy" in restart and "_base_restart_comfy" in restart[restart.index("base_restart()"):]
     assert "85-launch.sh" in defs["boot.sh"] and "_base_start_comfy" in defs["boot.sh"][defs["boot.sh"].index("boot_comfy()"):]
-    # the real /proc walk feeds the same matcher (no second opinion on what a ComfyUI process is)
-    body = defs["80-server.sh"][defs["80-server.sh"].index("_base_comfy_pids()"):defs["80-server.sh"].index("base_import_check()")]
+    # the real /proc walk feeds the same matcher (no second opinion on what a ComfyUI process is), and since 3.0.3 it lives
+    # in 85-launch.sh so the boot has it too
+    assert sum("_base_comfy_pids()" in t for t in defs.values()) == 1 and "_base_comfy_pids()" in defs["85-launch.sh"]
+    body = defs["85-launch.sh"][defs["85-launch.sh"].index("_base_comfy_pids()"):defs["85-launch.sh"].index("_base_stop_comfy()")]
     assert "_base_pids_from_table" in body
 
 
@@ -2698,3 +2702,135 @@ def test_unit_the_testbed_finds_a_consumer_repositorys_packages(tmp_path):
     r2 = subprocess.run(["bash", str(solo / "testbed.sh"), "--status"], capture_output=True, text=True)
     assert r2.returncode == 0, r2.stdout + r2.stderr
     assert "packages under" not in r2.stdout, r2.stdout
+
+
+# ---------------------------------------------------------------- 3.0.3: renders on the store, one ComfyUI per machine
+
+def test_unit_hygiene_removes_output_and_input_dirs_that_are_not_on_the_store(tmp_path):
+    """3.0.3, MEASURED on a Verda machine on a shared store: comfyui_args.txt still carried --output-directory and
+    --input-directory from when the library was a second mount. 2.5.2 dropped that library under a shared root but the
+    hygiene only ever ENSURED the flags, so ComfyUI made the old mount point on the OS disk and wrote every render and
+    upload there. Without a library, a value off the store is removed (ComfyUI then writes inside its tree, on the
+    store); a value on the store stays; a package that names the flag in HYGIENE_ARGS keeps its own choice."""
+    _pod(tmp_path)
+    b = _base_args(tmp_path); b.parent.mkdir(parents=True)
+    b.write_text("# comfy-base launch args\n--preview-method auto\n"
+                 "--output-directory /mnt/comfy-library/output\n--input-directory /mnt/comfy-library/input\n--fast\n")
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_VOLUME_SHARED": "1", "BASE_LOCAL_STATE": str(tmp_path / "machine")}
+    run = 'base_env_setup 2>/dev/null; base_discover quiet; base_hygiene; echo CHANGED=${#BASE_CHANGED[@]}'
+    r = _bash(run, env=env)
+    txt = b.read_text()
+    assert "/mnt/comfy-library" not in txt, txt + r.stdout + r.stderr
+    assert "--output-directory" not in txt and "--input-directory" not in txt and "--fast" in txt, txt
+    assert "--user-directory %s/user" % (tmp_path / "machine") in txt, txt      # the shared-root flags are untouched
+    assert "not on the store" in r.stdout, r.stdout
+    r2 = _bash(run, env=env)
+    assert "CHANGED=0" in r2.stdout and b.read_text() == txt, r2.stdout            # idempotent
+
+    # a value ON the store is the store's, and stays
+    on = tmp_path / "renders"
+    b.write_text(txt + "--output-directory %s\n" % on)
+    r = _bash(run, env=env)
+    assert "--output-directory %s" % on in b.read_text() and "is on the store" in r.stdout, r.stdout
+
+    # a package's own HYGIENE_ARGS choice is not undone and redone on every run
+    b.write_text(txt)
+    pkg = 'HYGIENE_ARGS=("--input-directory /data/inbox"); ' + run
+    _bash(pkg, env=env)
+    r = _bash(pkg, env=env)
+    assert "--input-directory /data/inbox" in b.read_text() and "CHANGED=0" in r.stdout, b.read_text() + r.stdout
+
+
+def test_unit_launch_line_leaves_off_a_directory_on_the_os_disk_and_never_makes_it(tmp_path):
+    """3.0.3: the boot runs no hygiene, so the launch line is the last guard. With the store a mount of its own, an
+    --output-directory or --input-directory on the OS disk (a library that is not mounted, a stale args file) is left
+    off the launch line and never created; ComfyUI then writes inside its tree, on the store. `_base_mount_of` is
+    stubbed: which mount holds a path is the machine's fact, and the suite has one disk."""
+    store = tmp_path / "store"; home = store / "comfy-base"; (home / "state").mkdir(parents=True)
+    off = tmp_path / "osdisk" / "comfy-library"
+    args = home / "state" / "comfyui_args.txt"
+    args.write_text("# args\n--output-directory %s/output --input-directory %s/input\n--user-directory %s/u\n--fast\n" % (off, store, store))
+    base = 'BASE_HOME="%s"; ARGS_FILE="%s"; COMFY="%s/ComfyUI"; PY=python; PORT=8188; ' % (home, args, store)
+    stub = '_base_mount_of(){ case "$1" in /|"%s"*) echo /;; *) echo /store;; esac; }; ' % (tmp_path / "osdisk")
+    r = _bash(base + stub + '_base_launch_args; _base_local_dirs; echo "CMD $(_base_start_cmd)"')
+    words = r.stdout.splitlines()
+    assert "%s/output" % off not in r.stdout and "left off the launch line" in r.stderr, r.stdout + r.stderr
+    assert words[:6] == ["--input-directory", "%s/input" % store, "--user-directory", "%s/u" % store, "--fast", words[5]], words
+    assert not (off / "output").exists() and not off.exists()                      # never made on the OS disk
+    assert (store / "u").is_dir()                                                  # the per-machine one still is
+    cmd = [l for l in words if l.startswith("CMD ")][0]
+    assert str(off) not in cmd and "--input-directory %s/input" % store in cmd, cmd
+    # an owned box whose store IS the OS disk has no second disk to land on by mistake: nothing is left off
+    r = _bash(base + '_base_mount_of(){ echo /; }; _base_launch_args')
+    assert "%s/output" % off in r.stdout and "left off" not in r.stderr, r.stdout + r.stderr
+
+
+def test_unit_restart_goes_through_the_boot_unit_when_the_unit_owns_comfyui(tmp_path):
+    """3.0.3, MEASURED on a Verda machine: the install's BASE_RESTART=1 started ComfyUI detached (ppid 1), outside
+    comfy-base-boot.service's cgroup, so a later `systemctl restart comfy-base-boot` started a SECOND ComfyUI beside it
+    (two main.py; the old one held :8188 and 34 GB of VRAM). Where the unit owns ComfyUI, the restart is the unit's:
+    stop the unit, stop any ComfyUI it never owned, start the unit, wait with a grace for the boot's own stages."""
+    stubs = ('_base_root(){ echo "ROOT $*"; }; _base_stop_comfy(){ echo STOP_ALL; }; '
+             '_base_wait_comfy(){ echo "WAIT ${1:-0}"; }; _base_start_comfy(){ echo DIRECT_START; }; ')
+    r = _bash(stubs + '_base_boot_unit_owns(){ return 0; }; _base_restart_comfy; echo "RC=$? VIA=$BASE_RESTART_VIA"')
+    lines = [l for l in r.stdout.splitlines() if l.split(" ")[0] in ("ROOT", "STOP_ALL", "WAIT", "DIRECT_START", "RC=0")]
+    assert lines == ["ROOT systemctl stop comfy-base-boot.service", "STOP_ALL", "ROOT systemctl start comfy-base-boot.service",
+                     "WAIT 180", "RC=0 VIA=unit"], r.stdout + r.stderr
+    # no unit (RunPod, an owned box without systemd): every ComfyUI stops, then one starts directly
+    r = _bash(stubs + '_base_boot_unit_owns(){ return 1; }; _base_restart_comfy; echo "RC=$? VIA=$BASE_RESTART_VIA"')
+    assert "STOP_ALL\nDIRECT_START\nRC=0 VIA=direct" in r.stdout and "ROOT" not in r.stdout, r.stdout
+    # the unit cannot be stopped (no root, no sudo): said, then the direct start, which the unit's next start replaces
+    r = _bash(stubs.replace('_base_root(){ echo "ROOT $*"; }', '_base_root(){ return 1; }')
+              + '_base_boot_unit_owns(){ return 0; }; _base_restart_comfy; echo "RC=$? VIA=$BASE_RESTART_VIA"')
+    assert "could not stop comfy-base-boot" in r.stdout and "DIRECT_START" in r.stdout and "VIA=direct" in r.stdout, r.stdout
+    # a ComfyUI that survives TERM and KILL: nothing is started beside it
+    r = _bash(stubs.replace("_base_stop_comfy(){ echo STOP_ALL; }", "_base_stop_comfy(){ return 1; }")
+              + '_base_boot_unit_owns(){ return 1; }; _base_restart_comfy; echo "RC=$?"')
+    assert "RC=1" in r.stdout and "DIRECT_START" not in r.stdout, r.stdout
+    # base_restart itself never kills or starts on its own any more: one way in, _base_restart_comfy
+    src = code_only((BASE / "lib" / "80-server.sh").read_text())
+    body = src[src.index("base_restart()"):src.index("base_smoke()")]
+    assert "kill " not in body.replace("echo \"        kill", "") and "_base_start_comfy" not in body, body
+
+
+def test_unit_the_unit_owns_comfyui_only_on_a_systemd_host_with_it_enabled_and_from_outside_it(tmp_path):
+    """The predicate behind the restart: never RunPod (a container) nor a fake root; the unit enabled; and the caller NOT
+    inside the unit's own cgroup (a JupyterLab terminal, a boot extension), whose `systemctl stop` would stop the caller."""
+    bin_ = tmp_path / "bin"; bin_.mkdir()
+    sc = bin_ / "systemctl"; sc.write_text('#!/bin/bash\n[ "$1" = is-enabled ] && exit "${UNIT_ENABLED_RC:-0}"; exit 0\n'); sc.chmod(0o755)
+    env = {"PATH": "%s:%s" % (bin_, os.environ["PATH"])}
+    q = '_base_boot_unit_owns && echo OWNS || echo NO'
+    assert "NO" in _bash('BASE_HOST=runpod; ' + q, env=env).stdout
+    assert "NO" in _bash('BASE_HOST=verda; BASE_FAKE_ROOT=/x; ' + q, env=env).stdout
+    live = 'BASE_HOST=verda; _base_systemd_live(){ return 0; }; '
+    assert "OWNS" in _bash(live + '_base_in_boot_unit(){ return 1; }; ' + q, env=env).stdout
+    assert "NO" in _bash(live + '_base_in_boot_unit(){ return 0; }; ' + q, env=env).stdout
+    assert "NO" in _bash(live + '_base_in_boot_unit(){ return 1; }; ' + q, env={**env, "UNIT_ENABLED_RC": "1"}).stdout
+    # the hand-off names the unit, never a nohup line that would start the detached second ComfyUI
+    r = _bash(live + 'COMFY=/c; _base_restart_hint', env=env)
+    assert "systemctl restart comfy-base-boot" in r.stdout and "nohup" not in r.stdout, r.stdout
+
+
+def test_unit_stop_comfy_stops_every_server_and_waits_for_it(tmp_path):
+    """_base_stop_comfy is TERM, a wait, then KILL, and says which pids it stopped. The process here is a real one,
+    orphaned so init reaps it (a zombie child would still answer kill -0), and the matcher is stubbed to name it."""
+    r = _bash('P=$( (sleep 120 >/dev/null 2>&1 & echo $!) ); _base_comfy_pids(){ kill -0 "$P" 2>/dev/null && echo "$P"; return 0; }; '
+              '_base_stop_comfy; echo "RC=$?"; kill -0 "$P" 2>/dev/null && { echo ALIVE; kill -9 "$P"; } || echo GONE')
+    assert "stopping ComfyUI:" in r.stdout and "RC=0" in r.stdout and "GONE" in r.stdout, r.stdout + r.stderr
+    # nothing running: nothing said, success
+    r = _bash('_base_comfy_pids(){ return 0; }; _base_stop_comfy; echo "RC=$?"')
+    assert r.stdout.strip() == "RC=0", r.stdout
+
+
+def test_unit_the_boot_stops_a_comfyui_it_does_not_own_before_starting_its_own():
+    """3.0.3: at boot_comfy this boot has started nothing, so a ComfyUI already running is one it does not own (an earlier
+    install's detached start). It is stopped before the boot's own starts, so `systemctl restart comfy-base-boot` replaces
+    the server instead of adding a second. The boot now has the matcher, which 85-launch.sh carries since 3.0.3."""
+    src = code_only((BASE / "lib" / "boot.sh").read_text())
+    body = src[src.index("boot_comfy()"):src.index("boot_main()")]
+    assert "_base_stop_comfy" in body and body.index("_base_stop_comfy") < body.index("if _base_start_comfy"), body
+    r = subprocess.run(["bash", "-c", 'BOOT_HOME=/nonexistent; source "%s/lib/boot.sh"; boot_launch_lib; '
+                        'declare -F _base_comfy_pids _base_pids_from_table _base_stop_comfy _base_wait_comfy' % BASE],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and len(r.stdout.split()) == 4, r.stdout + r.stderr
+

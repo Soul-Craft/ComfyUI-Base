@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.0.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.0.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -55,7 +55,9 @@ run once per machine as **step one**; then each workflow package is **step two**
    RunPod pod's start command at it; the process `comfy-base-boot.service` runs on a VM host) runs sshd → JupyterLab →
    ComfyUI from the base's venv with the base's launch line, then sleeps forever. An install prints the exact launch
    line; `BASE_RESTART=1` stops the running server (found by what it runs, never PID 1) and starts that line, the same
-   function boot.sh uses (`lib/85-launch.sh`).
+   function boot.sh uses (`lib/85-launch.sh`). One ComfyUI per machine: where `comfy-base-boot.service` is enabled the
+   restart is the unit's (`systemctl stop`, then `start`), so the server is always the unit's, and the boot stops any
+   ComfyUI it did not start before starting its own (3.0.3).
 8. **One deletion prompt, default No.** Duplicates, superseded files (only inside the package's own family
    folders) and partials, never a file another installed package claims (the ledger). `BASE_YES=1` approves.
 9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, pypi.org, pypi.nvidia.com,
@@ -496,6 +498,20 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.0.3: renders stay on the store, and a machine runs one ComfyUI. Both measured on a Verda machine on a shared store
+  (`BASE_VOLUME_SHARED=1`). First, `comfyui_args.txt` still named `--output-directory` and `--input-directory` on the
+  old library mount: 2.5.2 stopped using a library under a shared root, but the hygiene only ever ensured those flags
+  and never took them back, so ComfyUI made the old mount point on the OS disk and wrote every render and upload there.
+  Without a library the hygiene now removes a value that is not on the store (a package's own `HYGIENE_ARGS` choice
+  stands), and the launch line, which the boot also uses, leaves off one that sits on the OS disk while the store is a
+  mount of its own, and never creates it. Second, `BASE_RESTART=1` started ComfyUI detached (ppid 1), outside
+  `comfy-base-boot.service`'s cgroup, so a later `systemctl restart comfy-base-boot` started a second one beside it (the
+  old one kept :8188 and 34 GB of VRAM). `_base_restart_comfy` is now the one way to restart: through the unit where it
+  is enabled and the caller is not inside it, directly elsewhere; and `boot_comfy` stops any ComfyUI it did not start
+  before starting its own. The process matcher moved to `lib/85-launch.sh`, which gives the boot's wait the liveness
+  check it lacked (before, it declared a healthy start dead after 2 s). Exercised by the suite only (macOS and Python
+  3.14); not yet on a live machine.
 
 - 3.0.2: every `HTTPError` the host providers and `py/smoke.py` read is closed. 3.0.0's test runner takes the newest
   Python uv has instead of 3.12, and on Python 3.14 an HTTPError that is read but never closed is a `ResourceWarning`

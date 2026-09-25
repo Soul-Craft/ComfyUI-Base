@@ -57,6 +57,18 @@ base_boot_tools(){ # JupyterLab in the base's tools venv, on the newest Python, 
   ls -dt "$BASE_HOME"/tools.[0-9]* "$BASE_HOME"/tools.pre-* 2>/dev/null | sed -n '3,$p' | while IFS= read -r old; do rm -rf "$old"; done
   return 0
 }
+_base_systemd_live(){ # systemd is this machine's init and the base may drive it: never RunPod (a container) nor a fake root
+  [ "$BASE_HOST" != runpod ] && [ -z "$BASE_FAKE_ROOT" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+_base_boot_unit_enabled(){ # 3.0.3: comfy-base-boot is installed and enabled here, so the unit is what owns ComfyUI
+  _base_systemd_live && systemctl is-enabled --quiet comfy-base-boot.service 2>/dev/null
+}
+_base_in_boot_unit(){ # 3.0.3: this shell runs INSIDE the unit (a JupyterLab terminal, a boot extension), so stopping the unit stops it
+  grep -q 'comfy-base-boot\.service' "/proc/$$/cgroup" 2>/dev/null
+}
+_base_boot_unit_owns(){ # 3.0.3: a restart must go through the unit: it owns ComfyUI here and stopping it does not stop this run
+  _base_boot_unit_enabled && ! _base_in_boot_unit
+}
 _base_boot_unit_text(){ # the systemd unit that runs the base's boot at every boot of a VM host (Verda, Crusoe, an owned box)
   local mounts=""
   [ "${BASE_VOLUME_KIND:-mount}" = mount ] && mounts="RequiresMountsFor=$BASE_VOLUME"$'\n'
@@ -84,7 +96,7 @@ base_boot_unit(){ # 2.2.0: the unit's text always lands beside boot.sh (what a p
   text="$(_base_boot_unit_text)"
   if [ "$BASE_DRY" = "1" ]; then would "write $unit (BASE_HOST=$BASE_HOST)"; return 0; fi
   if ! { [ -f "$unit" ] && [ "$(cat "$unit")" = "$text" ]; }; then printf '%s\n' "$text" > "$unit"; changed=1; fi
-  if [ "$BASE_HOST" = runpod ] || [ -n "$BASE_FAKE_ROOT" ] || ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+  if ! _base_systemd_live; then
     [ "$changed" = 1 ] && ok "boot unit written: $unit (installed by the host's startup script or by hand)" || ok "boot unit current: $unit"
     return 0
   fi

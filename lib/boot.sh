@@ -155,6 +155,13 @@ boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only w
   if command -v nvidia-smi >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && [ -f "$BOOT_HOME/py/gpu_facts.py" ]; then
     echo "boot: gpu $(python3 "$BOOT_HOME/py/gpu_facts.py" 2>/dev/null || echo 'unreadable')"     # NOT-OURS here = memory held outside this container: stop/start or redeploy (2.0.26)
   fi
+  # 3.0.3: this boot has started nothing yet, so any ComfyUI running now is one it does not own: an earlier install's
+  # detached start, outside the unit. Left running, it keeps the port and its VRAM and this boot's server is the second
+  # GPU process beside it (MEASURED on a Verda machine: two main.py after `systemctl restart comfy-base-boot`).
+  if [ -n "$(_base_comfy_pids 2>/dev/null || true)" ]; then
+    echo "boot: a ComfyUI this boot did not start is running: stopping it first (one GPU process per machine)"
+    if ! _base_stop_comfy; then echo "boot: it would not stop, so no second ComfyUI is started beside it"; return 0; fi
+  fi
   echo "boot: starting ComfyUI: $(_base_start_cmd)"
   if _base_start_comfy; then echo "boot: ComfyUI answers on $HOSTPORT"; else echo "boot: ComfyUI did not answer within the wait — see $COMFY_LOG"; fi
   return 0

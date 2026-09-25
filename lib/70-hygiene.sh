@@ -48,6 +48,31 @@ _base_args_remove(){ # <--flag> [why]
   sed -E "s/(^|[[:space:]])${name}([[:space:]]|$)/\1\2/g" "$ARGS_FILE" | awk 'NF || /^#/' | _base_replace_file "$ARGS_FILE"
   BASE_CHANGED+=("comfyui_args.txt: removed $name"); ok "args: removed $name${why:+ ($why)}"
 }
+_base_args_value(){ # <--flag> → the value the args file gives it, or nothing
+  [ -f "$ARGS_FILE" ] || return 0
+  sed -nE "s#(^|.*[[:space:]])${1}[[:space:]]+([^[:space:]]+).*#\\2#p" "$ARGS_FILE" | head -1
+}
+_base_args_remove_valued(){ # <--flag> [why]: the flag AND its value (a bare _base_args_remove would leave the value as a stray word)
+  local name="$1" why="${2:-}" cur
+  cur="$(_base_args_value "$name")"; [ -n "$cur" ] || return 0
+  if [ "$BASE_DRY" = "1" ]; then would "remove $name $cur from comfyui_args.txt${why:+ ($why)}"; return 0; fi
+  sed -E "s#(^|[[:space:]])${name}[[:space:]]+[^[:space:]]+#\\1#g" "$ARGS_FILE" | awk 'NF || /^#/' | _base_replace_file "$ARGS_FILE"
+  BASE_CHANGED+=("comfyui_args.txt: removed $name $cur"); ok "args: removed $name $cur${why:+ ($why)}"
+}
+_base_args_store_dirs(){ # 3.0.3: with no shared library, output/ and input/ are ComfyUI's own, inside the tree, on the store
+  # MEASURED on a Verda machine on a shared store: the args file kept --output-directory and --input-directory from the
+  # days its library was a second mount. 2.5.2 stopped using that library under a shared root but only ever ENSURED the
+  # flags and never took them back, so ComfyUI made the old mount point on the OS disk and wrote every render and upload
+  # there, off the store. A value off the store is removed; a package that wants one elsewhere says so in HYGIENE_ARGS,
+  # which is applied after this.
+  local store="${BASE_FAKE_ROOT:-$BASE_VOLUME}" name cur row
+  for name in --output-directory --input-directory; do
+    for row in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do [ "${row%% *}" = "$name" ] && continue 2; done   # the package's own choice
+    cur="$(_base_args_value "$name")"; [ -n "$cur" ] || continue
+    case "${cur%/}" in "$store"|"$store"/*) ok "args: $name $cur is on the store" ;;
+      *) _base_args_remove_valued "$name" "not on the store $store: ComfyUI writes inside its tree instead" ;; esac
+  done
+}
 _base_manager_security(){ # security_level = normal; network_mode and everything else untouched
   local ini="" c
   for c in "$(_base_user_dir)/default/ComfyUI-Manager/config.ini" "$COMFY/user/default/ComfyUI-Manager/config.ini" "$CN/ComfyUI-Manager/config.ini"; do if [ -f "$c" ]; then ini="$c"; break; fi; done
@@ -186,6 +211,8 @@ base_hygiene(){
     _base_args_ensure --output-directory "$BASE_LIBRARY/output"
     _base_args_ensure --input-directory "$BASE_LIBRARY/input"
     if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LIBRARY/output" "$BASE_LIBRARY/input" 2>/dev/null || true; fi
+  else
+    _base_args_store_dirs
   fi
   # 2.5.0: with a SHARED workspace, ComfyUI's user/ and temp/ must NOT be shared. user/ holds the saved workflows
   # the App view opens and the frontend's settings, which are per machine and per package; temp/ is scratch two
