@@ -242,6 +242,9 @@ base_packs(){ # base_packs git | pip
     elif _base_pip install -q --upgrade --upgrade-strategy only-if-needed -c "$CONSTRAINTS" --extra-index-url https://pypi.nvidia.com "${extras[@]}" 2>&1 | tail -2; then ok "PIP_EXTRA: ${extras[*]}"
     else miss "PIP_EXTRA install failed: ${extras[*]}"; BASE_FAILED+=("pip: PIP_EXTRA failed (${extras[*]})"); fi
   fi
+  # 2.12.3: one file at a time, `--upgrade` takes whatever a file names to its newest even past a cap another installed
+  # package declares (huggingface-hub 2.0.0 under transformers' <2.0); re-resolve the conflicts together, at their newest
+  _base_venv_reconcile
   # A pack with no requirements file is only fine if what it imports is already in the venv. Writing one
   # into the checkout is not the fix (it dirties the tree and the pack is never updated again).
   _base_pack_imports_report ${probe[@]+"${probe[@]}"}

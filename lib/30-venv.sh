@@ -194,6 +194,34 @@ _base_venv_pytest(){ # pytest into OUR venv, proven by import — so base_test's
   ok "pytest $v in the venv — the suite runs inside it"
   return 0
 }
+_base_venv_reconcile_names(){ # stdin: `pip check` output -> the distribution names on both sides of every conflict, one per line
+  # pip's two shapes: "A 1.0 has requirement B<2,>=1, but you have B 2.0." and "A 1.0 requires B, which is not installed."
+  # a pair per line, split by tr: "\n" in a sed replacement is a newline in GNU sed and a literal n in BSD sed (the Mac)
+  sed -n -e 's/^\([A-Za-z0-9._-]*\) [^ ]* has requirement \([A-Za-z0-9._-]*\).*/\1 \2/p' \
+         -e 's/^\([A-Za-z0-9._-]*\) [^ ]* requires \([A-Za-z0-9._-]*\), which is not installed.*/\1 \2/p' | tr ' ' '\n' | sort -u
+}
+_base_venv_reconcile(){ # every run, after the pip half: the venv's requirements must agree with each other, at their newest
+  # 2.12.3, measured on a Verda machine: a REUSED venv held transformers 5.17.0 (the newest release, which requires
+  # huggingface-hub<2.0) and the per-pack loop took huggingface-hub to 2.0.0, because `pip install --upgrade -r` always takes a
+  # requirement the file NAMES (several packs name a bare huggingface_hub) to its newest, and pip does not resolve against
+  # what is installed outside the request; it only warns. main.py then died in transformers' import-time version check.
+  # The answer is not a pin: re-resolve both sides of each conflict in ONE call, so the resolver sees them together and
+  # lands on the newest set that agrees (that night: transformers 5.17.0 with huggingface-hub 1.33.0). A conflict pip
+  # cannot resolve is reported and left to the import check, which stays the gate; this step never fails a run by itself.
+  local out names
+  if [ "$BASE_DRY" = "1" ]; then would "pip check the venv and re-resolve any conflicting requirements together"; return 0; fi
+  out="$(_base_pip check 2>&1)" && { ok "pip check: every requirement in the venv agrees"; return 0; }
+  names="$(printf '%s\n' "$out" | _base_venv_reconcile_names | tr '\n' ' ')"
+  names="${names% }"
+  if [ -z "$names" ]; then note "pip check reported something it did not name as a conflict: $(printf '%s' "$out" | tail -1)"; return 0; fi
+  if [ "$BASE_NO_NET" = "1" ]; then note "pip check found conflicts ($names); not re-resolved (BASE_NO_NET)"; return 0; fi
+  note "pip check found conflicts; re-resolving together: $names"
+  # shellcheck disable=SC2086  # the names are word-split on purpose: one argument per distribution
+  _base_pip install -q --upgrade ${CONSTRAINTS:+-c "$CONSTRAINTS"} $names 2>&1 | tail -2 || true
+  if out="$(_base_pip check 2>&1)"; then ok "pip check: conflicts re-resolved ($names)"
+  else note "pip check still reports, left to the import check: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"; fi
+  return 0
+}
 _base_venv_ensure_pytest(){ # every run, reuse included: a venv without pytest is a venv the suite cannot run in
   "$PY" -c 'import pytest' >/dev/null 2>&1 && return 0
   if [ "$BASE_DRY" = "1" ]; then would "install pytest into the venv (the suite runs inside it)"; return 0; fi
@@ -241,6 +269,7 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   _base_venv_pip_extra || step_fail=1
   _base_venv_pytest || step_fail=1
   _base_pip install -q --upgrade -c "$CONSTRAINTS" "huggingface_hub[hf-xet]" 2>&1 | tail -2 || { miss "huggingface_hub install failed"; step_fail=1; }
+  _base_venv_reconcile            # 2.12.3: the upgrades above can overshoot a cap another installed package declares
   # (d) verify inside the venv → stamp, else roll back
   if ! _base_venv_verify "$pymm" || [ "$step_fail" = "1" ]; then
     err "venv verify failed — rolling back"

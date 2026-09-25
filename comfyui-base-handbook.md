@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.12.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.12.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -467,6 +467,16 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 2.12.3: the venv's requirements are made to agree after every pip half, at their newest. On a Verda machine with a
+  reused venv, `--latest` ended at the import check: `transformers` 5.17.0, the newest release, requires
+  `huggingface-hub<2.0`, and the per-pack loop had taken the hub to 2.0.0. `pip install --upgrade -r <file>` always
+  takes a requirement the file names to its newest, several packs name a bare `huggingface_hub`, and pip does not
+  resolve against what is installed outside the request; it only warns. `_base_venv_reconcile` now runs after the
+  per-pack loop (every run, reuse included) and after the build's installs: `pip check`, then both sides of every
+  conflict in ONE `pip install --upgrade` under the torch constraint, so the resolver lands on the newest set that
+  agrees (that night, transformers 5.17.0 with huggingface-hub 1.33.0). No pin is written. A conflict pip cannot
+  resolve is reported and left to the import check, which stays the gate. Four unit tests feed it canned
+  `pip check` text.
 - 2.12.2: `comfyui-base.zip` carries `LICENSE`. It never did: the packager's member list named five files and the
   licence was not one of them, so every copy of the zip went out without the notice MIT asks to travel with it.
   The zip is exactly the copy a project built on the base hands to its own users (a workflow package's buyers

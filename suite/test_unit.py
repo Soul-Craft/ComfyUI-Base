@@ -1886,6 +1886,60 @@ def test_unit_pip_extra_step_is_safe_when_a_package_declares_none(tmp_path):
     assert "RC=0" in r.stdout and "nvidia-vfx sageattention" in r.stdout and "-c /dev/null" in r.stdout, r.stdout + r.stderr
 
 
+PIP_CHECK_CONFLICT = (
+    "transformers 5.17.0 has requirement huggingface-hub<2.0,>=1.5.0, but you have huggingface-hub 2.0.0.\n"
+    "comfyui-frontend-package 1.54.7 requires comfyui-workflow-templates, which is not installed.\n")
+PIP_CHECK_CLEAN = "No broken requirements found.\n"
+
+
+def _reconcile(d, first, second, extra=""):
+    """_base_venv_reconcile against a fake _base_pip whose `check` answers `first`, then `second` ((text, rc) each)."""
+    d.mkdir(parents=True, exist_ok=True)
+    for n, (text, rc) in enumerate((first, second), 1):
+        (d / f"check{n}.txt").write_text(text, encoding="utf-8")
+        (d / f"check{n}.rc").write_text(str(rc), encoding="utf-8")
+    fake = ('_base_pip(){ if [ "$1" = check ]; then n=$(cat "{d}/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{d}/n"; '
+            'cat "{d}/check$n.txt"; return $(cat "{d}/check$n.rc"); fi; echo "PIP $*"; }').replace("{d}", str(d))
+    return _bash("set -u; %s; CONSTRAINTS=/dev/null; BASE_DRY=0; BASE_NO_NET=0; %s _base_venv_reconcile; echo RC=$?" % (fake, extra))
+
+
+def test_unit_reconcile_names_both_sides_of_every_pip_check_conflict(tmp_path):
+    """2.12.3: both of pip's conflict shapes, parsed portably (a sed replacement's "\\n" is a literal n on the Mac)."""
+    (tmp_path / "check.txt").write_text(PIP_CHECK_CONFLICT, encoding="utf-8")
+    r = _bash('_base_venv_reconcile_names < "%s"' % (tmp_path / "check.txt"))
+    assert r.stdout.split() == ["comfyui-frontend-package", "comfyui-workflow-templates", "huggingface-hub", "transformers"], r.stdout + r.stderr
+
+
+def test_unit_reconcile_re_resolves_a_conflict_in_one_call_at_the_newest(tmp_path):
+    """Verda, 2026-09-25: a reused venv's per-pack `pip install --upgrade -r` took huggingface-hub to 2.0.0 past the newest
+    transformers' <2.0 cap, and main.py died at import. Both sides go to pip TOGETHER, under the torch constraint, unpinned."""
+    r = _reconcile(tmp_path, (PIP_CHECK_CONFLICT, 1), (PIP_CHECK_CLEAN, 0))
+    out = r.stdout + r.stderr
+    call = "PIP install -q --upgrade -c /dev/null comfyui-frontend-package comfyui-workflow-templates huggingface-hub transformers"
+    assert call in out and "conflicts re-resolved" in out and "RC=0" in out, out
+    assert out.count("PIP install") == 1 and "==" not in out, out           # one resolve, and no pin written
+
+
+def test_unit_reconcile_leaves_a_clean_venv_alone_and_never_fails_a_run(tmp_path):
+    r = _reconcile(tmp_path / "clean", (PIP_CHECK_CLEAN, 0), ("", 0))
+    assert "every requirement in the venv agrees" in r.stdout + r.stderr and "PIP " not in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    r = _reconcile(tmp_path / "stuck", (PIP_CHECK_CONFLICT, 1), (PIP_CHECK_CONFLICT, 1))
+    assert "left to the import check" in r.stdout + r.stderr and "RC=0" in r.stdout, r.stdout + r.stderr   # the import check stays the gate
+    r = _reconcile(tmp_path / "dry", (PIP_CHECK_CONFLICT, 1), ("", 0), extra="BASE_DRY=1;")
+    assert "PIP " not in r.stdout and not (tmp_path / "dry" / "n").exists() and "RC=0" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_reconcile_follows_every_pip_half():
+    """Both places the venv takes requirements call it after their installs: the per-pack loop, which runs on EVERY run
+    (a reused venv included, which is where it broke), and the build."""
+    packs = code_only(_src(BASE / "lib" / "40-packs.sh"))
+    loop = packs.index('-r "$rf"')
+    assert loop < packs.index("_base_venv_reconcile", loop) < packs.index("_base_pack_imports_report ${probe"), "reconcile after the pack loop"
+    venv = code_only(_src(BASE / "lib" / "30-venv.sh"))
+    hub = venv.index('"huggingface_hub[hf-xet]"')
+    assert hub < venv.index("_base_venv_reconcile", hub) < venv.index('_base_venv_verify "$pymm"', hub), "reconcile before the build's verify"
+
+
 def test_unit_optional_declarations_are_never_counted_unguarded():
     """${#NAME[@]} on an array a package may not declare is an unbound-variable exit under set -u on bash 5:
     every such count must sit behind ${NAME[@]+…} on the same line."""
