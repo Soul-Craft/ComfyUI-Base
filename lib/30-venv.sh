@@ -3,7 +3,20 @@
 # Stamp: $VENV/.comfy-base-venv holds "python=<x.y.z> torch=<ver> base=<ver> ts=<ts> by=<pkg id>".
 # An unstamped venv that passes the probe is adopted and stamped.
 
-_base_dir_bytes(){ du -sk "$1" 2>/dev/null | awk '{print $1*1024}' || echo 0; }
+_base_dir_bytes(){ # <dir> → its size in bytes. 3.5.0: remembered by path and ctime in state/sizes.tsv, because a backup venv
+  # is never written after it is made and `du` over it on a network volume took up to a minute on every run
+  local d="$1" c k hit b f
+  c="$( { stat -c %Z "$d" || stat -f %c "$d"; } 2>/dev/null | head -1)"
+  f="${BASE_STATE:-}/sizes.tsv"
+  if [ -n "$c" ] && [ -n "${BASE_STATE:-}" ]; then
+    k="$d"$'\t'"$c"
+    hit="$(awk -F'\t' -v p="$d" -v c="$c" '$1==p && $2==c {print $3; exit}' "$f" 2>/dev/null)"
+    if [ -n "$hit" ]; then echo "$hit"; return 0; fi
+  fi
+  b="$(du -sk "$d" 2>/dev/null | awk '{print $1*1024}')"; b="${b:-0}"
+  if [ -n "${k:-}" ] && [ "$b" != "0" ]; then mkdir -p "$BASE_STATE" 2>/dev/null && printf '%s\t%s\n' "$k" "$b" >> "$f" 2>/dev/null || true; fi
+  echo "$b"
+}
 _base_pip(){ "$PY" -m pip "$@"; }      # never bare pip: pip on PATH belongs to whatever interpreter start.sh did not use
 _base_uvpip(){ uv pip install --python "$PY" "$@"; }   # uv is faster and hardlinks out of a same-filesystem cache; the interpreter is named, never inferred
 # Every requirements file the venv must satisfy. 40-packs.sh replaces this with the full list (ComfyUI,

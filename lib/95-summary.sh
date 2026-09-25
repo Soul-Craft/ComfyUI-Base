@@ -72,11 +72,14 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
   # 3.0.0: the OS and the NVIDIA driver at their newest FIRST: they are the machine's, not the store's, so this runs
   # before the store's lock, and before the driver gate so an upgrade can lift a driver below DRIVER_MIN. A new driver
   # stops the run here, before anything touches the GPU: the machine must restart first (a person approves it).
-  local src=0
+  local src=0 sysbg=0
   if _base_runtime_on; then _base_runtime_skip "the OS and the NVIDIA driver"; BASE_SYSTEM_RESULT="runtime (not upgraded)"
+  elif _base_system_start; then sysbg=1          # 3.5.0: apt runs beside the network checks; joined before the venv
   else base_system || src=$?; fi
-  if [ "$src" = 10 ]; then base_summary; fi
-  if ! _base_driver_gate; then base_summary; fi
+  if [ "$sysbg" = 0 ]; then
+    if [ "$src" = 10 ]; then base_summary; fi
+    if ! _base_driver_gate; then base_summary; fi
+  fi
   # 2.5.0: on a SHARED workspace only, one installer at a time. Nothing above this line writes to the store.
   if ! _base_install_lock; then base_summary; fi
   base_require_workflow
@@ -98,6 +101,11 @@ base_run(){ # the install, in the order the spec fixes; hooks run where a packag
     _base_runtime_skip "the packs' requirements"; _base_runtime_skip "Comfy MCP"; BASE_MCP_RESULT="skipped (runtime)"
     _base_runtime_skip "the newest-everything pass"; BASE_LIFT_RESULT="runtime (not lifted)"
   else
+  if [ "$sysbg" = 1 ]; then             # 3.5.0: the OS stage joins here, before anything touches the venv or the GPU
+    src=0; _base_system_join || src=$?
+    if [ "$src" = 10 ]; then base_summary; fi
+    if ! _base_driver_gate; then base_summary; fi
+  fi
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
   _base_hook pkg_pre_venv
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi

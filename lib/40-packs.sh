@@ -90,6 +90,32 @@ _base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could no
   fi
   return 0
 }
+_BASE_PACK_HEADS=""   # 3.5.0: the table py/pack_heads.py wrote this run (url, branch, sha per remote that answered)
+_base_pack_heads_probe(){ # <url>... → every remote's HEAD, asked at once; nothing asked in a dry, fake or runtime run
+  _BASE_PACK_HEADS=""
+  if [ "$BASE_DRY" = "1" ] || [ "$BASE_NO_NET" = "1" ] || _base_runtime_on; then return 0; fi
+  [ "$#" -gt 0 ] || return 0
+  _base_tmp; _BASE_PACK_HEADS="$BASE_TMPD/pack-heads.tsv"
+  printf '%s\n' "$@" | "${SYS_PY:-python3}" "$BASE_DIR/py/pack_heads.py" > "$_BASE_PACK_HEADS" 2>/dev/null || : > "$_BASE_PACK_HEADS"
+  return 0
+}
+_base_pack_current(){ # <dir> <url> → 0 when the checkout sits exactly on what that remote publishes as HEAD: same commit, on
+  # that branch, wired to it, not shallow, no local edits. Then there is nothing to fetch. Anything else takes the full
+  # path (_base_pack_move), which fetches, never moves backwards, stashes edits and says what git says.
+  local dir="$1" url="$2" line br sha rmt
+  [ -n "$_BASE_PACK_HEADS" ] && [ -s "$_BASE_PACK_HEADS" ] || return 1
+  line="$(awk -F'\t' -v u="$url" '$1==u {print; exit}' "$_BASE_PACK_HEADS")"
+  [ -n "$line" ] || return 1
+  br="$(printf '%s' "$line" | cut -f2)"; sha="$(printf '%s' "$line" | cut -f3)"
+  [ "$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$sha" ] || return 1
+  [ "$(_base_git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" = "$br" ] || return 1
+  [ "$(_base_git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" = "false" ] || return 1
+  [ -z "$(_base_git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ] || return 1
+  rmt="$(_base_git_remote "$dir")"; [ -n "$rmt" ] || return 1
+  [ "$(_base_git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" = "$rmt/$br" ] || return 1
+  [ "$(_base_git -C "$dir" remote get-url "$rmt" 2>/dev/null)" = "$url" ] || return 1      # the remote it fetches is the one asked
+  return 0
+}
 _base_pack_move_aside(){ # <dir> → moves a pack directory aside under custom_nodes/comfy-base-aside.disabled, prints the new path
   local d="$1" aside="$CN/comfy-base-aside.disabled" to   # ".disabled": ComfyUI skips it when it loads custom_nodes
   mkdir -p "$aside" 2>/dev/null || return 1
@@ -168,7 +194,13 @@ base_packs(){ # base_packs git | pip
     [ "$BASE_DRY" = "1" ] || mkdir -p "$CN" 2>/dev/null || true
     PACK_DIRS=(); BASE_PACKS_LATEST_ROWS=()
     local rows; rows="$(_base_pack_rows)" || { err "the pack tables are invalid (see above)"; BASE_FAILED+=("packs: invalid rows"); return 1; }
-    local declared=" "
+    local declared=" " purls=() pu pd
+    # 3.5.0: every remote's HEAD, asked at once (declared rows and every checkout already in custom_nodes)
+    while IFS='|' read -r name url sha cnr why; do if [ -n "$url" ]; then purls+=("$url"); fi; done <<< "$rows"
+    for pd in "${CN:-/nonexistent}"/*/; do
+      if [ -d "$pd/.git" ]; then pu="$(_base_git -C "$pd" remote get-url "$(_base_git_remote "$pd")" 2>/dev/null || true)"; if [ -n "$pu" ]; then purls+=("$pu"); fi; fi
+    done
+    _base_pack_heads_probe ${purls[@]+"${purls[@]}"}
     while IFS='|' read -r name url sha cnr why; do
       [ -n "$name" ] || continue
       dir="$(_base_pack_locate "$name" "$url")"
@@ -202,6 +234,8 @@ base_packs(){ # base_packs git | pip
         would "fetch $name and move it to the HEAD its remote publishes (never backwards; local edits stashed first)"; PACK_PRESENT+=("$name")
       elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (no-net: not moved)")
       elif _base_runtime_on; then PACK_PRESENT+=("$name (runtime)")
+      elif _base_pack_current "$dir" "$url"; then
+        PACK_PRESENT+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null) (its remote HEAD; nothing to fetch)"
       else _base_pack_move "$name" "$dir" "$url"; fi
       declared="$declared$(basename "${dir:-$name}") "
       PACK_DIRS+=("$name|$dir")
@@ -220,7 +254,10 @@ base_packs(){ # base_packs git | pip
         uurl="$(_base_git -C "$ud" remote get-url "$(_base_git_remote "$ud")" 2>/dev/null || true)"
         if [ -z "$uurl" ]; then note "$un: undeclared git checkout with no remote: nothing to move it to"; continue; fi
         if [ "$BASE_DRY" = "1" ]; then would "move undeclared $un to its remote HEAD"
-        elif [ "$BASE_NO_NET" != "1" ] && ! _base_runtime_on; then _base_pack_move "$un" "$ud" "$uurl"; fi
+        elif [ "$BASE_NO_NET" != "1" ] && ! _base_runtime_on; then
+          if _base_pack_current "$ud" "$uurl"; then PACK_PRESENT+=("$un @ $(_base_git -C "$ud" rev-parse --short HEAD 2>/dev/null)"); ok "$un @ $(_base_git -C "$ud" rev-parse --short HEAD 2>/dev/null) (its remote HEAD; nothing to fetch)"
+          else _base_pack_move "$un" "$ud" "$uurl"; fi
+        fi
       elif [ -f "$ud/__init__.py" ]; then note "$un: undeclared and not a git checkout: no source to upgrade it from, left alone"; fi
     done
     # the last-tested records: printed on EVERY real run, so podctl can write them back after a green install
@@ -283,10 +320,19 @@ base_cuda_toolchain(){ # CAN THIS TOOLKIT LINK WHAT PACKAGES BUILD? "nvcc exists
   [ -x "$nvcc" ] || nvcc="$(command -v nvcc 2>/dev/null || true)"
   if [ -z "$nvcc" ] || [ ! -x "$nvcc" ]; then BASE_CUDA_BUILD_OK=0; return 0; fi   # no toolkit: the builders say so
   _base_tmp
-  local src="$BASE_TMPD/cublas_probe.cu" bin="$BASE_TMPD/cublas_probe" ver pkg
+  local src="$BASE_TMPD/cublas_probe.cu" bin="$BASE_TMPD/cublas_probe" ver pkg key stamp root
+  # 3.5.0: a toolkit that linked cuBLAS on this machine and has not changed since is not compiled against again. The key
+  # is nvcc's path and version and the identity of the cuBLAS library and header; per machine, since the store is shared
+  # and each machine has its own toolkit (a restarted container loses an apt-installed library: the key changes).
+  root="$(cd "$(dirname "$nvcc")/.." 2>/dev/null && pwd -P)"
+  key="$( { echo "$nvcc"; "$nvcc" --version 2>/dev/null | tail -1; ls -liL "$root"/lib64/libcublas.so* "$root"/lib/libcublas.so* "$root"/include/cublas_v2.h /usr/include/cublas_v2.h 2>/dev/null; } | cksum)"
+  stamp="${BASE_STATE:-/nonexistent}/machines/$(hostname -s 2>/dev/null || echo machine).cublas-probe"
+  if [ "$(cat "$stamp" 2>/dev/null)" = "$key" ]; then BASE_CUDA_BUILD_OK=1; ok "CUDA toolchain links cuBLAS (this toolkit was probed on this machine before)"; return 0; fi
   printf '%s\n' '#include <cublas_v2.h>' 'int main(){ cublasHandle_t h; cublasCreate(&h); cublasDestroy(h); return 0; }' > "$src"
   if "$nvcc" -o "$bin" "$src" -lcublas >/dev/null 2>&1; then
-    BASE_CUDA_BUILD_OK=1; ok "CUDA toolchain links cuBLAS — source builds can proceed"; return 0
+    BASE_CUDA_BUILD_OK=1; ok "CUDA toolchain links cuBLAS — source builds can proceed"
+    if [ -n "${BASE_STATE:-}" ] && [ "$BASE_DRY" != "1" ]; then mkdir -p "$(dirname "$stamp")" 2>/dev/null && printf '%s\n' "$key" > "$stamp" 2>/dev/null || true; fi
+    return 0
   fi
   ver="$("$nvcc" --version 2>/dev/null | sed -nE 's/.*release ([0-9]+)\.([0-9]+).*/\1-\2/p' | head -1)"
   pkg="cuda-libraries-dev${ver:+-$ver}"          # the installed toolkit's own; with none readable, NVIDIA's newest-tracking metapackage

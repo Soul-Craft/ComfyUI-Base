@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.4.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.5.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -375,9 +375,11 @@ newest Python, and starts it on CPU. It is several GB and gitignored.
 ## 5. Pipeline (install)
 
 init (env · log · volume check · discover, or materialise the tree · declarations + `BASE_MIN` gate · banner) → system
-(the OS and the NVIDIA driver at their newest; a new driver stops here with "restart required") → driver gate → the
-store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
-consolidate strays (the volume only) → packs git (every pack to its HEAD) → the venv snapshot → `pkg_pre_venv` → venv →
+(the OS and the NVIDIA driver at their newest; 3.5.0: started in the background and joined before the venv snapshot,
+where the driver gate and a new driver's "restart required" stop apply; `BASE_SYSTEM_FOREGROUND=1` keeps the old order)
+→ the store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
+consolidate strays (the volume only) → packs git (every pack to its HEAD; 3.5.0: every remote's HEAD asked at once,
+and a pack already on it is not fetched) → [join the OS stage · driver gate] → the venv snapshot → `pkg_pre_venv` → venv →
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
@@ -532,15 +534,17 @@ installed there and ssh is the default. The ssh transport passes `ClearAllForwar
 holds them prints warnings onto the very stdio channel MCP is speaking. The tunnel transport takes the alias's
 own local port (`tunnel_locals`), so two machines never point at one tunnel.
 
-**What this repository does NOT ship.** No `.mcp.json` is committed. Comfy-Org's `comfy skills install` writes
-the client configuration for Claude Code, Cursor and `AGENTS.md` at user scope, and their `Comfy-Org/comfy-skills`
-marketplace calls itself the single source of truth for the installer and the MCP server; comfy-mcp itself had two
-releases in its first two months. A second, committed source of truth for a thing that young, owned by someone
-else, would drift within weeks and would prompt every person who clones this repository to enable a server that
-cannot work until they have a tunnel up. So the local case belongs to upstream, and what stays here is the case
-upstream does not cover: a machine the base provisioned on a rented GPU, which is neither "ComfyUI on your
-machine" nor Comfy Cloud. `podctl mcp` writes that file, and `.gitignore` keeps it out of the tree because it
-names one machine and one operator's paths.
+**What this repository does NOT ship.** No `.mcp.json` is committed, and no settings file approves one
+(`enabledMcpjsonServers`, `enableAllProjectMcpServers`). This is a public toolchain many people clone: Claude Code
+starts a project's servers once a person trusts the folder (and a headless `claude -p` without asking), and a
+committed approval folds the per-server prompt, the one that shows the exact command, into that single trust click,
+which is the pattern the MCP specification's security guidance warns against. The entries would also be one person's
+setup (a port, a path). The local case is the person's own: `claude mcp add ... -- comfy-mcp` at user or local scope,
+as Comfy-Org's docs show (the README has the line). Corrected in 3.5.0: `comfy skills install` writes Comfy-Org's
+agent skills, not MCP client configuration; their `comfy-skills` marketplace plugin connects the hosted Comfy Cloud
+server; and comfy-mcp 0.9.0 and 0.10.0 came two days apart, not two months. What stays here is the case upstream does
+not cover: a machine the base provisioned on a rented GPU. `podctl mcp` writes that file beside you, and `.gitignore`
+keeps it out of the tree because it names one machine and one operator's paths.
 
 **`COMFY_BIN`.** comfy-mcp is a wrapper: its discovery and lifecycle tools shell out to comfy-cli, which it
 finds through `COMFY_BIN` or `PATH`. An MCP client is usually launched by a GUI, whose `PATH` is not your
@@ -559,6 +563,20 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.5.0: every probe once, and in parallel where it can be. The pack HEADs are asked of every remote at once
+  (`py/pack_heads.py`, one `git ls-remote --symref` each, sixteen at a time), and a checkout already on its remote's
+  HEAD (same commit, on that branch, wired to it, not shallow, no edits) is not fetched; anything else takes the full
+  path, never backwards. ComfyUI asks the remote for its newest release tag first and skips the fetch of every branch
+  when HEAD is already on it. apt runs in the background beside those network checks and is joined before the venv
+  snapshot, where the driver gate and "restart required" stop as before; its output is shown whole at the join. The two
+  filesystem walks skip the uv, pip, Hugging Face and xet caches (`.comfy-base-staging` stays pruned), a directory's
+  name is read without a `basename` process per line, a backup venv is sized once per path and ctime (`state/sizes.tsv`),
+  the venv's torch backend comes from torch's metadata without importing it (a torch with no local tag is still asked
+  directly), and the cuBLAS probe compiles once per toolkit on a machine. Runtime mode keeps the OS step skipped and its
+  torch import. The README and §9.1 now say what Comfy-Org's tooling actually does (skills, not MCP client
+  configuration; the marketplace plugin is Comfy Cloud's) and why the repository still ships no `.mcp.json` and no
+  approval for one. Exercised on fake pods only.
 
 - 3.4.0: each model file's sha256, from the Hub, never hashed here (Paul, 2026-09-25, asked for by the ComfyUI tooling
   session so a Comfy Build spec needs no second pass over 100+ GB). `base.sh gen-hashes <pkg dir>` reads the sha256 the Hub

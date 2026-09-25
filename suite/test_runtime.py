@@ -234,7 +234,7 @@ def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
     """Runtime mode is a branch, not an edit: the plain path still runs every 3.0.0 step, in the 3.0.0 order."""
     body = (BASE / "lib" / "95-summary.sh").read_text()
     run = body[body.index("base_run(){"):body.index("_base_use_testbed(){")]
-    plain = run[run.index("  else\n  base_venv_snapshot"):]
-    for a, b in (("base_venv_snapshot", "if ! base_venv"), ("if ! base_venv", "base_packs pip"), ("base_packs pip", "base_mcp"), ("base_mcp", "base_venv_latest")):
+    plain = run[run.index('  else\n  if [ "$sysbg" = 1 ]'):]              # 3.5.0: the plain branch opens by joining the background OS stage
+    for a, b in (("_base_system_join", "base_venv_snapshot"), ("base_venv_snapshot", "if ! base_venv"), ("if ! base_venv", "base_packs pip"), ("base_packs pip", "base_mcp"), ("base_mcp", "base_venv_latest")):
         assert plain.index(a) < plain.index(b)
     assert "else base_system || src=$?; fi" in run and "else base_update_comfyui || true; fi" in run

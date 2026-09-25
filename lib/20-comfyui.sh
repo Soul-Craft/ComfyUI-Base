@@ -260,6 +260,19 @@ base_update_comfyui(){ # the newest release (or a newer COMFY_REF), checked out 
     fi
     return 0
   else
+    # 3.5.0: ask the remote first. When HEAD already sits on the remote's newest release tag (the same tag object),
+    # there is nothing to fetch: the full fetch of every branch and tag is skipped. Anything else fetches as before.
+    if [ "$ref" = release ]; then
+      local lr rtag rsha
+      lr="$(_base_git -C "$COMFY" ls-remote --tags --refs "$rmt" 'v*' 2>/dev/null | awk '{sub("refs/tags/", "", $2); print $2" "$1}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+ ' | sort -V | tail -1 || true)"
+      rtag="${lr%% *}"; rsha="${lr#* }"
+      if [ -n "$rtag" ] && [ "$(_base_git -C "$COMFY" rev-parse -q --verify "refs/tags/$rtag" 2>/dev/null)" = "$rsha" ] \
+         && [ "$(_base_git -C "$COMFY" rev-parse HEAD 2>/dev/null)" = "$(_base_git -C "$COMFY" rev-parse -q --verify "$rtag^{commit}" 2>/dev/null)" ]; then
+        COMFY_NEW="$(_base_comfy_version "$COMFY" 2>/dev/null)"; COMFY_REF_INFO="$rtag @ $(_base_git -C "$COMFY" rev-parse --short HEAD 2>/dev/null)"
+        ok "ComfyUI already at $COMFY_REF_INFO, the remote's newest release (branch $(_base_git -C "$COMFY" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'); nothing to fetch)"
+        return 0
+      fi
+    fi
     local fetch_out fetch_rc=0
     # --force: the template ships tags upstream has since moved; without it the whole fetch is refused
     fetch_out="$(_base_git -C "$COMFY" fetch --tags --force --prune "$rmt" 2>&1)" || fetch_rc=$?

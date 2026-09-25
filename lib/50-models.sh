@@ -37,6 +37,15 @@ BASE_PRUNE_DIRS=( '(' -path /proc -o -path /sys -o -path /dev -o -path /run -o -
                   -o -name lost+found -o -name .git -o -name node_modules -o -name __pycache__
                   -o -name site-packages -o -name dist-packages -o -name .comfy-base-staging ${BASE_FAKE_IMAGE_ROOT:+-o} ${BASE_FAKE_IMAGE_ROOT:+-path} ${BASE_FAKE_IMAGE_ROOT:+"$BASE_FAKE_IMAGE_ROOT"} ')' )
 BASE_DIRSCAN=""; IDX=""; IDX_ROOTS=""
+_base_cache_prune(){ # → a find prune expression for the tool caches (3.5.0): the uv, pip, Hugging Face and xet caches hold
+  # no ComfyUI tree, no pack and no model-shaped file (the Hub cache keeps blobs under hash names), only walk time
+  local p out=() first=1
+  for p in "${UV_CACHE_DIR:-}" "${PIP_CACHE_DIR:-}" "${HF_HOME:-}" "${HF_XET_CACHE:-}"; do
+    [ -n "$p" ] || continue
+    if [ "$first" = 1 ]; then out+=( -path "$p" ); first=0; else out+=( -o -path "$p" ); fi
+  done
+  [ "${#out[@]}" -gt 0 ] && printf '%s\n' '(' "${out[@]}" ')' || true
+}
 BASE_DL_BYTES=0; BASE_DL_TIME=0; BASE_DL_SECS=0
 
 # ---------------------------------------------------------------- rows and dests
@@ -111,8 +120,10 @@ _base_dirscan(){ # ONE filesystem walk for every directory question the run asks
   # bounded: a hung network mount must not stall the run. `cd && pwd -P` collapses SYMLINKS. It does NOT
   # collapse a second mount of the same export: two mountpoints give one inode two different path strings,
   # and this walk indexes both. That is why the duplicate sweep compares dev:ino and not paths alone.
+  local cp=(); while IFS= read -r p; do cp+=("$p"); done < <(_base_cache_prune)
+  [ "${#cp[@]}" -gt 0 ] && cp+=( -prune -o ) || true
   if _base_timeout "${BASE_SCAN_SECS:-240}" \
-    find "${roots[@]}" ${BASE_PRUNE_DIRS[@]+"${BASE_PRUNE_DIRS[@]}"} -prune -o -type d \( "${expr[@]}" \) -print 2>/dev/null \
+    find "${roots[@]}" ${cp[@]+"${cp[@]}"} ${BASE_PRUNE_DIRS[@]+"${BASE_PRUNE_DIRS[@]}"} -prune -o -type d \( "${expr[@]}" \) -print 2>/dev/null \
     | while IFS= read -r p; do if [ -d "$p" ]; then (cd "$p" 2>/dev/null && pwd -P) || true; fi; done \
     | sort -u > "$BASE_DIRSCAN"; then :
   else
@@ -126,7 +137,7 @@ _base_find_dirs(){ # <dir-name-glob>… → matches out of the single scan above
   local d b p
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    b="$(basename "$d")"
+    b="${d##*/}"                                           # 3.5.0: no basename fork per line (thousands on a used volume)
     for p in "$@"; do case "$b" in $p) echo "$d"; break;; esac; done
   done < "$BASE_DIRSCAN"
   return 0
@@ -147,7 +158,9 @@ _base_build_index(){ # every model-shaped file on every mounted filesystem → I
   # No -xdev: models routinely sit on a different mount from where the walk starts. custom_nodes is NOT pruned
   # (rife426.pth lives inside a pack); site-packages IS (thousands of *.pth path files that are not weights).
   [ -n "$BASE_FAKE_ROOT" ] || note "indexing ${kept[*]} — a minute or two on a network volume"
-  if find "${kept[@]}" ${BASE_PRUNE[@]+"${BASE_PRUNE[@]}"} -prune -o -type f \( "${names[@]}" \) -print0 2>/dev/null \
+  local cp=() p; while IFS= read -r p; do cp+=("$p"); done < <(_base_cache_prune)
+  [ "${#cp[@]}" -gt 0 ] && cp+=( -prune -o ) || true
+  if find "${kept[@]}" ${cp[@]+"${cp[@]}"} ${BASE_PRUNE[@]+"${BASE_PRUNE[@]}"} -prune -o -type f \( "${names[@]}" \) -print0 2>/dev/null \
     | _base_xargs0 stat "${fmt[@]}" 2>/dev/null >> "$IDX"; then :
   else
     # a short index is indistinguishable from "no models on disk", and the answer to that is a re-download

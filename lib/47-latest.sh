@@ -24,7 +24,21 @@ _base_uv_index_args(){ # the indexes every resolve in the venv uses: PyPI first,
   printf '%s\n' --index-strategy unsafe-best-match --extra-index-url https://pypi.nvidia.com
   if [ -d "$BASE_STATE/wheels" ]; then printf '%s\n' --find-links "$BASE_STATE/wheels"; fi
 }
-_base_venv_backend(){ # → the torch backend the venv was built on (cu132 ...), from torch itself; "" when it cannot tell
+_base_venv_backend(){ # → the torch backend the venv was built on (cu132 ...); "" when it cannot tell
+  # 3.5.0: from torch's installed metadata ("2.14.0+cu130") without importing it (seconds from a network volume); a torch
+  # with no local tag (a CUDA build from plain PyPI) is asked directly, as before
+  "$PY" -c '
+import importlib.metadata as m, sys
+try:
+    v = m.version("torch")
+except Exception:
+    sys.exit(1)
+tag = v.split("+", 1)[1] if "+" in v else ""
+if tag.startswith("cu") or tag == "cpu":
+    print(tag)
+else:
+    sys.exit(2)
+' 2>/dev/null && return 0
   "$PY" -c 'import torch; c = torch.version.cuda or ""; print("cu" + c.replace(".", "") if c else "cpu")' 2>/dev/null || true
 }
 

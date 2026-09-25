@@ -182,3 +182,49 @@ base_system(){ # the stage; sets BASE_REBOOT_REQUIRED and returns 10 when a rest
   [ -n "$BASE_SYSTEM_RESULT" ] || BASE_SYSTEM_RESULT="ok$( [ "$rc" = 0 ] || echo " (with failures)")"
   return 0
 }
+
+# ---------------------------------------------------------------- 3.5.0: the OS stage beside the network checks
+# apt (update, full-upgrade) is the slowest check before the venv, and nothing after it until the venv needs what it
+# decides: the tokens, the ComfyUI tag and the pack HEADs only ask the network. So it runs in the background and the run
+# joins it before the venv snapshot, where the driver gate and a "restart required" stop apply exactly as before. Its
+# output is shown whole at the join; everything it decided comes back as plain assignments (a sourced `declare` inside a
+# function would make them local, and bash 3.2 has no `declare -g`). Runtime mode, a dry run and BASE_SYSTEM_FOREGROUND=1
+# keep it in the foreground.
+_BASE_SYSTEM_PID=""; _BASE_SYSTEM_DIR=""
+_base_system_start(){ # → 0 when the OS stage is now running in the background, 1 when the caller must run it itself
+  if _base_runtime_on || [ "$BASE_DRY" = "1" ] || [ "${BASE_SYSTEM_FOREGROUND:-0}" = "1" ]; then return 1; fi
+  _BASE_SYSTEM_DIR="$(_base_mktemp_d)"
+  local dir="$_BASE_SYSTEM_DIR" nf="${#BASE_FAILED[@]}" nw="${#BASE_WARN[@]}"
+  (
+    trap - ERR EXIT; set +e
+    t0="$SECONDS"; base_system; rc=$?
+    {
+      printf 'BASE_SYSTEM_RESULT=%q\n' "${BASE_SYSTEM_RESULT:-}"
+      printf 'BASE_DRIVER_BEFORE=%q\n' "${BASE_DRIVER_BEFORE:-}"
+      printf 'BASE_DRIVER_AFTER=%q\n' "${BASE_DRIVER_AFTER:-}"
+      printf 'BASE_KERNEL_INFO=%q\n' "${BASE_KERNEL_INFO:-}"
+      printf 'BASE_NVIDIA_REPO=%q\n' "${BASE_NVIDIA_REPO:-}"
+      printf 'BASE_REBOOT_REQUIRED=%q\n' "${BASE_REBOOT_REQUIRED:-}"
+      printf 'BASE_SYSTEM_ROWS=('; for x in ${BASE_SYSTEM_ROWS[@]+"${BASE_SYSTEM_ROWS[@]}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_base_sys_failed=('; for x in ${BASE_FAILED[@]+"${BASE_FAILED[@]:$nf}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_base_sys_warn=('; for x in ${BASE_WARN[@]+"${BASE_WARN[@]:$nw}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_base_sys_secs=%q\n_base_sys_rc=%q\n' "$(( SECONDS - t0 ))" "$rc"
+    } > "$dir/vars.sh"
+  ) > "$dir/out" 2>&1 &
+  _BASE_SYSTEM_PID=$!
+  note "the OS and the NVIDIA driver are being checked in the background; the run joins them before the venv"
+  return 0
+}
+_base_system_join(){ # → the OS stage's status (10: the machine must restart first); its output shown, its results in this run
+  [ -n "$_BASE_SYSTEM_PID" ] || return 0
+  local _base_sys_failed=() _base_sys_warn=() _base_sys_secs=0 _base_sys_rc=0 x
+  wait "$_BASE_SYSTEM_PID" 2>/dev/null || true
+  _BASE_SYSTEM_PID=""
+  cat "$_BASE_SYSTEM_DIR/out" 2>/dev/null || true
+  if [ -f "$_BASE_SYSTEM_DIR/vars.sh" ]; then . "$_BASE_SYSTEM_DIR/vars.sh"
+  else BASE_FAILED+=("system: the background OS stage ended without a result (its output is above)"); return 0; fi
+  for x in ${_base_sys_failed[@]+"${_base_sys_failed[@]}"}; do BASE_FAILED+=("$x"); done
+  for x in ${_base_sys_warn[@]+"${_base_sys_warn[@]}"}; do BASE_WARN+=("$x"); done
+  BASE_STAGE_TIMES+=("$_base_sys_secs|SYSTEM (in the background)")
+  return "$_base_sys_rc"
+}

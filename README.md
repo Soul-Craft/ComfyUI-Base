@@ -72,10 +72,19 @@ that tier on its own. It is several GB and gitignored. Tiers that need a GPU or 
 Every machine the base installs comes up drivable by an agent: `comfy-mcp` (the official Comfy-Org MCP server)
 goes into the run's venv, and the driver points a client at it.
 
-**For a ComfyUI on your own machine, use Comfy-Org's own tooling** — `comfy skills install`, or the Claude Code
-marketplace (`/plugin marketplace add Comfy-Org/comfy-skills`). They call that repository the single source of
-truth for the installer and the MCP server, it writes at user scope for Claude Code, Cursor and `AGENTS.md`,
-and it is theirs to keep current. This repository does not compete with it and ships no `.mcp.json`.
+**For a ComfyUI on your own machine** (Comfy Desktop, a local install, this repository's testbed), add comfy-mcp
+to your own client at user or local scope, the way Comfy-Org's docs show. Nothing in this repository changes:
+
+```bash
+claude mcp add comfy-local --scope user -e COMFY_WHERE=local -e COMFY_LOCAL_URL=http://127.0.0.1:8188 \
+  -e DO_NOT_TRACK=1 -e COMFY_NO_TELEMETRY=1 -- comfy-mcp
+```
+
+Add `-e COMFY_BIN=$(command -v comfy)` only when `comfy` is not on your PATH. Comfy-Org's `comfy skills install`
+adds their agent skills (instructions, not an MCP server), and their `Comfy-Org/comfy-skills` marketplace plugin
+connects Comfy Cloud's hosted server. This repository ships no `.mcp.json` and no settings that approve one: in a
+repository many people clone, a committed server entry starts a command on each of their machines once they trust
+the folder, and an entry that approves itself skips the per-server prompt that shows them that command.
 
 **For a machine this base provisioned, use the driver.** That case is the one upstream's tooling does not
 cover: its local flow assumes ComfyUI is on your machine, and its cloud flow assumes Comfy Cloud, while this

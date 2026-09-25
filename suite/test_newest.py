@@ -1,6 +1,6 @@
 """unit tier, 3.0.0: always the newest, for everything the base installs. Every test runs the real library against a
 throwaway tree, with uv, apt and the GPU tools replaced by stand-ins on PATH; nothing here reaches the network or the OS."""
-import json, os, pathlib, re, stat, subprocess, sys, textwrap, pytest
+import json, os, pathlib, re, shutil, stat, subprocess, sys, textwrap, pytest
 pytestmark = pytest.mark.unit
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
@@ -613,3 +613,123 @@ def test_unit_the_sageattention_key_names_the_cuda_backend_and_an_existing_build
     stamp = (venv / ".comfy-base-sageattention").read_text().strip()
     assert stamp == "sageattention-abcdef123456-%s-torch2.14.0-cu130-sm_120" % tag, (stamp, r.stdout, r.stderr)
     assert "already built" in r.stdout, r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------- 3.5.0: every probe once, in parallel
+
+def _git_spy(tmp_path):
+    """git on PATH that logs each call's subcommand, then runs the real git."""
+    real = shutil.which("git"); d = tmp_path / "gitspy"; d.mkdir(exist_ok=True); log = tmp_path / "git.log"
+    _stub(d, "git", f'skip=0; for a in "$@"; do if [ "$skip" = 1 ]; then skip=0; continue; fi; case "$a" in -c|-C) skip=1;; -*) ;; *) echo "$a" >> "{log}"; break;; esac; done\nexec "{real}" "$@"\n')
+    return {"PATH": f"{d}:{os.environ['PATH']}"}, log
+
+
+def test_unit_a_pack_already_at_its_remote_head_is_not_fetched(tmp_path):
+    origin, head, _ = _pack_origin(tmp_path, "PackA")
+    env = _packs_env(tmp_path); cn = tmp_path / "ComfyUI" / "custom_nodes"
+    _git("clone", "-q", str(origin), str(cn / "PackA"))
+    spy, log = _git_spy(tmp_path)
+    row = f"PackA|{origin}|{head}||test pack"
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("{row}"); base_packs git; echo FAILED=${{#BASE_FAILED[@]}}', env={**env, **spy})
+    assert "FAILED=0" in r.stdout and "PackA @" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text().split()
+    assert "ls-remote" in calls and "fetch" not in calls, calls                    # one probe, no fetch
+    assert f'"PackA|{origin}|{head}||test pack"' in r.stdout                        # the record is printed all the same
+
+
+def test_unit_a_pack_whose_remote_moved_is_fetched_and_moved(tmp_path):
+    origin, head, old = _pack_origin(tmp_path, "PackA")
+    env = _packs_env(tmp_path); cn = tmp_path / "ComfyUI" / "custom_nodes"
+    _git("clone", "-q", str(origin), str(cn / "PackA")); _git("reset", "-q", "--hard", old, cwd=cn / "PackA")
+    spy, log = _git_spy(tmp_path)
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("PackA|{origin}|{old}||t"); base_packs git', env={**env, **spy})
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackA") == head, r.stdout + r.stderr
+    assert "fetch" in log.read_text().split()
+
+
+def test_unit_pack_heads_are_probed_in_parallel_and_an_unreachable_one_says_nothing(tmp_path):
+    a, ha, _ = _pack_origin(tmp_path, "PackA"); b, hb, _ = _pack_origin(tmp_path, "PackB")
+    r = subprocess.run([sys.executable, str(BASE / "py" / "pack_heads.py")], input=f"{a}\n{b}\n{tmp_path / 'nope.git'}\n",
+                       capture_output=True, text=True)
+    rows = sorted(l.split("\t") for l in r.stdout.splitlines())
+    assert rows == sorted([[str(a), "main", ha], [str(b), "main", hb]]), r.stdout + r.stderr
+
+
+def test_unit_comfyui_already_at_the_newest_release_is_not_fetched(tmp_path):
+    work, _ = _comfy_repo(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path)}
+    _bash('base_env_setup; base_discover quiet; base_update_comfyui >/dev/null', env=env)            # first run: moves to v0.35.1
+    spy, log = _git_spy(tmp_path)
+    r = _bash('base_env_setup; base_discover quiet; base_update_comfyui; echo NEW=$COMFY_NEW; echo INFO=$COMFY_REF_INFO', env={**env, **spy})
+    assert "NEW=0.35.1" in r.stdout and "INFO=v0.35.1 @" in r.stdout and "nothing to fetch" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text().split()
+    assert "ls-remote" in calls and "fetch" not in calls, calls
+
+
+def test_unit_the_os_stage_runs_in_the_background_and_its_results_reach_the_run(tmp_path):
+    # apt is slow and touches nothing the network checks after it need: it runs beside them, and everything it decided
+    # (its result, its rows, the driver, its failures and warnings, its "restart required") reaches the run at the join
+    r = _bash('base_system(){ hdr "SYSTEM · stand-in"; ok "apt ran"; BASE_SYSTEM_RESULT="upgraded 3"; BASE_SYSTEM_ROWS=("pkg a 1 -> 2" "pkg b");'
+              ' BASE_DRIVER_AFTER=590.1; BASE_FAILED+=("apt: one failed"); warn "kernel updated"; return 0; };'
+              ' _base_system_start; echo "STARTED=$?"; echo "BEFORE_JOIN=$BASE_SYSTEM_RESULT"; _base_system_join; echo "RC=$?";'
+              ' echo "RESULT=$BASE_SYSTEM_RESULT"; printf "ROW %s\\n" "${BASE_SYSTEM_ROWS[@]}"; echo "DRIVER=$BASE_DRIVER_AFTER";'
+              ' printf "F %s\\n" "${BASE_FAILED[@]}"; printf "W %s\\n" "${BASE_WARN[@]}"')
+    out = r.stdout
+    assert "STARTED=0" in out and "BEFORE_JOIN=\n" in out and "RC=0" in out, out + r.stderr
+    assert "apt ran" in out and "RESULT=upgraded 3" in out and "ROW pkg a 1 -> 2" in out and "ROW pkg b" in out and "DRIVER=590.1" in out, out
+    assert "F apt: one failed" in out and "W kernel updated" in out, out
+    assert out.index("BEFORE_JOIN") < out.index("apt ran")                     # its output is shown at the join, whole
+
+
+def test_unit_a_restart_required_from_the_background_os_stage_still_stops_the_run(tmp_path):
+    r = _bash('base_system(){ echo "  restart required: driver 590"; BASE_SYSTEM_RESULT="restart required"; return 10; };'
+              ' _base_system_start; _base_system_join; echo "RC=$?"')
+    assert "RC=10" in r.stdout and "restart required: driver 590" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_the_os_stage_stays_in_the_foreground_on_a_runtime_machine_or_when_asked(tmp_path):
+    r = _bash('_base_runtime_on(){ return 0; }; _base_system_start; echo "STARTED=$?"')
+    assert "STARTED=1" in r.stdout
+    r = _bash('BASE_SYSTEM_FOREGROUND=1; _base_system_start; echo "STARTED=$?"')
+    assert "STARTED=1" in r.stdout
+
+
+def test_unit_the_walks_skip_the_caches_but_never_the_staging_folder(tmp_path):
+    r = _bash('UV_CACHE_DIR=/v/.cache/uv; PIP_CACHE_DIR=/v/.cache/pip; HF_HOME=/v/hf; HF_XET_CACHE=/x/xet; printf "%s\\n" "${BASE_PRUNE[@]}"; _base_cache_prune')
+    out = r.stdout
+    assert ".comfy-base-staging" in out
+    for p in ("/v/.cache/uv", "/v/.cache/pip", "/v/hf", "/x/xet"):
+        assert p in out, (p, out)
+
+
+def test_unit_a_backup_venv_is_sized_once_until_it_changes(tmp_path):
+    d = tmp_path / "venv.pre-x"; d.mkdir(); (d / "f").write_bytes(b"x" * 5000)
+    st = tmp_path / "state"; st.mkdir()
+    spy = tmp_path / "bin"; spy.mkdir(); log = tmp_path / "du.log"
+    _stub(spy, "du", f'echo du >> "{log}"\nexec /usr/bin/du "$@"\n')
+    snippet = f'BASE_STATE="{st}"; a=$(_base_dir_bytes "{d}"); b=$(_base_dir_bytes "{d}"); echo "A=$a B=$b"'
+    r = _bash(snippet, env={"PATH": f"{spy}:{os.environ['PATH']}"})
+    assert r.stdout.split()[0].split("=")[1] == r.stdout.split()[1].split("=")[1] != "0", r.stdout + r.stderr
+    assert log.read_text().count("du") == 1                                        # the second answer came from the cache
+
+
+def test_unit_the_venv_backend_is_read_from_torch_metadata_without_importing_it(tmp_path):
+    site = tmp_path / "site"; (site / "torch-2.14.0+cu130.dist-info").mkdir(parents=True)
+    (site / "torch-2.14.0+cu130.dist-info" / "METADATA").write_text("Metadata-Version: 2.1\nName: torch\nVersion: 2.14.0+cu130\n")
+    (site / "torch").mkdir(); (site / "torch" / "__init__.py").write_text("raise ImportError('must not be imported')\n")
+    r = _bash(f'PY="{sys.executable}"; _base_venv_backend', env={"PYTHONPATH": str(site)})
+    assert r.stdout.strip() == "cu130", r.stdout + r.stderr
+
+
+def test_unit_the_cublas_probe_compiles_once_per_toolkit_on_a_machine(tmp_path):
+    cuda = tmp_path / "cuda"; (cuda / "bin").mkdir(parents=True); (cuda / "lib64").mkdir(); (cuda / "include").mkdir()
+    (cuda / "lib64" / "libcublas.so.13").write_text("lib"); (cuda / "include" / "cublas_v2.h").write_text("h")
+    log = tmp_path / "nvcc.log"
+    _stub(cuda / "bin", "nvcc", f'if [ "$1" = --version ]; then echo "Cuda compilation tools, release 13.0, V13.0.88"; exit 0; fi\necho compile >> "{log}"\nexit 0\n')
+    st = tmp_path / "state"; st.mkdir()
+    run = f'BASE_STATE="{st}"; CUDACXX="{cuda}/bin/nvcc"; base_cuda_toolchain; BASE_CUDA_BUILD_OK=""; base_cuda_toolchain; echo OK=$BASE_CUDA_BUILD_OK'
+    r = _bash(run)
+    assert "OK=1" in r.stdout and log.read_text().count("compile") == 1, (r.stdout, r.stderr, log.read_text())
+    (cuda / "lib64" / "libcublas.so.13").unlink()                                   # the library went (a restarted container)
+    r = _bash(f'BASE_STATE="{st}"; CUDACXX="{cuda}/bin/nvcc"; base_cuda_toolchain')
+    assert log.read_text().count("compile") == 2, log.read_text()                   # a changed toolkit is probed again
