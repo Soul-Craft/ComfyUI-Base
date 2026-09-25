@@ -32,7 +32,9 @@ sys.path.insert(0, str(BASE / "py"))
 import brand                                                        # noqa: E402
 
 STAMP = (2026, 9, 4, 0, 0, 0)       # zip stores a local datetime, not an epoch; fixed so two builds give the same bytes
-BASE_MEMBERS = ["base.sh", "comfyui-base-script.sh", "comfyui-base-handbook.md", "VERSION", "pytest.ini"]
+# LICENSE ships (2.12.2): MIT asks that the notice travel with every copy, and this zip is the copy the projects
+# that build on the base hand to their own users.
+BASE_MEMBERS = ["base.sh", "comfyui-base-script.sh", "comfyui-base-handbook.md", "VERSION", "pytest.ini", "LICENSE"]
 BASE_DIRS = ["lib", "py", "suite", "hosts"]
 BASE_ZIP = BASE / "comfyui-base.zip"
 

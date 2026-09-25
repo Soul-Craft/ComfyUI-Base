@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 2.12.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 2.12.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -466,6 +466,17 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 2.12.2: `comfyui-base.zip` carries `LICENSE`. It never did: the packager's member list named five files and the
+  licence was not one of them, so every copy of the zip went out without the notice MIT asks to travel with it.
+  The zip is exactly the copy a project built on the base hands to its own users (a workflow package's buyers
+  install it as step one), so the gap reached every one of them. `suite/test_unit.py` asserts the notice is in
+  the extracted zip, beside the manifest check that already proves every shipped file is listed. Step one's
+  copy list (`lib/95-summary.sh`) had to learn the file too, or the install failed its own manifest check; a new
+  test holds the packager's members and the installer's list together, since they are kept by hand in two places.
+  Also: `suite/test_podctl.py`'s fake-RunPod CLI call inherited the session's `PODCTL_*`, so a workspace exporting
+  `PODCTL_PROVIDER=verda` sent it, authenticated, to the LIVE Verda API. It strips them now; a test reaches only
+  its own fake server.
 
 - 2.12.1: a security review of 2.12.0, and it found two real things, both in the same eight lines. The Jupyter
   token was interpolated into the ssh COMMAND, and sshd runs a non-login remote command as `bash -c '<cmd>'`, so

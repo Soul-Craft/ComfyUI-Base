@@ -333,7 +333,7 @@ base_install_self(){ # copy this base to $BASE_HOME (the volume) unless it alrea
     note "base $BASE_VERSION already installed at $dest (same manifest)"
   else
     hdr "INSTALL BASE $BASE_VERSION → $dest"
-    for f in base.sh lib py suite hosts pytest.ini VERSION MANIFEST.sha256 "comfyui-base-script.sh" "comfyui-base-handbook.md"; do
+    for f in base.sh lib py suite hosts pytest.ini VERSION MANIFEST.sha256 "comfyui-base-script.sh" "comfyui-base-handbook.md" LICENSE; do
       [ -e "$here/$f" ] || continue
       rm -rf "$dest/$f"; cp -R "$here/$f" "$dest/$f"
     done                                                                          # state/, python/, dead-venvs/ are never touched

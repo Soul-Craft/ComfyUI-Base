@@ -885,6 +885,8 @@ def test_unit_manifest_covers_every_shipped_file_and_a_tamper_is_fatal(tmp_path)
     shipped = {str(p.relative_to(inst)) for p in inst.rglob("*") if p.is_file() and p.name != "MANIFEST.sha256"}
     assert listed == shipped, (listed ^ shipped)
     assert "base.sh" in shipped and "lib/00-env.sh" in shipped and "py/basetest.py" in shipped and "comfyui-base-script.sh" in shipped
+    # 2.12.2: the MIT notice travels with the zip, because the zip is what a project built on the base hands on
+    assert "LICENSE" in shipped and "MIT License" in (inst / "LICENSE").read_text(encoding="utf-8")
     assert not any(p.startswith("_build") or p.endswith(".zip") for p in shipped)
     home = tmp_path / "comfy-base"; shutil.copytree(inst, home)
     (home / "lib" / "00-env.sh").write_text((home / "lib" / "00-env.sh").read_text() + "\n# tamper\n")
@@ -892,6 +894,21 @@ def test_unit_manifest_covers_every_shipped_file_and_a_tamper_is_fatal(tmp_path)
     assert r.returncode == 5 and "00-env.sh" in r.stderr, r.stdout + r.stderr
     r = subprocess.run(["bash", str(inst / "base.sh"), "version"], capture_output=True, text=True, env={**os.environ, "BASE_FAKE_ROOT": str(tmp_path)})
     assert r.returncode == 0                                                                        # an extracted (not installed) copy is not checked
+
+
+def test_unit_the_installer_copies_everything_the_packager_ships():
+    """Two hand-kept lists must agree: what package.py puts in comfyui-base.zip, and what step one copies from the
+    extracted zip into the home. 2.12.2 added LICENSE to the first and the install died on its own manifest check,
+    because the second did not know the file existed."""
+    _repo_only("_build/package.py")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pkg_for_list", BASE / "_build" / "package.py")
+    pkg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pkg)
+    m = re.search(r"^\s*for f in (base\.sh [^;]+); do", (BASE / "lib" / "95-summary.sh").read_text(encoding="utf-8"), re.M)
+    assert m, "the installer's copy list moved; re-point this test"
+    copied = {w.strip('"') for w in m.group(1).split()}
+    shipped = set(pkg.BASE_MEMBERS) | set(pkg.BASE_DIRS) | {"MANIFEST.sha256"}
+    assert shipped <= copied, "shipped but never installed: %s" % sorted(shipped - copied)
 
 
 def test_unit_step_one_installs_itself_and_runs_the_toolchain_in_fake_mode(tmp_path):

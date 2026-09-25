@@ -155,8 +155,11 @@ def test_unit_podctl_reads_the_key_from_runpodctl_config_or_env_and_never_prints
     # the CLI, against a fake RunPod, never echoes the key anywhere
     fake = FakeRunPod(_pod())
     try:
+        # 2.12.2: no PODCTL_* from the session. A workspace that exports PODCTL_PROVIDER=verda turned this "fake RunPod"
+        # call into an authenticated GET against the LIVE Verda API (MEASURED: HTTP 400 "instanceId must be a UUID").
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PODCTL_")}
         r = subprocess.run([sys.executable, str(TOOL), "status", "fakepod0000001"], capture_output=True, text=True,
-                           env={**os.environ, "RUNPOD_API_KEY": "rp_from_env_7c1d", "RUNPOD_API_URL": fake.url})
+                           env={**env, "RUNPOD_API_KEY": "rp_from_env_7c1d", "RUNPOD_API_URL": fake.url})
     finally:
         fake.close()
     assert r.returncode == 0, r.stderr
