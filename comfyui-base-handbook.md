@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.0.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.0.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -496,6 +496,13 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.0.1: a SageAttention build for a list of architectures serves each GPU in the list. An image built with no GPU
+  stamps its build for `SAGE_ARCHS="9.0;12.0"`, and the machine it serves computed its key from `sm_120`, so the two
+  never matched and every first install rebuilt SageAttention (10-20 minutes) from the very source, Python and torch the
+  image already carried. The stamp, and a cached wheel, now count as current when they are the same commit, Python and
+  torch and their list holds this GPU's sm; a GPU the list does not hold still builds. Measured by the session that
+  adapts a baked-image consumer to 3.0.0.
 
 - 3.0.0: always the newest, for everything the base installs, on every run and every host (§0.3). ComfyUI stays on its
   newest release, with `COMFY_REF` (`podctl install --comfy-ref`) as the opt-in for something newer; a pack is at its

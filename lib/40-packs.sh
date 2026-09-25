@@ -301,6 +301,16 @@ base_cuda_toolchain(){ # CAN THIS TOOLKIT LINK WHAT PACKAGES BUILD? "nvcc exists
   return 0
 }
 
+_base_sage_covers(){ # <key> <prefix> <sm token, e.g. 12-0> → 0 when <key> is <prefix>archs-<list> and the list holds this GPU
+  # 3.0.1: an image built with no GPU stamps SageAttention for SAGE_ARCHS="9.0;12.0". On the machine it serves, the same
+  # source, Python and torch built for a list that holds this GPU's sm IS current; before, the keys never matched and
+  # every first install rebuilt it (10-20 min). Measured by the SoulCraft image session on base 3.0.0.
+  local key="$1" prefix="$2" tok="$3" list
+  case "$key" in "${prefix}archs-"*) ;; *) return 1;; esac
+  list="${key#"${prefix}archs-"}"
+  case "_${list}_" in *"_${tok}_"*) return 0;; esac
+  return 1
+}
 base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 built from source for THIS GPU's sm (no PyPI wheel has
   # sm_100/sm_120 kernels; 1.0.6 crashes there). SAGE_REF names a BRANCH or tag (default main); 3.0.0 retired SAGE_WHEEL and a
   # 40-hex SAGE_REF, both of which held it below its newest. It is rebuilt whenever the full cache key (the resolved commit,
@@ -324,7 +334,11 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
     key="sageattention-${sha:-unresolved}-${pytag:-cp}-torch${tv:-0}-${SAGE_ARCHS:+archs-}$(printf '%s' "${SAGE_ARCHS:-${BASE_GPU_SM:-sm}}" | tr ';.' '_-')"
     # already built from exactly this source for exactly this venv: nothing to do. Anything else (main moved, a new
     # Python, a new torch, another GPU) rebuilds or reinstalls from the cache, so it is never left behind.
-    if [ -n "$sha" ] && [ "$(cat "$stampf" 2>/dev/null)" = "$key" ] && "$PY" -c "import sageattention" >/dev/null 2>&1; then
+    local prefix="sageattention-${sha:-unresolved}-${pytag:-cp}-torch${tv:-0}-" smtok="${BASE_GPU_SM#sm_}" stamped
+    smtok="${smtok%?}-${smtok: -1}"                                  # sm_120 → 12-0, the form SAGE_ARCHS takes in a key
+    stamped="$(cat "$stampf" 2>/dev/null)"
+    if [ -n "$sha" ] && { [ "$stamped" = "$key" ] || { [ -z "${SAGE_ARCHS:-}" ] && [ -n "${BASE_GPU_SM:-}" ] && _base_sage_covers "$stamped" "$prefix" "$smtok"; }; } \
+       && "$PY" -c "import sageattention" >/dev/null 2>&1; then
       ok "sageattention $(_base_sage_ver) already built from SageAttention $sha for this venv (its newest)"; return 0
     fi
     local cc="${BASE_GPU_SM:-}"; cc="${cc#sm_}"
@@ -339,6 +353,15 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
       BASE_FAILED+=("SageAttention: the CUDA toolkit cannot link cuBLAS (the toolchain line above names the fix)"); return 0
     fi
     hit=""; [ -n "$sha" ] && hit="$(ls "$cache/$key"/*.whl 2>/dev/null | head -1)"
+    if [ -z "$hit" ] && [ -n "$sha" ] && [ -z "${SAGE_ARCHS:-}" ] && [ -n "${BASE_GPU_SM:-}" ]; then   # 3.0.1: a wheel built for a list holding this GPU
+      local cd_
+      for cd_ in "$cache/${prefix}archs-"*; do
+        [ -d "$cd_" ] || continue
+        if _base_sage_covers "$(basename "$cd_")" "$prefix" "$smtok" && ls "$cd_"/*.whl >/dev/null 2>&1; then
+          key="$(basename "$cd_")"; hit="$(ls "$cd_"/*.whl | head -1)"; break
+        fi
+      done
+    fi
     if [ -n "$hit" ]; then
       ok "SageAttention: a cached wheel matches this exact source and venv — installing instead of a 10-20 min build"
       note "$(basename "$hit")  ($key)"

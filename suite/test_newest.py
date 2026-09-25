@@ -460,3 +460,23 @@ def test_unit_a_force_its_holder_refuses_at_import_is_taken_back_and_named(tmp_p
     assert "FAILED=0" in r.stdout, r.stdout + r.stderr
     assert "U huggingface-hub 2.0.0: cannot be forced: transformers 5.17.0 refuses it at import" in r.stdout, r.stdout
     assert "OVR=\n" in r.stdout or r.stdout.rstrip().endswith("OVR="), r.stdout                   # nothing forced in the end
+
+
+def test_unit_a_sageattention_build_for_a_list_of_archs_serves_each_gpu_in_it(tmp_path):
+    """3.0.1, measured by the SoulCraft image session on 3.0.0: an image built with no GPU stamps SageAttention for
+    SAGE_ARCHS="9.0;12.0", and the machine it serves computed its key from sm_120, so the two never matched and every first
+    install rebuilt it (10-20 min). The same commit, Python and torch built for a list holding this GPU is current; a
+    GPU the list does not hold still builds."""
+    v = tmp_path / "venv"; (v / "bin").mkdir(parents=True); py = v / "bin" / "python"
+    py.write_text('#!/bin/bash\ncase "$*" in *"import sageattention"*) exit 0;; *) exit 0;; esac\n'); py.chmod(0o755)
+    gitbin = tmp_path / "gitbin"; gitbin.mkdir()
+    (gitbin / "git").write_text('#!/bin/bash\n[ "$1" = ls-remote ] && { echo "abcdef1234567890abcdef1234567890abcdef12\trefs/heads/main"; exit 0; }\nexec /usr/bin/git "$@"\n'); (gitbin / "git").chmod(0o755)
+    (v / ".comfy-base-sageattention").write_text("sageattention-abcdef123456-cp-torch0-archs-9-0_12-0\n")
+    env = {"PATH": f"{gitbin}:{os.environ['PATH']}", "HOME": str(tmp_path / "home")}
+    base = f'VENV="{v}"; PY="{py}"; BASE_STATE="{tmp_path}"; BASE_DRY=0; BASE_NO_NET=0; '
+    r = _bash(base + 'BASE_GPU_SM=sm_120; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env=env)
+    assert "already built from SageAttention abcdef123456" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
+    r = _bash(base + 'BASE_GPU_SM=sm_90; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env=env)
+    assert "already built" in r.stdout, r.stdout + r.stderr
+    r = _bash(base + 'BASE_GPU_SM=sm_89; base_build_sageattention; echo F=${#BASE_FAILED[@]}', env=env)
+    assert "already built" not in r.stdout, r.stdout + r.stderr                              # 8.9 is not in the list: it builds
