@@ -56,6 +56,7 @@ _GLOBALS = globals()
 sys.modules["comfyui_podctl"] = sys.modules[__name__] if __name__ in sys.modules else _Self("comfyui_podctl")   # providers reach back through this
 _hosts = _load_by_path("comfyui_hosts", BASE_DIR / "hosts" / "__init__.py", BASE_DIR / "hosts")
 _brand = _load_by_path("comfyui_brand", BASE_DIR / "py" / "brand.py")
+_pkgdirs = _load_by_path("comfyui_pkgdirs", BASE_DIR / "py" / "pkgdirs.py")     # 3.6.0: the one package-discovery rule
 PodctlError = _hosts.PodctlError
 Provider = _hosts.Provider
 
@@ -389,9 +390,10 @@ def repo_root(path):
     return None                                            # 2.2.0: a base that is its own repository has no brand tree above it
 
 
-def pins_elsewhere(script_path, rows):
-    """What a green install MEASURED for files the run does not own: every other '*-script.sh' beside the
-    package and the base's own pack list — WITHOUT writing any of them. Returns [(path, pack, old, new)].
+def pins_elsewhere(script_path, rows, base_dir=None, env=None):
+    """What a green install MEASURED for files the run does not own: every other package's script under the consumer
+    root (py/pkgdirs.py: either shape, $BASE_WORKSPACE honoured) and the base's own pack list, base_dir/lib/40-packs.sh
+    (this podctl's base by default) — WITHOUT writing any of them. Returns [(path, pack, old, new)].
 
     It used to write them. That is the fault behind three separate blockages on 2026-09-08: an install is a
     process whose job is to install, and it was mutating source files belonging to sessions that were not
@@ -400,14 +402,18 @@ def pins_elsewhere(script_path, rows):
     commits were green on this pod at this time"), and a measurement belongs in an artefact that a human
     accepts, not in someone else's source file."""
     script_path = pathlib.Path(script_path).resolve()
-    root = repo_root(script_path)
-    if root is None:
-        return []
+    base_dir = pathlib.Path(base_dir or BASE_DIR)
+    try:
+        root = _pkgdirs.consumer_root(base_dir, None, os.environ if env is None else env)
+    except _pkgdirs.NoSuchRoot as e:                    # a mistyped $BASE_WORKSPACE is said, never read as "no packages"
+        raise PodctlError(str(e))
     targets = []
-    for d in sorted(root.glob("*/packages/*/")):          # every package of every brand, 2026-09-12 layout
-        if d.is_dir() and d.resolve() != script_path.parent:
-            targets += sorted(d.glob("*-script.sh"))
-    packs_sh = root / "base" / "comfyui-base" / "lib" / "40-packs.sh"
+    for d in (_pkgdirs.package_dirs(root, base_dir) if root is not None else []):     # 3.6.0: both shapes, not */packages/* alone
+        if d != script_path.parent:
+            targets.append(d / ("%s-script.sh" % d.name))
+    # 3.6.0: the base's OWN list, beside this driver. A workspace has no <root>/base/comfyui-base to read it from, and
+    # a standalone base (no consumer root) still measures its own rows, where it used to report nothing at all.
+    packs_sh = base_dir / "lib" / "40-packs.sh"
     if packs_sh.exists():
         targets.append(packs_sh)
     report = []

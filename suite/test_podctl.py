@@ -24,7 +24,7 @@ def _no_session_podctl_env(monkeypatch):
     """A workspace that exports PODCTL_HOST / PODCTL_TUNNEL_OFFSET / PODCTL_PROVIDER (so a session addresses its own
     machine) must not change what these tests expect: every test starts with none of them, and sets its own."""
     for k in list(os.environ):
-        if k.startswith("PODCTL_"):
+        if k.startswith("PODCTL_") or k == "BASE_WORKSPACE":         # 3.6.0: the pin scan honours a workspace
             monkeypatch.delenv(k, raising=False)
 
 def _load():
@@ -848,7 +848,8 @@ def test_unit_podctl_pins_for_other_packages_are_measured_and_recorded_never_wri
                            '  "rgthree-comfy|https://github.com/rgthree/rgthree-comfy|2222222222222222222222222222222222222222||switches"\n')
 
     before = {f: f.read_text(encoding="utf-8") for f in (b / "B Pkg-script.sh", c / "C Pkg-script.sh", base / "40-packs.sh")}
-    report = podctl.pins_elsewhere(a / "A Pkg-script.sh", rows)
+    sub = dict(base_dir=root / "base" / "comfyui-base", env={})              # 3.6.0: the submodule shape, this tree's own base
+    report = podctl.pins_elsewhere(a / "A Pkg-script.sh", rows, **sub)
 
     # NOTHING outside the run's own package is written — that is the whole point
     for f, text in before.items():
@@ -870,7 +871,7 @@ def test_unit_podctl_pins_for_other_packages_are_measured_and_recorded_never_wri
     assert "2222222222222222222222222222222222222222||switches" in (base / "40-packs.sh").read_text(encoding="utf-8")
     assert "cccccccc" in (c / "C Pkg-script.sh").read_text(encoding="utf-8")   # unrelated rows untouched
     assert "bbbbbbbb" in (b / "B Pkg-script.sh").read_text(encoding="utf-8")   # B's own row untouched
-    assert podctl.pins_elsewhere(a / "A Pkg-script.sh", rows) == []            # idempotent once applied
+    assert podctl.pins_elsewhere(a / "A Pkg-script.sh", rows, **sub) == []     # idempotent once applied
 
 
 def test_unit_podctl_cli_install_takes_base_and_packages_in_order():

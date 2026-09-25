@@ -15,12 +15,13 @@
 #  Then, from any package folder that runs on ComfyUI Base:
 #      bash "<name>-script.sh" test             # auto-detects base/testbed and the server on the port --server took
 #  Overrides: BASE_NODE_SRC="<this dir>/testbed"  BASE_SERVER=127.0.0.1:8199
+#  Which packages: $BASE_WORKSPACE, else <repo> of <repo>/base/comfyui-base (3.6.0)
 #  (every package with a suite finds it the same way: BASE_NODE_SRC / BASE_SERVER, auto-detected by `test`;
 #   --server writes the port it chose to .testbed-server.port beside this script, which the base's runner
 #   and its _build/verify.sh read; --stop removes it)
 #
 #  WHICH PACKS
-#  The base derives them: `base/comfyui-base/base.sh list-packs */` merges the four
+#  The base derives them: `base.sh list-packs <every package py/pkgdirs.py finds>` merges the four
 #  shared base packs with every converted package's PACKS table, pinned to the
 #  commits the pod installs. EXTRA below would hold the packs of packages NOT yet
 #  converted onto the base; each conversion deletes its rows here.
@@ -71,41 +72,40 @@ EXTRA=(
   # Klein installers will declare theirs the same way — nothing is hand-kept here any more
 )
 
-# A package's own node pack: <brand>/packages/<pkg>/<Pack>/__init__.py. Derived, never hand-kept — nothing
+# A package's own node pack: <package dir>/<Pack>/__init__.py. Derived, never hand-kept — nothing
 # here knows a brand's name, and the list used to go stale every time a package was added or moved. In a
 # standalone base checkout the glob matches nothing and no links are made, which is correct: there are no
 # packages to vendor. Absolute paths, so the link loop does not re-anchor them.
 VENDORED=()
 
-# Where the packages are. testbed.sh sits IN the base (this repository, since 2.6.0) or beside it (a brand
-# repository before that), and a brand's packages are at <repo>/<brand>/packages/<name>/ either way — so the
-# repository root is one level up or two, depending on which. Two levels up from a STANDALONE base checkout is
-# whatever directory happens to contain it, which could hold an unrelated sibling, so a candidate only counts
-# when it actually holds a package: a <name>/ whose <name>-script.sh exists. A standalone base finds none, and
-# that is correct — it has no packages, and list-packs still supplies the base's own rows.
-REPO_ROOT=""
-_find_repo_root(){
-  local root d name
-  for root in "$HERE/../.." "$HERE/.."; do
-    [ -d "$root" ] || continue
-    for d in "$root"/*/packages/*/; do
-      [ -d "$d" ] || continue
-      name="$(basename "${d%/}")"
-      if [ -f "$d/$name-script.sh" ]; then REPO_ROOT="$(cd "$root" && pwd)"; return 0; fi
-    done
-  done
-  return 0
-}
-_find_repo_root
+# Where the packages are (3.6.0): py/pkgdirs.py, the rule every walker in the base shares. The consumer root is
+# $BASE_WORKSPACE when set (a workspace of one repository per package, <brand>-<name>/ side by
+# side, with the base read from $COMFY_BASE outside it), else <repo> when the base is <repo>/base/comfyui-base (a
+# brand repository's submodule, packages at <brand>/packages/<name>/). A standalone base has no root and no packages,
+# which is correct: list-packs still supplies the base's own rows.
+# Fail closed: an empty answer is "no consumer root"; a missing helper, a crash or a root that does not exist stops here,
+# never a testbed that quietly provisions the base's packs and none of the packages' (the 2.6.0 fault, status() below).
+die(){ warn "$*"; exit 1; }
+REPO_ROOT=""; PKGS=()
+PKGDIRS_PY="$(dirname "$BASE_SH")/py/pkgdirs.py"
+if [ -f "$BASE_SH" ]; then
+  [ -f "$PKGDIRS_PY" ] || die "no $PKGDIRS_PY: the base beside this script predates 3.6.0 and cannot say where the packages are"
+  REPO_ROOT="$(python3 "$PKGDIRS_PY" --root)" || die "py/pkgdirs.py could not resolve the consumer root (above)"
+  if [ -n "$REPO_ROOT" ]; then
+    _pkgs="$(python3 "$PKGDIRS_PY" "$REPO_ROOT")" || die "py/pkgdirs.py could not list $REPO_ROOT (above)"
+    while IFS= read -r _d; do [ -n "$_d" ] && PKGS+=("$_d"); done <<< "$_pkgs"
+  fi
+fi
 
 derive_vendored(){
-  local d
-  [ -n "$REPO_ROOT" ] || return 0
-  for d in "$REPO_ROOT"/*/packages/*/*/; do
-    [ -d "$d" ] || continue
-    case "$(basename "$d")" in _*) continue;; esac      # _build/ and friends are not node packs
-    [ -f "$d/__init__.py" ] || continue
-    VENDORED+=("${d%/}")
+  local p d
+  for p in ${PKGS[@]+"${PKGS[@]}"}; do
+    for d in "$p"/*/; do
+      [ -d "$d" ] || continue
+      case "$(basename "$d")" in _*) continue;; esac      # _build/ and friends are not node packs
+      [ -f "$d/__init__.py" ] || continue
+      VENDORED+=("${d%/}")
+    done
   done
 }
 derive_vendored
@@ -118,7 +118,7 @@ derive_packs() {
   if [ -f "$BASE_SH" ]; then
     while IFS='|' read -r dir url sha; do
       if [ -n "$dir" ] && ! _has_pack "$dir"; then PACKS+=("$dir|$url|$sha"); fi
-    done < <(bash "$BASE_SH" list-packs ${REPO_ROOT:+"$REPO_ROOT"/*/packages/*/} 2>/dev/null || true)
+    done < <(bash "$BASE_SH" list-packs ${PKGS[@]+"${PKGS[@]}"} 2>/dev/null || true)
   else
     warn "no ComfyUI Base beside this script — only EXTRA packs are provisioned"
   fi
@@ -274,7 +274,7 @@ status() {
   [ -f "$PORTF" ] && note "port file: $PORTF ($(tr -d '[:space:]' < "$PORTF"))"
   # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
   # a testbed that quietly provisioned the base's packs and none of a consumer repository's.
-  note "packs: ${#PACKS[@]} derived${REPO_ROOT:+ · packages under $REPO_ROOT}${REPO_ROOT:+ · ${#VENDORED[@]} vendored}"
+  note "packs: ${#PACKS[@]} derived${REPO_ROOT:+ · packages under $REPO_ROOT (${#PKGS[@]})}${REPO_ROOT:+ · ${#VENDORED[@]} vendored}"
   echo; note "BASE_NODE_SRC=\"$COMFY\"   BASE_SERVER=127.0.0.1:$PORT"
 }
 

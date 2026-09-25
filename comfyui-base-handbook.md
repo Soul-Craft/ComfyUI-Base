@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.5.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.6.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -303,6 +303,17 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   `host = runpod | verda | crusoe | local`). `py/brand.py` reads it; the packager names the zip `<name>-<host>.zip`
   by it and the driver takes its default provider from it. A tree with no `brand.toml` above it (an extracted zip, a
   flat checkout) is host `runpod` by default.
+- Where the packages are (3.6.0): a package directory is any `d` holding `d/<basename(d)>-script.sh`, in one of two
+  shapes under a consumer root. The submodule shape keeps the base at `<root>/base/comfyui-base` and the packages at
+  `<root>/<brand>/packages/<name>/`. The workspace shape clones one repository per package side by side as
+  `<root>/<brand>-<name>/` and reads the base from `$COMFY_BASE`, a shared checkout outside the workspace; the
+  workspace names itself with `$BASE_WORKSPACE`. The root is an explicit `--root <dir>` (the Python tools), else
+  `$BASE_WORKSPACE` (the only override `verify.sh` and `testbed.sh` take), else `<root>` of the submodule shape, else
+  none, and then only what the caller named is walked. A named root that does not exist is an error, and every walker
+  fails on it rather than walking zero packages; so do `verify.sh` and `testbed.sh` when the helper itself fails.
+  `py/pkgdirs.py` is that rule, once: `package.py --all`, `verify.sh`, `testbed.sh`, podctl's pin scan (which also
+  reads the base's own `lib/40-packs.sh`, beside the driver) and the unit tier's cross-package checks all ask it.
+  Dot-directories, a `comfyui-base/` checkout and the caller's own base are never packages.
 - The brand's families: `<brand>/families.txt` beside `brand.toml`, one family spelling per line (`#` comments), is
   the brand's list of `Family` folders. The base's unit tier, run from the brand repository, checks every package's
   rows against it (`test_unit_every_package_family_is_in_its_brands_families_file`); on the machine a Family is
@@ -361,7 +372,8 @@ Suites ship as `suite.py` + `pytest.ini` beside the script and load the base's p
 table. `bash "<name>-script.sh" test` auto-detects the testbed and its server on 8199, or on the port a running testbed
 recorded in `.testbed-server.port` beside `testbed.sh` (2.2.0: `_base_use_testbed` and `verify.sh` both read it, so a
 brand whose testbed runs elsewhere needs no env var); `BASE_NODE_SRC` / `BASE_SERVER` override; the runner hands the
-suite `BASE_COMFY` and `BASE_VENV`.
+suite `BASE_COMFY` and `BASE_VENV`, and `BASE_WORKSPACE` when set (3.6.0: the consumer root `py/pkgdirs.py` walks in the
+workspace shape, so a suite's cross-package checks see the workspace's packages); every other `BASE_*` is scrubbed.
 
 Since 2.6.0 the testbed lives in **two possible places**, checked in this order: `<base>/testbed`, provisioned by the
 `testbed.sh` that ships in this repository, and `base/testbed` beside `base/comfyui-base` in a brand repository. A root
@@ -563,6 +575,21 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.6.0: packages are found in the workspace shape too. Every cross-package walker assumed a consumer with the base as
+  a submodule at `base/comfyui-base` and its packages under `<brand>/packages/<name>/`; the consumers are moving to one
+  repository per package, cloned side by side as `<brand>-<name>/` under a workspace, with the base read from
+  `$COMFY_BASE`. `py/pkgdirs.py` holds the one rule (a directory holding `<its name>-script.sh`, in either shape,
+  deduplicated by resolved path) and the one root resolution (`--root`, then `$BASE_WORKSPACE`, then the
+  submodule shape, then none); `package.py --all` (new `--root`), podctl's pin scan, `verify.sh`, `testbed.sh` and
+  `basetest.converted_packages` use it instead of five `*/packages/*` globs with five guards. The pin scan now reads
+  the base's own `lib/40-packs.sh` beside the driver, not `<root>/base/comfyui-base/lib/`, which a workspace does not
+  have, so a standalone base (no consumer root) now measures its own rows where it used to report nothing: intended,
+  those rows are the base's. `base_test` hands `BASE_WORKSPACE` to the suite when set, and the unit tier's
+  cross-package checks walk the consumer root it resolves (skipping when there is none, the 2.2.0 standalone guard). A
+  named root that does not exist is an error everywhere, and `verify.sh` / `testbed.sh` stop when `py/pkgdirs.py` is
+  missing or fails instead of going green over zero packages. `podctl --pkg` resolution and the provider default
+  still read the submodule shape. Exercised on temp trees only.
 
 - 3.5.0: every probe once, and in parallel where it can be. The pack HEADs are asked of every remote at once
   (`py/pack_heads.py`, one `git ls-remote --symref` each, sixteen at a time), and a checkout already on its remote's

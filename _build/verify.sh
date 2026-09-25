@@ -2,9 +2,14 @@
 # Everything that can be checked WITHOUT a pod, in one command — because the failures of 2026-09-08 were
 # not missing tests, they were checks that existed and were skipped while moving fast.
 #
-#   bash base/comfyui-base/_build/verify.sh                                        # the base and every package under */packages/
-#   bash base/comfyui-base/_build/verify.sh <brand>/packages/<name>                  # just these (repository-relative paths)
+#   bash base/comfyui-base/_build/verify.sh                                        # the base and every package of the consumer root
+#   bash base/comfyui-base/_build/verify.sh <brand>/packages/<name>                  # just these (paths relative to that root)
+#   BASE_WORKSPACE=<ws> bash "$COMFY_BASE/_build/verify.sh"                         # the base and every <brand>-<name>/ of a workspace
 #   bash _build/verify.sh                                                          # a standalone base checkout: the base alone
+#
+# The consumer root (3.6.0, py/pkgdirs.py): $BASE_WORKSPACE, else <root> when this base is
+# <root>/base/comfyui-base. Its packages are <brand>/packages/<name>/ and <brand>-<name>/, found by the same rule
+# every other walker uses.
 #
 # Three things per item, in the order that fails cheapest first:
 #   1. the built zip matches the working tree            (package.py --check)
@@ -18,10 +23,14 @@
 # A package whose script declares PKG_NO_SUITE=1 and ships no suite.py skips steps 2 and 3 as "declared":
 # the zip check still runs over it.
 set -uo pipefail
-BASE="$(cd "$(dirname "$0")/.." && pwd)"; ROOT="$(cd "$BASE/../.." && pwd)"
+BASE="$(cd "$(dirname "$0")/.." && pwd)"; UP="$(cd "$BASE/../.." && pwd)"
+# Fail closed: an empty answer is "no consumer root" (documented, printed below); a helper that is missing, crashes, or
+# names a root that does not exist stops the gate, because a green gate over zero packages is the 2.6.0 fault again.
+CROOT="$(python3 "$BASE/py/pkgdirs.py" --root)" || { echo "── py/pkgdirs.py could not resolve the consumer root (above): NOT green"; exit 1; }
+ROOT="${CROOT:-$UP}"
 # The testbed sits either IN the base (since 2.6.0 testbed.sh ships here) or at base/testbed of a brand tree.
 # One root is chosen and used whole, so the port file always comes from the same place as the tree.
-if [ -f "$BASE/testbed.sh" ]; then TB_ROOT="$BASE"; else TB_ROOT="$ROOT/base"; fi
+if [ -f "$BASE/testbed.sh" ]; then TB_ROOT="$BASE"; else TB_ROOT="$UP/base"; fi
 export BASE_NODE_SRC="${BASE_NODE_SRC:-$TB_ROOT/testbed}"
 # BASE_SERVER only when nothing set it: the runner detects the testbed itself (lib/95-summary.sh), and an
 # unconditional export here overrode that detection. The testbed's port file wins over the 8199 default.
@@ -30,16 +39,15 @@ if [ -z "${BASE_SERVER:-}" ]; then
   else BASE_SERVER="127.0.0.1:8199"; fi
   export BASE_SERVER
 fi
-# The standalone guard: this base walks */packages/ only when it IS <root>/base/comfyui-base of a brand tree.
-in_tree=0; [ -d "$ROOT/base/comfyui-base" ] && [ "$(cd "$ROOT/base/comfyui-base" && pwd -P)" = "$(cd "$BASE" && pwd -P)" ] && in_tree=1
 items=(); rc=0
 if [ "$#" -gt 0 ]; then for a in "$@"; do items+=("$ROOT/$a"); done
 else
   items+=("$BASE")
-  if [ "$in_tree" = 1 ]; then
-    for d in "$ROOT"/*/packages/*/; do d="${d%/}"; [ -f "$d/$(basename "$d")-script.sh" ] && items+=("$d"); done
+  if [ -n "$CROOT" ]; then
+    pkgs="$(python3 "$BASE/py/pkgdirs.py" "$CROOT")" || { echo "── py/pkgdirs.py could not list $CROOT (above): NOT green"; exit 1; }
+    while IFS= read -r d; do [ -n "$d" ] && items+=("$d"); done <<< "$pkgs"
   else
-    echo "── no brand tree above this base: verifying the base alone"
+    echo "── no consumer root (no \$BASE_WORKSPACE, not at <root>/base/comfyui-base): verifying the base alone"
   fi
 fi
 for d in "${items[@]}"; do

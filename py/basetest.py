@@ -167,18 +167,17 @@ def brand_families(path):
 
 
 def converted_packages(root):
-    """Package dirs under root whose script sources the base (contains base_main): <root>/<Brand>/packages/<Name>/ in the
-    2026-09-12 layout, or <root>/<Name>/ in a flat tree (a test's tmp tree, an extracted zip). The base's own dir is not a package."""
+    """Package dirs under root whose script sources the base (contains base_main), in either shape py/pkgdirs.py knows:
+    <root>/<brand>/packages/<name>/ beside a base submodule, or <root>/<name>/ side by side (a workspace of one repository
+    per package, a test's tmp tree, an extracted zip). The base's own dir is not a package."""
+    here = str(pathlib.Path(__file__).resolve().parent)       # pkgdirs.py ships beside this file
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import pkgdirs                             # 3.6.0: the one package-discovery rule, shared with every other walker
     out = []
-    root = pathlib.Path(root)
-    # 2.2.0: the brand walk only when this base sits inside that brand tree (a base that is its own repository has
-    # sibling repositories two levels up, not packages); a flat tmp tree is still walked by iterdir
-    brand_walk = (root / "base" / "comfyui-base").resolve() == BASE_LIB.resolve()
-    for d in sorted(list(root.iterdir()) + (list(root.glob("*/packages/*")) if brand_walk else [])):
-        if not d.is_dir() or d.resolve() == BASE_LIB.resolve():
-            continue
-        s = sorted(d.glob("*-script.sh"))
-        if s and "base_main" in s[0].read_text(encoding="utf-8", errors="replace"):
+    for d in pkgdirs.package_dirs(root, BASE_LIB):
+        s = d / (d.name + "-script.sh")
+        if "base_main" in s.read_text(encoding="utf-8", errors="replace"):
             out.append(d)
     return out
 

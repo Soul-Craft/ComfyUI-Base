@@ -33,6 +33,22 @@ def code_only(text):
     return "\n".join(out)
 
 
+def _consumer_root():
+    """3.6.0: the root the cross-package checks walk: $BASE_WORKSPACE (handed to the suite by base_test), else <root> of
+    <root>/base/comfyui-base; a standalone base has none, and those checks skip (the 2.2.0 guard, kept)."""
+    import pkgdirs
+    root = pkgdirs.consumer_root(BASE, None, os.environ)
+    if root is None:
+        pytest.skip("no consumer root: no $BASE_WORKSPACE and this base is not <root>/base/comfyui-base")
+    return root
+
+
+def _no_workspace_env():
+    """The inherited environment minus BASE_WORKSPACE, for a subprocess that builds its OWN consumer tree: a workspace
+    the session exported would otherwise take precedence over the temp tree the test is about."""
+    return {k: v for k, v in os.environ.items() if k != "BASE_WORKSPACE"}
+
+
 def _bash(snippet, env=None, cwd=None):
     """Source base.sh, then run a bash snippet. Returns CompletedProcess."""
     e = dict(os.environ)
@@ -1084,7 +1100,7 @@ def test_unit_every_package_family_is_in_its_brands_families_file():
     same pod never file the same family under two spellings. Standalone, or for a brand without the file, this skips."""
     from basetest import brand_families, converted_packages, load_package
     checked = 0
-    for d in converted_packages(BASE.parents[1]):
+    for d in converted_packages(_consumer_root()):
         fams = brand_families(d)
         if fams is None:
             continue
@@ -1097,7 +1113,7 @@ def test_unit_every_package_family_is_in_its_brands_families_file():
 
 def test_unit_converted_packages_agree_on_dests_superseded_and_pins():
     from basetest import converted_packages, load_package
-    pkgs = [load_package(d) for d in converted_packages(BASE.parents[1])]     # the repository root, two above the base
+    pkgs = [load_package(d) for d in converted_packages(_consumer_root())]    # the workspace, or <root> of base/comfyui-base
     if not pkgs: pytest.skip("no converted package beside the base yet")
     dest_by_name, sup_by_pkg, claims = {}, {}, {}
     for p in pkgs:
@@ -2283,12 +2299,12 @@ def test_unit_the_suite_never_inherits_the_runs_tokens_and_a_red_suite_fails_the
     # (BASE_NO_NET=1, BASE_FAKE_ROOT, BASE_DRY…): tests that build their own fake pods inherited them and saw fake clones and
     # skipped stages. The suite gets the documented hand-over (BASE_COMFY, BASE_VENV, BASE_STATE, BASE_ON_POD…) and no other BASE_*.
     uv.write_text('#!/bin/bash\nenv | grep "^BASE_" | sort | tr "\\n" " " >> "$(dirname "$0")/env.log"; echo "1 passed"\nexit 0\n')
-    r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; export BASE_NO_NET=1 BASE_DRY=1 BASE_LATEST=1 BASE_RESTART=1 BASE_FAKE_DL=fail; base_test unit; echo "RC=$BASE_TEST_RC"',
+    r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; export BASE_NO_NET=1 BASE_DRY=1 BASE_LATEST=1 BASE_RESTART=1 BASE_FAKE_DL=fail BASE_WORKSPACE=/ws; base_test unit; echo "RC=$BASE_TEST_RC"',
               env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_FAKE_PID1_ENV": str(tmp_path / "pid1.env"), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
     seen = (tools / "env.log").read_text()
     for leaked in ("BASE_NO_NET=", "BASE_FAKE_ROOT=", "BASE_FAKE_PID1_ENV=", "BASE_DRY=", "BASE_LATEST=", "BASE_RESTART=", "BASE_FAKE_DL="):
         assert leaked not in seen, (leaked, seen)
-    for handed in ("BASE_COMFY=", "BASE_VENV=", "BASE_STATE=", "BASE_LIB=", "BASE_ON_POD="):
+    for handed in ("BASE_COMFY=", "BASE_VENV=", "BASE_STATE=", "BASE_LIB=", "BASE_ON_POD=", "BASE_WORKSPACE=/ws"):   # 3.6.0: the workspace root
         assert handed in seen, (handed, seen)
     assert "RC=0" in r.stdout, r.stdout + r.stderr
 
@@ -2415,7 +2431,7 @@ def test_unit_every_shipped_workflow_models_array_equals_its_rows():
     """All instances: every converted package's workflow carries the `models` array its rows say (2.1.0). A package not yet
     stamped is reported by name and skipped, never silently passed."""
     from basetest import converted_packages
-    root = BASE.parents[1]
+    root = _consumer_root()
     unstamped, stale = [], []
     for d in converted_packages(root):
         s = d / (d.name + "-script.sh")
@@ -2683,12 +2699,13 @@ def test_unit_the_testbed_finds_a_consumer_repositorys_packages(tmp_path):
     for q in (BASE / "lib").glob("*.sh"):
         (base / "lib" / q.name).write_text(q.read_text())
     (base / "py").mkdir()
+    (base / "py" / "pkgdirs.py").write_text((BASE / "py" / "pkgdirs.py").read_text())   # 3.6.0: where testbed.sh asks
     (base / "testbed.sh").write_text(tbsh.read_text())
     pkg = tmp_path / "brand" / "packages" / "pkg-x"
     pkg.mkdir(parents=True)
     (pkg / "pkg-x-script.sh").write_text('PKG_ID="pkg-x"\n')
 
-    r = subprocess.run(["bash", str(base / "testbed.sh"), "--status"], capture_output=True, text=True)
+    r = subprocess.run(["bash", str(base / "testbed.sh"), "--status"], capture_output=True, text=True, env=_no_workspace_env())
     assert r.returncode == 0, r.stdout + r.stderr
     assert "packages under %s" % tmp_path.resolve() in r.stdout, r.stdout + r.stderr
     assert "no ComfyUI Base beside this script" not in (r.stdout + r.stderr), r.stdout
@@ -2699,9 +2716,20 @@ def test_unit_the_testbed_finds_a_consumer_repositorys_packages(tmp_path):
     solo = tmp_path / "iso" / "deep" / "solo"
     solo.parent.mkdir(parents=True)
     shutil.copytree(base, solo)
-    r2 = subprocess.run(["bash", str(solo / "testbed.sh"), "--status"], capture_output=True, text=True)
+    r2 = subprocess.run(["bash", str(solo / "testbed.sh"), "--status"], capture_output=True, text=True, env=_no_workspace_env())
     assert r2.returncode == 0, r2.stdout + r2.stderr
     assert "packages under" not in r2.stdout, r2.stdout
+
+
+def test_unit_the_testbed_test_holds_with_a_workspace_exported(tmp_path, monkeypatch):
+    """3.6.0: base_test hands BASE_WORKSPACE to the suite, and testbed.sh takes it over the submodule shape. The test
+    above builds its own submodule tree, so it must not inherit a session's workspace: with BASE_WORKSPACE exported
+    to an empty directory, the temp submodule tree still wins."""
+    _repo_only("the repo's testbed.sh")
+    ws = tmp_path / "empty-ws"; ws.mkdir()
+    monkeypatch.setenv("BASE_WORKSPACE", str(ws))
+    tree = tmp_path / "tree"; tree.mkdir()
+    test_unit_the_testbed_finds_a_consumer_repositorys_packages(tree)
 
 
 # ---------------------------------------------------------------- 3.0.3: renders on the store, one ComfyUI per machine

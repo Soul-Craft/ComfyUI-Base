@@ -2,7 +2,8 @@
 """The one packager: builds every package's zip for its brand's host, and the base's own, byte-reproducibly.
 
     python3 "base/comfyui-base/_build/package.py" "<pkg dir>" ...    # rebuild those packages' zips
-    python3 "base/comfyui-base/_build/package.py" --all               # every <brand>/packages/<name> above this base
+    python3 "base/comfyui-base/_build/package.py" --all               # every package of the consumer root (py/pkgdirs.py)
+    python3 "$COMFY_BASE/_build/package.py" --all --root <workspace>  # ... of a named root ($BASE_WORKSPACE when not given)
     python3 "base/comfyui-base/_build/package.py" --base              # the base zip (writes MANIFEST.sha256 first)
     python3 "base/comfyui-base/_build/package.py" --host "<pkg dir>"  # print the host the package's zip is named for
     ... --check                                                  # verify without writing; exit 1 if stale
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import os
 import re
 import shlex
 import sys
@@ -27,9 +29,9 @@ import zipfile
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
-ROOT = BASE.parents[1] if len(BASE.parents) > 1 else BASE.parent   # the brand tree's root when this base sits at <root>/base/comfyui-base
 sys.path.insert(0, str(BASE / "py"))
 import brand                                                        # noqa: E402
+import pkgdirs                                                      # noqa: E402  3.6.0: the one package-discovery rule
 
 STAMP = (2026, 9, 4, 0, 0, 0)       # zip stores a local datetime, not an epoch; fixed so two builds give the same bytes
 # LICENSE ships (2.12.2): MIT asks that the notice travel with every copy, and this zip is the copy the projects
@@ -37,12 +39,6 @@ STAMP = (2026, 9, 4, 0, 0, 0)       # zip stores a local datetime, not an epoch;
 BASE_MEMBERS = ["base.sh", "comfyui-base-script.sh", "comfyui-base-handbook.md", "VERSION", "pytest.ini", "LICENSE"]
 BASE_DIRS = ["lib", "py", "suite", "hosts"]
 BASE_ZIP = BASE / "comfyui-base.zip"
-
-
-def in_brand_tree() -> bool:
-    """True when this base is the <root>/base/comfyui-base of a brand tree (a monorepo, or a brand repository's
-    submodule). Standalone, ROOT is whatever happens to be two levels up and holds no packages to walk."""
-    return (ROOT / "base" / "comfyui-base").resolve() == BASE.resolve()
 
 
 def workflow_name(pkg: Path, name: str) -> str | None:
@@ -183,6 +179,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="*")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--root", metavar="DIR", help="the consumer root --all walks (default: $BASE_WORKSPACE, else <root> of <root>/base/comfyui-base)")
     ap.add_argument("--base", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--host", metavar="PKG_DIR", help="print the host a package's zip is named for, and exit")
@@ -191,7 +188,7 @@ def main() -> int:
         print(zip_host(Path(a.host).resolve()))
         return 0
     if not (a.dirs or a.all or a.base):
-        print("usage: package.py <pkg dir>... | --all | --base [--check] | --host <pkg dir>", file=sys.stderr)
+        print("usage: package.py <pkg dir>... | --all [--root <dir>] | --base [--check] | --host <pkg dir>", file=sys.stderr)
         return 2
     rc = 0
     if a.base:
@@ -207,10 +204,16 @@ def main() -> int:
         rc = max(rc, do(BASE, members, BASE_ZIP, a.check, prefix="comfyui-base/"))
     dirs = [Path(d).resolve() for d in a.dirs]
     if a.all:
-        if in_brand_tree():
-            dirs += sorted(p for p in ROOT.glob("*/packages/*") if p.is_dir() and list(p.glob("*-script.sh")))
+        # 3.6.0: both shapes, <root>/<brand>/packages/<name>/ and <root>/<brand>-<name>/, from the root the caller names
+        try:
+            root = pkgdirs.consumer_root(BASE, a.root, os.environ)
+        except pkgdirs.NoSuchRoot as e:                 # a mistyped --root / $BASE_WORKSPACE is an error, not zero packages
+            print("  %s" % e, file=sys.stderr)
+            return 1
+        if root is not None:
+            dirs += [p for p in pkgdirs.package_dirs(root, BASE) if p not in dirs]
         else:
-            print("  no brand tree above this base: nothing to walk")
+            print("  no consumer root (no --root, no $BASE_WORKSPACE, not at <root>/base/comfyui-base): nothing to walk")
     for pkg in dirs:
         rc = max(rc, do(pkg, package_members(pkg), pkg / f"{pkg.name}-{zip_host(pkg)}.zip", a.check))
     return rc
