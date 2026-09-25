@@ -192,3 +192,23 @@ def test_unit_a_failed_scoped_check_is_judged_again_by_the_full_one(tmp_path):
     r = _bash(_scope_env(tmp_path) + f' COMFY="{comfy}"; _base_quick_test_scoped "{log}"; echo rc=$?')
     text = log.read_text()
     assert "rc=0" in r.stdout and "--disable-all-custom-nodes" not in text and "IMPORT FAILED" not in text, text   # the full check's verdict stands
+
+
+def test_unit_files_a_hook_adds_to_an_own_pack_survive_a_run_where_the_pack_did_not_change(tmp_path):
+    # Qwen 2.1 fetches its rewriter prompts INTO its own pack in pkg_post_models (they cannot ship in the zip). The
+    # "unchanged" verdict compares the zip's copy with the STAMP, never with the live folder, so those files stay.
+    _own_tree(tmp_path); _own(tmp_path, 'base_own_packs >/dev/null')
+    fetched = tmp_path / "ComfyUI" / "custom_nodes" / "ComfyUI-My-Own" / "prompts" / "system.txt"
+    fetched.parent.mkdir(); fetched.write_text("fetched by a hook\n", encoding="utf-8")
+    r = _own(tmp_path, '_base_own_packs_save; base_own_packs')
+    assert "unchanged" in r.stdout and fetched.exists(), r.stdout
+
+
+def test_unit_own_packs_are_mirrored_before_the_hooks_that_may_add_to_them():
+    # the order that keeps a hook's additions: mirror (which empties a changed pack) first, then pkg_pre_models and
+    # pkg_post_models, which may write into the pack again. Both branches of base_run (runtime and normal).
+    body = (BASE / "lib" / "95-summary.sh").read_text(encoding="utf-8")
+    run = body[body.index("base_run(){"):body.index("_base_use_testbed(){")]
+    mirrors = [i for i in range(len(run)) if run.startswith("base_own_packs ||", i)]
+    assert len(mirrors) == 2, mirrors
+    assert max(mirrors) < run.index("_base_hook pkg_pre_models") < run.index("_base_hook pkg_post_models")

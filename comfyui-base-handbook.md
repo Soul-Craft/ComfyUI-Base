@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.2.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.2.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -554,6 +554,11 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.2.1: a package may write into its own pack, and the mirror keeps what it writes. Qwen 2.1 fetches its rewriter
+  prompts into its own pack in `pkg_post_models` (they cannot ship in the zip); they survive because "unchanged" compares
+  the zip's copy with the stamp, never with the live folder, and because the mirror runs before the models hooks. Found
+  by the Qwen 2.1 session reading 3.2.0; now said in `lib/62-own-packs.sh` and held by two tests. No behaviour change.
 
 - 3.2.0: an install does each piece of work once, and says what each stage cost. Paul, 2026-09-25: a two-file change to
   a package's own node pack took a full install (about 10 minutes), and he asked for installs that always take everything

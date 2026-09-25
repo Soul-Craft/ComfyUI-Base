@@ -14,6 +14,12 @@
 # whatever is there: `_base_own_packs_save` keeps the live folder BEFORE the hooks, and `base_own_packs` mirrors AFTER
 # them (still before the requirements resolve), so the rollback copy is the real previous one and a newer copy kept
 # from another package is put back if a hook wrote over it.
+#
+# Keep two things as they are (3.2.1, found by the Qwen 2.1 session): a package may WRITE INTO its own pack after the
+# mirror (Qwen fetches its rewriter prompts into its pack in pkg_post_models, because they cannot ship in the zip), so
+# (1) "unchanged" compares the zip's copy with the stamp, never with the live folder's content, and (2) the mirror runs
+# before pkg_pre_models / pkg_post_models, so a changed pack is emptied first and the hook refills it. Judging by the
+# live folder, or mirroring after those hooks, would silently drop such files until the next run.
 
 OWN_CHANGED=()     # the own packs this run mirrored (the import check judges exactly these)
 OWN_SAVED=()       # the own packs whose live folder _base_own_packs_save kept before the hooks
