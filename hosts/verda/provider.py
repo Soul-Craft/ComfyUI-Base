@@ -172,7 +172,10 @@ class Api:
             with urllib.request.urlopen(req, timeout=60) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
-            text = e.read().decode(errors="replace")
+            try:
+                text = e.read().decode(errors="replace")
+            finally:
+                e.close()                                    # an unclosed HTTPError is a ResourceWarning on newer Pythons
             if e.code == 401 and auth and _retry:              # an expired token: take a fresh one, once
                 self._token, self._until = None, 0.0
                 return self._call(method, path, body, auth=auth, _retry=False)

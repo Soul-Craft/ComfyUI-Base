@@ -65,7 +65,10 @@ def main():
             pid = json.loads(r.read())["prompt_id"]
     except urllib.error.HTTPError as e:
         print("x server rejected the prompt:")
-        print(e.read().decode()[:2000])
+        try:
+            print(e.read().decode()[:2000])
+        finally:
+            e.close()
         sys.exit(1)
     print("-> queued prompt %s — waiting (up to 60 min)…" % pid)
     t0 = time.time()

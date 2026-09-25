@@ -106,7 +106,10 @@ class Api:
             with urllib.request.urlopen(req, timeout=60) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
-            text = e.read().decode(errors="replace")
+            try:
+                text = e.read().decode(errors="replace")
+            finally:
+                e.close()                                    # an unclosed HTTPError is a ResourceWarning on newer Pythons
             if e.code == 403 and "error-1010" in text and _retry:
                 import time
                 time.sleep(5)                               # one retry: the edge rule is per request signature, not per key

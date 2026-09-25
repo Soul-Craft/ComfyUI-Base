@@ -235,7 +235,11 @@ class Api:
             with urllib.request.urlopen(req, timeout=60) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
-            raise HttpError(method, path, e.code, e.read().decode(errors="replace"))
+            try:
+                text = e.read().decode(errors="replace")
+            finally:
+                e.close()                                    # an unclosed HTTPError is a ResourceWarning on newer Pythons
+            raise HttpError(method, path, e.code, text)
         except urllib.error.URLError as e:
             raise PodctlError("%s %s -> %s" % (method, path, e.reason))
         if not raw:

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.0.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.0.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -496,6 +496,11 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.0.2: every `HTTPError` the host providers and `py/smoke.py` read is closed. 3.0.0's test runner takes the newest
+  Python uv has instead of 3.12, and on Python 3.14 an HTTPError that is read but never closed is a `ResourceWarning`
+  when it is collected; with warnings as errors, the repository's CI went red on 3.0.0 (13 failures, all this one
+  cause, each reported against whichever test was running when it was collected). The suite passes under 3.14 now.
 
 - 3.0.1: a SageAttention build for a list of architectures serves each GPU in the list. An image built with no GPU
   stamps its build for `SAGE_ARCHS="9.0;12.0"`, and the machine it serves computed its key from `sm_120`, so the two
