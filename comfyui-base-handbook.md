@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.3.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.4.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -334,7 +334,10 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
   fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
-  basenames the index may adopt. `base.sh stamp-models <pkg dir>` writes ComfyUI's own `models` array into the
+  basenames the index may adopt. `base.sh gen-hashes <pkg dir> [--check]` (3.4.0) writes `models.sha256` beside the
+  script (`<sha256>  <file>`, the `sha256sum` form): each Hugging Face file's sha256 as the Hub states it on a HEAD
+  (`x-linked-etag`), so nothing is downloaded or hashed; the packager ships it, `BASE_DECLARE_ONLY=1` prints
+  `MODELHASH file|sha256`, and stamp-models adds `hash` + `hash_type` to those entries. `base.sh stamp-models <pkg dir>` writes ComfyUI's own `models` array into the
   shipped workflow from these rows (`--check` compares).
 - `MODELS_LATER=( <file> ... )` (optional, 3.1.0): the MODELS rows the package's FIRST flow does not need, by their
   `file`. Only a staged run (`BASE_STAGED=1`, a buyer's machine) acts on it: each gets a stand-in (a 0-byte file at its
@@ -556,6 +559,13 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.4.0: each model file's sha256, from the Hub, never hashed here (Paul, 2026-09-25, asked for by the ComfyUI tooling
+  session so a Comfy Build spec needs no second pass over 100+ GB). `base.sh gen-hashes <pkg dir>` reads the sha256 the Hub
+  publishes for every LFS file on a HEAD and writes `models.sha256` beside the script; `--check` compares. The MODELS rows
+  are unchanged (no new column for every package to carry): a package opts in by adding the file. It ships in the zip,
+  the declarations dump prints `MODELHASH` rows, and the workflow's `models` array gains `hash` + `hash_type` for ComfyUI's
+  Missing Models dialog. Rows the Hub does not serve (LOCAL, a repo snapshot, a GitHub asset) are left out and said.
 
 - 3.3.0: every Python resolve once, and a force is never undone. Traced on 3.2.1: `base_packs pip` installed the derived
   set WITHOUT the overrides, so each package the newest pass had forced past a cap (protobuf 7 over its <6 caps) went back

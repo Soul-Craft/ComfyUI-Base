@@ -7,8 +7,9 @@ The frontend's Missing Models dialog reads the top-level `models` array of a wor
 hash + hash_type) and offers to download what the graph names, from the hosts it allows (huggingface.co among them).
 So every row with a URL becomes an entry: `name` is the file (a snapshot row's directory, with its trailing slash
 dropped), `url` the row's URL (hf://owner/repo → https://huggingface.co/owner/repo), `directory` the row's
-category/Family[/Purpose] path. LOCAL rows have no URL and are left out. Rows carry no sha256 today, so no hash is
-written; the base's own download verifies bytes. Entries are sorted by name and the rest of the file is kept as it is:
+category/Family[/Purpose] path. LOCAL rows have no URL and are left out. 3.4.0: when the package carries
+models.sha256 (`base.sh gen-hashes`, from the Hub), each file it names gets hash + hash_type "SHA256"; without it no
+hash is written, exactly as before. Entries are sorted by name and the rest of the file is kept as it is:
 the same indent, the same escaping, one trailing newline. Idempotent: stamping twice changes nothing.
 """
 from __future__ import annotations
@@ -43,7 +44,20 @@ def script_of(pkg):
     return s
 
 
-def entries(script_text):
+def hashes(pkg):
+    """models.sha256 beside the script → {file: sha256}; empty when the package carries none."""
+    p = Path(pkg) / "models.sha256"
+    out = {}
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            parts = ln.split()
+            if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+                out[parts[1]] = parts[0]
+    return out
+
+
+def entries(script_text, sums=None):
+    sums = sums or {}
     out = []
     for row in _array(script_text, "MODELS"):
         f = row.split("|")
@@ -56,7 +70,10 @@ def entries(script_text):
             url = "https://huggingface.co/" + url[len("hf://"):]
         directory = "/".join(x for x in (cat, fam, purp) if x)
         name = file.rstrip("/")
-        out.append({"name": name, "url": url, "directory": directory})
+        e = {"name": name, "url": url, "directory": directory}
+        if name in sums:
+            e["hash"] = sums[name]; e["hash_type"] = "SHA256"
+        out.append(e)
     out.sort(key=lambda e: (e["name"], e["directory"]))
     return out
 
@@ -78,7 +95,7 @@ def stamp(pkg, check=False):
         raise SystemExit("%s names %s, which is not beside it" % (s.name, m.group(1)))
     raw = wf.read_text(encoding="utf-8")
     doc = json.loads(raw)
-    want = entries(t)
+    want = entries(t, hashes(pkg))
     if doc.get("models") == want:
         print("%s: current (%d model entries)" % (wf.name, len(want)))
         return 0

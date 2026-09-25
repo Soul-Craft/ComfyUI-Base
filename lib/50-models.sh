@@ -781,6 +781,50 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
 }
 
 # ---------------------------------------------------------------- gen-models: fill/verify bytes from the Hub
+_base_hub_sha256(){ # <url> → the file's sha256 as the Hub publishes it (x-linked-etag on an LFS file), or nothing
+  local url="$1" auth=() out e
+  [[ "$url" == https://huggingface.co/* ]] || return 0                 # the Hub is the one host that states it on a HEAD
+  [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+  out="$(curl -sIL --max-time 40 --retry 2 ${auth[@]+"${auth[@]}"} "$url" 2>/dev/null | tr -d '\r' || true)"
+  e="$(printf '%s\n' "$out" | awk 'tolower($1)=="x-linked-etag:"{v=$2} END{print v}' | tr -d '"' | tr 'A-F' 'a-f')"
+  if [[ "$e" =~ ^[0-9a-f]{64}$ ]]; then echo "$e"; fi
+  return 0
+}
+base_gen_hashes(){ # <pkg dir> [--check] → models.sha256 beside the script: each Hub file's sha256, taken from the Hub (3.4.0)
+  # Nothing is downloaded or hashed here. --check writes nothing and exits 1 when the file is missing or differs.
+  local d="${1%/}" check="${2:-}" s rows cat fam purp file url bytes note alts h tmp rc=0
+  s="$(ls "$d"/*"-script.sh" 2>/dev/null | head -1 || true)"
+  if [ -z "$s" ]; then echo "  !! no '*-script.sh' in $d" >&2; return 1; fi
+  rows="$(BASE_DECLARE_ONLY=1 bash "$s" | grep '^MODELROW ' | cut -c10- || true)"
+  tmp="$(mktemp)"
+  while IFS='|' read -r cat fam purp file url bytes note alts; do
+    [ -n "$cat" ] || continue
+    case "$url" in LOCAL|hf://*) continue;; esac                        # no file URL: a local file, or a repo snapshot
+    case "$file" in */) continue;; esac
+    h="$(_base_hub_sha256 "$url")"
+    if [ -n "$h" ]; then printf '%s  %s\n' "$h" "$file" >> "$tmp"
+    else echo "  ○ $file: the host states no sha256 for $url (only the Hub does): left out" >&2; fi
+  done <<< "$rows"
+  sort -k2 -o "$tmp" "$tmp"
+  if [ "$check" = "--check" ]; then
+    if ! cmp -s "$tmp" "$d/models.sha256"; then
+      echo "  !! $d/models.sha256 is not what the Hub says:" >&2; diff "$d/models.sha256" "$tmp" >&2 || true; rc=1
+    else echo "  models.sha256 matches the Hub ($(grep -c . "$tmp" | tr -d ' ') file(s))"; fi
+    rm -f "$tmp"; return $rc
+  fi
+  mv "$tmp" "$d/models.sha256"; echo "  wrote $d/models.sha256 ($(grep -c . "$d/models.sha256" | tr -d ' ') file(s))"
+  return 0
+}
+_base_model_hashes(){ # → "file|sha256" for each line of models.sha256 beside the script; exit 1 naming a malformed line
+  local f="${PKG_DIR:-.}/models.sha256" h file bad=0
+  [ -f "$f" ] || return 0
+  while read -r h file; do
+    [ -n "$h" ] || continue
+    if [[ "$h" =~ ^[0-9a-f]{64}$ ]] && [ -n "$file" ]; then echo "$file|$h"
+    else echo "  !! models.sha256: not '<sha256>  <file>': $h $file" >&2; bad=1; fi
+  done < "$f"
+  return $bad
+}
 base_gen_models(){ # <pkg dir> → the package's MODELS rows with bytes filled from HEAD; exit 1 on drift or an unreadable size
   local d="${1%/}" s rows rc=0 cat fam purp file url bytes note alts exp
   s="$(ls "$d"/*"-script.sh" 2>/dev/null | head -1 || true)"

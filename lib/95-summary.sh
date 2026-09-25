@@ -25,6 +25,7 @@ _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per l
   _base_model_rows | sed 's/^/MODELROW /' || rc=1
   _base_later_rows | sed 's/^/MODELLATER /' || rc=1
   _base_own_rows | sed 's/^/OWNROW /' || rc=1      # 3.2.0: dir|version|digest, the package's own packs (they ship in its zip)
+  _base_model_hashes | sed 's/^/MODELHASH /' || rc=1   # 3.4.0: file|sha256, from models.sha256 (base.sh gen-hashes)
   return $rc
 }
 _base_hook(){ # run a package hook if the package defines it; a failing hook fails the run (no fallbacks)
@@ -376,6 +377,7 @@ base_cli(){ # the developer's entry (`bash base.sh test …`): a package script 
     version)      echo "$BASE_VERSION" ;;
     list-packs)   shift; base_list_packs "$@" ;;
     gen-models)   shift; base_env_setup; base_gen_models "$@" ;;
+    gen-hashes)   shift; base_env_setup; base_gen_hashes "$@" ;;                                 # 3.4.0: models.sha256, from the Hub
     stamp-models) shift; "$SYS_PY" "$BASE_DIR/py/stamp_models.py" "$@" ;;                    # 2.1.0: the workflow's own `models` array, from the rows
     status)       base_env_setup; base_status ;;
     latest)       base_env_setup; base_latest ;;
@@ -384,7 +386,7 @@ base_cli(){ # the developer's entry (`bash base.sh test …`): a package script 
     runtime-capture) shift; trap _base_on_exit EXIT; base_runtime_capture "$@" ;;
     fetch-later)     trap _base_on_exit EXIT; base_fetch_later ;;
     test|rescue|help|-h|--help) base_main "$@" ;;
-    *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> | stamp-models <dir> [--check] | runtime-apply <manifest> | runtime-capture <dir> | fetch-later | test [tier] | rescue | help)" >&2; exit 2 ;;
+    *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> | gen-hashes <dir> [--check] | stamp-models <dir> [--check] | runtime-apply <manifest> | runtime-capture <dir> | fetch-later | test [tier] | rescue | help)" >&2; exit 2 ;;
   esac
 }
 base_install_self(){ # copy this base to $BASE_HOME (the volume) unless it already runs from there; then re-exec the installed copy

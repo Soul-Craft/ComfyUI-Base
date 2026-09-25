@@ -8,7 +8,7 @@
     ... --check                                                  # verify without writing; exit 1 if stale
 
 A package zip is flat: the workflow the script names in WF_NAME (644; none when WF_NAME=""), <name>-script.sh (700),
-<name>-trainer.sh (700, if present), suite.py, pytest.ini, models.py (644, if present), <name>-handbook.md (644, if present),
+<name>-trainer.sh (700, if present), suite.py, pytest.ini, models.py and models.sha256 (644, if present), <name>-handbook.md (644, if present),
 plus every file named in the script's ZIP_EXTRA=( ... ). It is named <name>-<host>.zip, where the host is the one the
 package's brand declares in <brand>/brand.toml (py/brand.py; "runpod" when no brand.toml is above the package).
 
@@ -70,7 +70,7 @@ def package_members(pkg: Path) -> list[tuple[str, int]]:
     if wf:
         members.append((wf, 0o644))
     members.append((f"{name}-script.sh", 0o700))
-    for fn, mode in ((f"{name}-trainer.sh", 0o700), ("suite.py", 0o644), ("pytest.ini", 0o644), ("models.py", 0o644), (f"{name}-handbook.md", 0o644)):
+    for fn, mode in ((f"{name}-trainer.sh", 0o700), ("suite.py", 0o644), ("pytest.ini", 0o644), ("models.py", 0o644), ("models.sha256", 0o644), (f"{name}-handbook.md", 0o644)):
         if (pkg / fn).exists():
             members.append((fn, mode))
     m = re.search(r"^ZIP_EXTRA=\((.*?)\)", script.read_text(encoding="utf-8"), re.M | re.S)
